@@ -65,3 +65,23 @@ def test_append_many(tmp_path):
     s = BarStore(tmp_path)
     s.append_many("AAPL", [bar(100, 1.0), bar(110, 2.0), bar(120, 3.0)])
     assert [b["ts"] for b in s.since("AAPL", 0)] == [100, 110, 120]
+
+
+def test_append_ignores_non_monotonic_ts(tmp_path):
+    # A replay restart (or a stream reconnect that re-sends a bar) must not
+    # duplicate or rewind already-stored bars.
+    s = BarStore(tmp_path)
+    s.append_many("AAPL", [bar(100, 1.0), bar(110, 2.0)])
+    s.append("AAPL", bar(110, 9.9))   # duplicate ts -> ignored
+    s.append("AAPL", bar(100, 9.9))   # older ts     -> ignored
+    s.append("AAPL", bar(120, 3.0))   # newer ts     -> kept
+    got = s.since("AAPL", 0)
+    assert [(b["ts"], b["close"]) for b in got] == [(100, 1.0), (110, 2.0), (120, 3.0)]
+
+
+def test_non_monotonic_guard_persists_across_reopen(tmp_path):
+    BarStore(tmp_path).append_many("AAPL", [bar(100, 1.0), bar(110, 2.0)])
+    s2 = BarStore(tmp_path)              # reopen: last-ts known from disk
+    s2.append("AAPL", bar(105, 5.0))    # older than stored max -> ignored
+    s2.append("AAPL", bar(115, 5.0))    # newer -> kept
+    assert [b["ts"] for b in s2.since("AAPL", 0)] == [100, 110, 115]

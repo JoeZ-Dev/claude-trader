@@ -15,6 +15,11 @@ Bars are stored and returned exactly on the specs.md section 4 contract:
 "Since" reads most naturally as "at or after"; the polling client is
 responsible for advancing its cursor (e.g. asking for last_seen_ts + 1, or
 de-duplicating the boundary bar by ts).
+
+`append` is monotonic per symbol: a bar whose ts is <= the newest stored ts
+for that symbol is dropped. This keeps a replay restart (which re-runs the
+fixture from the top) or a stream reconnect that re-sends a bar from
+duplicating or rewinding history.
 """
 from __future__ import annotations
 
@@ -31,6 +36,8 @@ class BarStore:
     def append(self, symbol: str, bar: dict) -> None:
         key = symbol.upper()
         bars = self._load(key)
+        if bars and bar["ts"] <= bars[-1]["ts"]:
+            return  # non-monotonic: replay restart / reconnect re-send
         with self._path(key).open("a") as f:
             f.write(json.dumps(bar, separators=(",", ":")) + "\n")
         bars.append(bar)
