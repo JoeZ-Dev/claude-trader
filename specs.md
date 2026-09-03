@@ -94,6 +94,25 @@ interactive login is required regardless of client implementation.
 "Never requires re-authentication" is not achievable by any client and
 must not be implied by definition-of-done language.
 
+**Token refresh architecture:** `companion-auth` vends access-token-only
+responses (no `refresh_token`) - by design, keeping the refresh token off
+`schwab-connector` entirely. This means `schwab-py`'s own internal
+auto-refresh (via authlib, which needs a `refresh_token` in the token
+dict it was constructed with) cannot function here - confirmed by reading
+schwab-py's source, not assumed. `schwab-connector` therefore manages
+renewal explicitly: proactively re-fetch a fresh access token from
+`companion-auth` and rebuild the `schwab-py` client (via
+`client_from_access_functions`) shortly before each ~30-minute access
+token would expire (matching schwab-py's own 5-minute internal leeway
+convention), reconnecting the stream as part of that cycle. This makes
+stream reconnection a routine, expected event roughly every ~30 minutes
+during live operation, not a rare failure case - the reconnect path needs
+to be solid for exactly this reason. Deliberately NOT using direct
+`AsyncClient`/`AsyncOAuth2Client` manipulation (an alternative that avoids
+full reconnects) - that would reach past schwab-py's supported interface,
+which contradicts the original reason for choosing a vetted library over
+hand-rolling this layer.
+
 Bar shape (the contract between `schwab-connector` and everything else):
 ```
 {
