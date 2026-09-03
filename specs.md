@@ -75,23 +75,31 @@ Bar shape (the contract between `schwab-connector` and everything else):
 
 ### 5. Container architecture
 
-Three containers, one per credential boundary, via docker-compose:
+Three containers, one per credential boundary, via docker-compose. All
+directories below live under `momentum_monitor/` at the repo root — this
+subproject is one directory, per AGENT_PROTOCOL.md's directory-boundary
+principle, with no code living loose at repo root:
 
-- **`schwab-connector`** — the only container holding the Schwab OAuth
-  token. Owns the stream subscription and bar aggregation. Internal API
-  only (not published to host):
+- **`momentum_monitor/core/`** — the analysis logic from section 3.
+  (If found instead at repo-root `monitor_core/`, that's stale from an
+  earlier extraction step and should be moved here, not imported
+  across from its old location.)
+- **`momentum_monitor/schwab-connector/`** — the only container holding
+  the Schwab OAuth token. Owns the stream subscription and bar
+  aggregation. Internal API only (not published to host):
   - `POST /watch {"symbol": "..."}`
   - `GET /bars/{symbol}?since_ts={unix_seconds}` → array of bar objects
     per the shape in section 4.
   - `GET /health` → `{"status": "ok", "watching": [...], "connected": bool}`
-- **`claude-connector`** — the only container with the `claude` CLI's auth
-  mounted in. Shells out to `claude -p` for event-triggered narration.
-  Not built until phase 3 (see roadmap below) — currently a placeholder
-  directory only.
-- **`monitor-app`** — the FastAPI web app. Holds no credentials. Polls
-  `schwab-connector` for bars, runs them through `monitor_core`, serves
-  a web view. The only container with a port published to the host
-  (`8012`).
+- **`momentum_monitor/claude-connector/`** — the only container with the
+  `claude` CLI's auth mounted in. Shells out to `claude -p` for
+  event-triggered narration. Not built until phase 3 (see roadmap below)
+  — currently a placeholder directory with a README only.
+- **`momentum_monitor/monitor-app/`** — the FastAPI web app. Holds no
+  credentials. Polls `schwab-connector` for bars, runs them through
+  `momentum_monitor/core/`, serves a web view. The only container with a
+  port published to the host (`8012`).
+- **`momentum_monitor/docker-compose.yml`** — orchestrates all three.
 
 ### 6. Roadmap / phases
 
