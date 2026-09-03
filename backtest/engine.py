@@ -1,12 +1,22 @@
 """
 Event-driven (day-by-day) backtest engine.
 
-Deliberately not vectorized: with ~30 symbols and a few years of daily data
-that's a few thousand iterations, fast enough, and a day-by-day loop is much
-easier to audit for lookahead bias than a clever vectorized version — worth
-the tradeoff for a first build.
+Deliberately not vectorized: a day-by-day loop is much easier to audit for
+lookahead bias than a clever vectorized version.
+
+Execution model:
+  - Signals are computed from day T's close/indicators.
+  - Entries fill at day T+1's OPEN (what a once-a-day live trader can actually
+    achieve), not at the signal-day close.
+  - Stops/targets are checked intrabar against the daily high/low during the
+    hold. If the bar's OPEN has already gapped past the level, the fill is the
+    open price, not the (unreachable) exact stop/target.
+  - The time exit counts trading days (bars) held, not calendar days.
+  - If a point-in-time membership set is supplied, a symbol is only eligible
+    for a NEW entry while it was actually in the index; open positions are
+    allowed to ride out even if the name later leaves.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 import math
 import pandas as pd
@@ -26,6 +36,7 @@ class Trade:
     exit_date: Optional[pd.Timestamp] = None
     exit_price: Optional[float] = None
     exit_reason: Optional[str] = None
+    bars_held: int = 0  # trading days elapsed since the fill
 
     @property
     def is_open(self) -> bool:
@@ -50,11 +61,20 @@ class Trade:
 
 
 class Backtester:
-    def __init__(self, data: Dict[str, pd.DataFrame], cfg: StrategyConfig):
+    def __init__(
+        self,
+        data: Dict[str, pd.DataFrame],
+        cfg: StrategyConfig,
+        membership=None,
+        trade_start=None,
+    ):
         self.cfg = cfg
         self.data = {sym: compute_indicators(df, cfg) for sym, df in data.items()}
+        self.membership = membership
+        self.trade_start = pd.Timestamp(trade_start) if trade_start is not None else None
         self.cash = cfg.starting_equity
         self.open_positions: Dict[str, Trade] = {}
+        self.pending_entries: Dict[str, dict] = {}  # sym -> {"signal_date", "atr"}
         self.closed_trades: List[Trade] = []
         self.equity_curve: List[tuple] = []  # (date, equity)
 
@@ -75,28 +95,40 @@ class Backtester:
                 equity += trade.entry_price * trade.shares  # stale price fallback
         return equity
 
+    def _eligible(self, sym: str, date) -> bool:
+        if self.membership is None:
+            return True
+        return sym in self.membership.members_asof(date)
+
     # ---- main loop -------------------------------------------------
     def run(self) -> Dict:
         all_dates = sorted(set().union(*[df.index for df in self.data.values()]))
 
         for date in all_dates:
+            trading = self.trade_start is None or date >= self.trade_start
             day_rows = {
                 sym: df.loc[date] for sym, df in self.data.items() if date in df.index
             }
 
-            # 1) Manage open positions: check stop / target / time exit
+            # 1) Manage open positions: stop / target / time exit
             for sym in list(self.open_positions.keys()):
+                trade = self.open_positions[sym]
+                trade.bars_held += 1
                 if sym not in day_rows:
                     continue
-                trade = self.open_positions[sym]
                 row = day_rows[sym]
+                o = row["open"]
                 exit_price, reason = None, None
 
-                if row["low"] <= trade.stop_price:
+                if o <= trade.stop_price:                 # gapped down through the stop
+                    exit_price, reason = o, "stop"
+                elif o >= trade.target_price:             # gapped up through the target
+                    exit_price, reason = o, "target"
+                elif row["low"] <= trade.stop_price:      # stop touched intrabar
                     exit_price, reason = trade.stop_price, "stop"
-                elif row["high"] >= trade.target_price:
+                elif row["high"] >= trade.target_price:   # target touched intrabar
                     exit_price, reason = trade.target_price, "target"
-                elif (date - trade.entry_date).days >= self.cfg.max_hold_days:
+                elif trade.bars_held >= self.cfg.max_hold_days:
                     exit_price, reason = row["close"], "time"
 
                 if exit_price is not None:
@@ -106,18 +138,25 @@ class Backtester:
                     self.closed_trades.append(trade)
                     del self.open_positions[sym]
 
-            # 2) Look for new entries (only if we have room)
             equity_now = self._mark_to_market(date, day_rows)
-            for sym, row in day_rows.items():
+
+            # 2) Fill entries signalled on the PREVIOUS bar, at today's open
+            for sym in list(self.pending_entries.keys()):
+                if sym not in day_rows:
+                    continue  # no bar today; try again next session
+                pend = self.pending_entries[sym]
+                del self.pending_entries[sym]
+
                 if sym in self.open_positions:
                     continue
                 if len(self.open_positions) >= self.cfg.max_open_positions:
-                    break
-                if not entry_signal(row, self.cfg):
+                    continue
+                if not self._eligible(sym, date):
                     continue
 
-                entry_price = self._slip(row["close"], buying=True)
-                stop, target = stop_and_target(entry_price, row["atr"], self.cfg)
+                row = day_rows[sym]
+                entry_price = self._slip(row["open"], buying=True)
+                stop, target = stop_and_target(entry_price, pend["atr"], self.cfg)
                 risk_per_share = entry_price - stop
                 if risk_per_share <= 0:
                     continue
@@ -141,7 +180,18 @@ class Backtester:
                     stop_price=stop, target_price=target, shares=shares,
                 )
 
-            self.equity_curve.append((date, self._mark_to_market(date, day_rows)))
+            # 3) Scan today's closes for NEW signals -> queue for next bar's open
+            if trading:
+                for sym, row in day_rows.items():
+                    if sym in self.open_positions or sym in self.pending_entries:
+                        continue
+                    if not self._eligible(sym, date):
+                        continue
+                    if entry_signal(row, self.cfg):
+                        self.pending_entries[sym] = {"signal_date": date, "atr": row["atr"]}
+
+            if trading:
+                self.equity_curve.append((date, self._mark_to_market(date, day_rows)))
 
         # Close anything still open at the end, at last known price
         for sym, trade in list(self.open_positions.items()):

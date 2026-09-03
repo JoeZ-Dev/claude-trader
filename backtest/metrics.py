@@ -39,7 +39,8 @@ def trade_stats(trades: List[Trade]) -> dict:
     }
 
 
-def equity_stats(equity_curve: pd.DataFrame, starting_equity: float) -> dict:
+def equity_stats(equity_curve: pd.DataFrame, starting_equity: float,
+                 first_trade_date=None) -> dict:
     if equity_curve.empty:
         return {}
 
@@ -50,10 +51,15 @@ def equity_stats(equity_curve: pd.DataFrame, starting_equity: float) -> dict:
     drawdown = (equity - running_max) / running_max
     max_drawdown = drawdown.min()
 
-    daily_returns = equity.pct_change().dropna()
+    # Sharpe is measured from the first trade onward: including the flat
+    # pre-first-trade warmup stretch would understate volatility and inflate it.
+    sharpe_equity = equity
+    if first_trade_date is not None:
+        sharpe_equity = equity[equity.index >= pd.Timestamp(first_trade_date)]
+    daily_returns = sharpe_equity.pct_change().dropna()
     sharpe = (
         (daily_returns.mean() / daily_returns.std()) * np.sqrt(252)
-        if daily_returns.std() > 0
+        if len(daily_returns) > 1 and daily_returns.std() > 0
         else 0.0
     )
 
@@ -67,7 +73,8 @@ def equity_stats(equity_curve: pd.DataFrame, starting_equity: float) -> dict:
 
 def print_report(trades: List[Trade], equity_curve: pd.DataFrame, starting_equity: float):
     t_stats = trade_stats(trades)
-    e_stats = equity_stats(equity_curve, starting_equity)
+    first_trade_date = min((t.entry_date for t in trades), default=None)
+    e_stats = equity_stats(equity_curve, starting_equity, first_trade_date)
 
     print("=" * 50)
     print("BACKTEST REPORT")

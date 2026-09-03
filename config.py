@@ -38,20 +38,36 @@ class StrategyConfig:
 
 @dataclass
 class UniverseConfig:
-    # ~28 liquid, well-known large caps across sectors, so a first backtest
-    # tests generalization rather than fitting to one or two names.
+    # --- Backtest universe: point-in-time S&P 500 membership ---
+    # The backtest no longer uses a hand-picked list. Instead it reconstructs
+    # S&P 500 membership as it actually stood on each trading day, so a name is
+    # only eligible for entry while it was really in the index, and names that
+    # were later removed (acquired, shrank out, went bankrupt) are included for
+    # the period they were members. This removes the "we already know these
+    # specific tickers won" selection bias.
+    #
+    # Source: https://github.com/fja05680/sp500  (MIT license), vendored
+    # unmodified at the path below. See data/loader.py:load_pit_membership and
+    # data/sp500_constituents.SOURCE.md.
+    constituents_file: str = "data/sp500_constituents.csv"
+
+    # Data-layer limitation, documented not silently ignored: free yfinance
+    # history is unavailable for most tickers that left the index via merger or
+    # bankruptcy, so a residual survivorship bias remains at the data level even
+    # though the membership list itself is now point-in-time. run_backtest.py
+    # prints how many requested tickers actually returned usable data.
+
+    benchmark: str = "SPY"
+
+    # --- Live paper-trader universe ONLY (not used by the backtest) ---
+    # live/alpaca_paper_trader.py still imports `.symbols`; it is frozen this
+    # round, so this small explicit list stays here to keep that script working
+    # unchanged. The backtest ignores this field entirely.
     symbols: List[str] = field(default_factory=lambda: [
-        # Tech
         "AAPL", "MSFT", "NVDA", "GOOGL", "META", "CRM", "ADBE",
-        # Consumer
         "AMZN", "COST", "HD", "MCD", "NKE",
-        # Healthcare
         "UNH", "JNJ", "ABBV", "LLY",
-        # Financials
         "JPM", "V", "MA", "GS",
-        # Industrials / Energy
         "CAT", "HON", "XOM", "CVX",
-        # Comms / Staples
         "DIS", "PG", "KO", "PEP",
     ])
-    benchmark: str = "SPY"
