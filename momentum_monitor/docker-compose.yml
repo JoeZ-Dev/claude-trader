@@ -1,10 +1,21 @@
 # momentum_monitor phase 1 -- two live services (claude-connector is a
 # phase-3 placeholder, deliberately not a service here).
 #
-#   Live Schwab data:  set SCHWAB_API_KEY / SCHWAB_APP_SECRET / WATCH_SYMBOL,
-#                      put a schwab-py token at schwab-connector/data/token.json,
-#                      then:  docker compose up
+#   Live Schwab data:  set SCHWAB_API_KEY / SCHWAB_APP_SECRET / WATCH_SYMBOL /
+#                      AUTH_HELPER_URL, then:  docker compose up
 #   Replay (no token): STREAM_SOURCE=replay WATCH_SYMBOL=AEHL docker compose up
+#
+# Networks:
+#   monitor-net     internal; carries only monitor-app <-> schwab-connector.
+#   joelab-ingress  pre-existing EXTERNAL network. schwab-connector joins it
+#                   solely to reach the joelab auth helper by Docker service
+#                   name (http://companion-auth:<port>/access_token) -- token
+#                   requests must never leave the host. The public
+#                   https://companion-auth.p3l.co URL + Cloudflare Tunnel exist
+#                   only for Schwab's servers to hit the OAuth callback, and are
+#                   not used for service-to-service calls.
+#   monitor-app does NOT join joelab-ingress: it never talks to Schwab or the
+#   auth helper directly. That exposure stays scoped to schwab-connector.
 #
 # Only monitor-app publishes a port (8012). schwab-connector is internal.
 
@@ -22,8 +33,15 @@ services:
       SCHWAB_API_KEY: "${SCHWAB_API_KEY:-}"
       SCHWAB_APP_SECRET: "${SCHWAB_APP_SECRET:-}"
       REPLAY_PATH: "${REPLAY_PATH:-/app/fixtures/replay_sample.jsonl}"
+      # Live mode only. Full URL of the joelab auth helper, reached by service
+      # name on joelab-ingress. Port is pinned by the joelab side -- fill it in:
+      #   AUTH_HELPER_URL=http://companion-auth:<port>
+      AUTH_HELPER_URL: "${AUTH_HELPER_URL:-}"
     volumes:
       - ./schwab-connector/data:/data
+    networks:
+      - monitor-net
+      - joelab-ingress
     restart: unless-stopped
 
   monitor-app:
@@ -38,4 +56,12 @@ services:
       POLL_INTERVAL: "${POLL_INTERVAL:-5}"
     depends_on:
       - schwab-connector
+    networks:
+      - monitor-net
     restart: unless-stopped
+
+networks:
+  monitor-net:
+    driver: bridge
+  joelab-ingress:
+    external: true
