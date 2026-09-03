@@ -4,3 +4,4 @@ __pycache__/
 trade_log.csv
 equity_curve.csv
 .venv/
+*.zip
