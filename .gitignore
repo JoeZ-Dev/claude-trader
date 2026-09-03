@@ -7,3 +7,4 @@ equity_curve.csv
 .venv/
 *.zip
 data/_cache/
+momentum_monitor/schwab-connector/data/
