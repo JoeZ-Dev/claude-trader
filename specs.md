@@ -54,11 +54,24 @@ directory for the current, authoritative test suite.
 ### 4. Data source
 
 Charles Schwab's Market Data API — streaming quotes, aggregated into 10s
-bars. Deliberately scoped to a SEPARATE Schwab developer app registration
-from any other project in this environment, requesting ONLY "Market Data
-Production" — explicitly not "Accounts and Trading Production". The
-resulting credential must be structurally incapable of placing orders or
-reading account/position data, not merely unused for those purposes.
+bars, via the `schwab-py` library (chosen over hand-rolling OAuth/streaming:
+schwab-py's own documented rationale explicitly warns against rolling your
+own OAuth callback flow as "unnecessarily complex and dangerous," which
+matches this project's own empirical experience — the hand-rolled
+equivalent in the reference project had failing auth-refresh and
+stream-reconnect tests). Deliberately scoped to a SEPARATE Schwab developer
+app registration from any other project in this environment, requesting
+ONLY "Market Data Production" — explicitly not "Accounts and Trading
+Production". The resulting credential must be structurally incapable of
+placing orders or reading account/position data, not merely unused for
+those purposes.
+
+**Token lifetime constraint (platform-enforced, not a code quality issue):**
+Schwab refresh tokens are valid for 7 days, after which a fresh interactive
+login is required regardless of client implementation. "Survives a
+container restart" is the correct, achievable, testable claim. "Never
+requires re-authentication" is not achievable by any client and must not
+be implied by definition-of-done language.
 
 Bar shape (the contract between `schwab-connector` and everything else):
 ```
