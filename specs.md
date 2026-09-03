@@ -53,25 +53,46 @@ directory for the current, authoritative test suite.
 
 ### 4. Data source
 
-Charles Schwab's Market Data API — streaming quotes, aggregated into 10s
-bars, via the `schwab-py` library (chosen over hand-rolling OAuth/streaming:
-schwab-py's own documented rationale explicitly warns against rolling your
-own OAuth callback flow as "unnecessarily complex and dangerous," which
-matches this project's own empirical experience — the hand-rolled
-equivalent in the reference project had failing auth-refresh and
-stream-reconnect tests). Deliberately scoped to a SEPARATE Schwab developer
-app registration from any other project in this environment, requesting
-ONLY "Market Data Production" — explicitly not "Accounts and Trading
-Production". The resulting credential must be structurally incapable of
-placing orders or reading account/position data, not merely unused for
-those purposes.
+Charles Schwab's API — streaming quotes, aggregated into 10s bars, via the
+`schwab-py` library.
 
-**Token lifetime constraint (platform-enforced, not a code quality issue):**
-Schwab refresh tokens are valid for 7 days, after which a fresh interactive
-login is required regardless of client implementation. "Survives a
-container restart" is the correct, achievable, testable claim. "Never
-requires re-authentication" is not achievable by any client and must not
-be implied by definition-of-done language.
+**Revised credential model (as of this writing, superseding the original
+plan below):** Schwab caps individual/retail developers at ONE app
+registration. A separate, Market-Data-only app is not achievable under
+this account. `momentum_monitor` therefore authenticates through the
+existing ToS_Companion app registration, which has both "Market Data
+Production" and "Accounts and Trading Production" — meaning the resulting
+token has genuine trading capability. This is a real, accepted tradeoff,
+not an oversight, mitigated by:
+- A dedicated Schwab account, funded with $1, with no margin enabled -
+  bounds any worst-case outcome, from any cause, to that amount.
+- `momentum_monitor` containing ZERO order-placement or account-endpoint
+  code paths. This is now the primary, actively-maintained protection
+  rather than a nice-to-have - any future phase that would add order
+  submission (the eventual execution phase, if ever built) requires
+  explicitly revisiting this section first, not just writing the code.
+- Schwab's own app-level "Order Limit" setting as an additional,
+  independent safety layer (exact semantics not yet fully confirmed).
+
+Callback URL: `https://companion-auth.p3l.co/callback` (previously
+`127.0.0.1`, changed because 7-day token renewal requires repeated
+interactive logins, and this externally-routed URL is already approved
+on the existing app - avoiding a multi-week re-approval wait). Must be
+handled by a container routed through the existing joelab infrastructure
+for that domain - confirm with Claude Code exactly how that routing
+connects to `schwab-connector` before assuming it's automatic.
+
+**Original plan (kept for context, not current):** a separate,
+Market-Data-Production-only app registration was the original design,
+intended to make the token structurally incapable of trading. Confirmed
+infeasible given Schwab's one-app-per-retail-developer limit.
+
+**Token lifetime constraint (platform-enforced, unaffected by which app is
+used):** Schwab refresh tokens are valid for 7 days, after which a fresh
+interactive login is required regardless of client implementation.
+"Survives a container restart" is the correct, achievable, testable claim.
+"Never requires re-authentication" is not achievable by any client and
+must not be implied by definition-of-done language.
 
 Bar shape (the contract between `schwab-connector` and everything else):
 ```
