@@ -99,7 +99,11 @@ principle, with no code living loose at repo root:
   across from its old location.)
 - **`momentum_monitor/schwab-connector/`** — the only container holding
   the Schwab OAuth token. Owns the stream subscription and bar
-  aggregation. Internal API only (not published to host):
+  aggregation. Bars persist to an append-only JSONL store (chosen over
+  the originally-specified SQLite table for simplicity of an
+  append-mostly, single-symbol log; includes non-monotonic-bar dedup so
+  a container restart doesn't duplicate entries). Internal API only
+  (not published to host):
   - `POST /watch {"symbol": "..."}`
   - `GET /bars/{symbol}?since_ts={unix_seconds}` → array of bar objects
     per the shape in section 4.
