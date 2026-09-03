@@ -1,0 +1,4 @@
+pandas>=2.0
+numpy>=1.24
+yfinance>=0.2.40   # for historical backtest data (real backtests, run locally)
+alpaca-py>=0.30    # for live paper trading execution (run locally, needs your API keys)

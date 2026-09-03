@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+trade_log.csv
+equity_curve.csv
+.venv/
