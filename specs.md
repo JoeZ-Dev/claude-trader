@@ -123,6 +123,21 @@ principle, with no code living loose at repo root:
 3. Event-triggered LLM narration via `claude-connector`, firing only on
    meaningful state changes (level hold-confirmed, volume threshold
    crossed, MACD cross, retest, sharp reversal) — never polled.
+3.5. **Multi-scenario setup evaluation.** Rather than tracking only the
+   nearest above/below levels (phase 1's simpler version), evaluate
+   several distinct candidate setup TYPES in parallel — e.g. a
+   resistance breakout, a shorter-term micro-breakout, a VWAP
+   pullback-reclaim, and a round-number reclaim (the last of which can
+   be watched even before price has actually tested it — untested
+   round numbers are still psychologically real levels, unlike swing
+   levels which require an actual prior touch). This is a direct
+   evolution of ToS_Companion's `candidate_generator.py` three-setup-type
+   design, rebuilt on `monitor_core`'s corrected level detection instead
+   of its buggy nearest-price picking. Surface whichever candidate is
+   closest to a real setup, but per the "no collapsed grades" principle
+   established for the LLM Coach: show the factors that make it the
+   best candidate (proximity, level strength, volume confirmation) —
+   don't reduce the comparison to an opaque score.
 4. Virtual trade journal — logs what the system would have done
    (entry/stop/target) without placing anything, for end-of-day review
    against the user's own judgment.
