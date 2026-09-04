@@ -11,6 +11,23 @@ Everything in steps 1–2 happens **once**. Steps 3–6 are the actual checks.
 
 ---
 
+## 1–2. Provision credentials — **PENDING, section stale**
+
+> **TODO:** Steps 1–2 below describe the *original* credential plan (a
+> dedicated Market-Data-only Schwab app, with `schwab-connector` minting
+> and holding its own `token.json` via `client_from_login_flow`). That
+> plan is superseded — see `specs.md` §4 ("Revised credential model") —
+> `schwab-connector` now fetches short-lived access tokens from the
+> joelab `companion-auth` helper over `AUTH_HELPER_URL` and never performs
+> OAuth login itself. **`companion-auth` does not exist on this host
+> yet — it's being built separately.** Do not follow steps 1–2 as written;
+> they need a full rewrite once that service is running and its bootstrap
+> flow is confirmed. DoD check 5 below (credential-scope evidence) is
+> stale for the same reason and needs the same rewrite, against the
+> mitigation model in `specs.md` §4 (dedicated $1 funded account, no
+> margin, zero order-placement code paths, Schwab's Order Limit setting)
+> rather than the old "Market Data Production only" scope check.
+
 ## 1. Register the Schwab app — "Market Data Production" only
 
 1. Go to <https://developer.schwab.com/> → Dashboard → **Create App**.
@@ -76,14 +93,14 @@ docker compose up --build         # STREAM_SOURCE defaults to "schwab"
 
 **DoD check 1 passes if:** both `schwab-connector` and `monitor-app`
 reach "Application startup complete" with no errors, and
-`curl -s localhost:8010`… is not reachable from the host (it must be
+`curl -s localhost:7878`… is not reachable from the host (it must be
 internal only) while `http://localhost:8012` loads.
 
 Quick internal health check from inside the network:
 
 ```bash
 docker compose exec monitor-app python -c \
-  "import urllib.request,json; print(json.load(urllib.request.urlopen('http://schwab-connector:8010/health')))"
+  "import urllib.request,json; print(json.load(urllib.request.urlopen('http://schwab-connector:7878/health')))"
 # -> {'status': 'ok', 'watching': ['SPY'], 'connected': True}
 ```
 
@@ -148,7 +165,7 @@ Then confirm, explicitly:
    bars are still retrievable:
    ```bash
    docker compose exec monitor-app python -c \
-     "import urllib.request,json; d=json.load(urllib.request.urlopen('http://schwab-connector:8010/bars/SPY')); print(len(d),'bars, first ts', d[0]['ts'])"
+     "import urllib.request,json; d=json.load(urllib.request.urlopen('http://schwab-connector:7878/bars/SPY')); print(len(d),'bars, first ts', d[0]['ts'])"
    ```
    The bar file lives in the mounted volume at
    `schwab-connector/data/bars/SPY.jsonl` and is not touched by the
