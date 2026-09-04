@@ -29,7 +29,6 @@ services:
     environment:
       STREAM_SOURCE: "${STREAM_SOURCE:-schwab}"
       BAR_DB_DIR: /data/bars
-      SCHWAB_TOKEN_PATH: /data/token.json
       SCHWAB_API_KEY: "${SCHWAB_API_KEY:-}"
       SCHWAB_APP_SECRET: "${SCHWAB_APP_SECRET:-}"
       REPLAY_PATH: "${REPLAY_PATH:-/app/fixtures/replay_sample.jsonl}"
