@@ -13,7 +13,9 @@ Environment:
                      reports connected=false)
   REPLAY_PATH        fixture for STREAM_SOURCE=replay      (default /data/replay.jsonl)
 
-Run:  uvicorn main:app --host 0.0.0.0 --port 8010
+Run:  uvicorn main:app --host 0.0.0.0 --port 7878
+(internal only -- never published to the host; reached by service name on
+the docker networks schwab-connector joins.)
 """
 from __future__ import annotations
 

@@ -12,7 +12,7 @@ the working discipline.
 | Path | What |
 |---|---|
 | `core/` | Pure analysis logic (indicators, level detection, hold-confirmation) + its unit tests. No I/O. |
-| `schwab-connector/` | Holds the Schwab token. Streams one symbol, builds 10s bars, persists them, exposes an internal API (port 8010, not published). |
+| `schwab-connector/` | Holds the Schwab token. Streams one symbol, builds 10s bars, persists them, exposes an internal API (port 7878, not published). |
 | `monitor-app/` | Polls schwab-connector, full-recompute through `core/`, serves `/api/state` + a plain HTML page on published port **8012**. |
 | `claude-connector/` | Phase-3 placeholder. No service. |
 | `fixtures/` | `replay_sample.jsonl` — illustrative AEHL-shaped session for the no-token demo. Regenerate with `python fixtures/make_sample.py`. |

@@ -3,7 +3,7 @@ Production wiring for monitor-app. Binds create_app's fetch_bars /
 announce_watch to httpx calls against schwab-connector.
 
 Environment:
-  SCHWAB_CONNECTOR_URL  base URL of schwab-connector   (default http://schwab-connector:8010)
+  SCHWAB_CONNECTOR_URL  base URL of schwab-connector   (default http://schwab-connector:7878)
   WATCH_SYMBOL          the one symbol to watch this phase (default: unset -> idle)
   POLL_INTERVAL         seconds between bar polls       (default 5)
 
@@ -17,7 +17,7 @@ import httpx
 
 from app import create_app
 
-CONNECTOR_URL = os.environ.get("SCHWAB_CONNECTOR_URL", "http://schwab-connector:8010").rstrip("/")
+CONNECTOR_URL = os.environ.get("SCHWAB_CONNECTOR_URL", "http://schwab-connector:7878").rstrip("/")
 WATCH_SYMBOL = os.environ.get("WATCH_SYMBOL") or None
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "5"))
 

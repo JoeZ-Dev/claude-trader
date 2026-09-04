@@ -17,7 +17,8 @@
 #   monitor-app does NOT join joelab-ingress: it never talks to Schwab or the
 #   auth helper directly. That exposure stays scoped to schwab-connector.
 #
-# Only monitor-app publishes a port (8012). schwab-connector is internal.
+# Only monitor-app publishes a port (8012). schwab-connector binds 7878 and
+# is `expose`-only -- reachable on the docker networks, never on a host port.
 
 services:
   schwab-connector:
@@ -25,7 +26,7 @@ services:
       context: .
       dockerfile: schwab-connector/Dockerfile
     expose:
-      - "8010"
+      - "7878"
     environment:
       STREAM_SOURCE: "${STREAM_SOURCE:-schwab}"
       BAR_DB_DIR: /data/bars
@@ -50,7 +51,7 @@ services:
     ports:
       - "8012:8012"
     environment:
-      SCHWAB_CONNECTOR_URL: http://schwab-connector:8010
+      SCHWAB_CONNECTOR_URL: http://schwab-connector:7878
       WATCH_SYMBOL: "${WATCH_SYMBOL:-}"
       POLL_INTERVAL: "${POLL_INTERVAL:-5}"
     depends_on:
