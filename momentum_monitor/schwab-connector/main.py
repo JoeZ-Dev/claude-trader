@@ -19,13 +19,17 @@ the docker networks schwab-connector joins.)
 """
 from __future__ import annotations
 
+import logging
 import os
 
 from app import create_app
+from events import log_event
 from reconnect import ReconnectingStreamSource
 from store import BarStore
 from stream import ReplayStreamSource, SchwabStreamSource
 from token_source import AccessTokenSource
+
+logging.basicConfig(level=logging.INFO)
 
 STREAM_SOURCE = os.environ.get("STREAM_SOURCE", "schwab").lower()
 BAR_DB_DIR = os.environ.get("BAR_DB_DIR", "/data/bars")
@@ -62,6 +66,7 @@ else:
             token_source=AccessTokenSource(AUTH_HELPER_URL),
             build_client=_build_client,
             make_source=lambda client: SchwabStreamSource(client),
+            on_event=log_event,
         )
     _replay = False
 
