@@ -11,6 +11,10 @@ Environment:
                      joelab-ingress, e.g. http://companion-auth:<port>
                      (required for live mode; unset -> connector boots but
                      reports connected=false)
+  INTERNAL_AUTH_SECRET  shared secret sent as the X-Internal-Auth header on
+                     every companion-auth request; must match the value in
+                     companion-auth's own .env (unset -> companion-auth
+                     rejects every request with 401)
   REPLAY_PATH        fixture for STREAM_SOURCE=replay      (default /data/replay.jsonl)
 
 Run:  uvicorn main:app --host 0.0.0.0 --port 7878
@@ -36,6 +40,7 @@ BAR_DB_DIR = os.environ.get("BAR_DB_DIR", "/data/bars")
 API_KEY = os.environ.get("SCHWAB_API_KEY", "")
 APP_SECRET = os.environ.get("SCHWAB_APP_SECRET", "")
 AUTH_HELPER_URL = os.environ.get("AUTH_HELPER_URL", "").strip()
+INTERNAL_AUTH_SECRET = os.environ.get("INTERNAL_AUTH_SECRET", "")
 REPLAY_PATH = os.environ.get("REPLAY_PATH", "/data/replay.jsonl")
 
 _store = BarStore(BAR_DB_DIR)
@@ -63,7 +68,7 @@ else:
             raise RuntimeError(
                 "AUTH_HELPER_URL is not set; cannot reach companion-auth for a token")
         return ReconnectingStreamSource(
-            token_source=AccessTokenSource(AUTH_HELPER_URL),
+            token_source=AccessTokenSource(AUTH_HELPER_URL, shared_secret=INTERNAL_AUTH_SECRET),
             build_client=_build_client,
             make_source=lambda client: SchwabStreamSource(client),
             on_event=log_event,

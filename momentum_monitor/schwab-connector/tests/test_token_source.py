@@ -21,9 +21,11 @@ class FakeHelper:
     def __init__(self, *responses):
         self.responses = list(responses)
         self.calls = []
+        self.headers_sent = []
 
-    def __call__(self, url):
+    def __call__(self, url, headers=None):
         self.calls.append(url)
+        self.headers_sent.append(headers)
         if self.responses:
             return self.responses.pop(0)
         return 200, {"access_token": "DEFAULT", "expires_at": NOW + 3600, "source": "homelab"}
@@ -128,3 +130,33 @@ def test_as_schwab_token_fetches_when_empty():
     src = AccessTokenSource("http://x", http_get=helper, now_fn=lambda: NOW)
     src.as_schwab_token()
     assert len(helper.calls) == 1
+
+
+def test_refresh_sends_shared_secret_header():
+    helper = FakeHelper((200, {"access_token": "abc", "expires_at": NOW + 1800}))
+    src = AccessTokenSource("http://x", http_get=helper, now_fn=lambda: NOW,
+                            shared_secret="s3cr3t")
+    src.refresh()
+    assert helper.headers_sent == [{"X-Internal-Auth": "s3cr3t"}]
+
+
+def test_shared_secret_defaults_from_internal_auth_secret_env_var(monkeypatch):
+    monkeypatch.setenv("INTERNAL_AUTH_SECRET", "from-env")
+    helper = FakeHelper((200, {"access_token": "abc", "expires_at": NOW + 1800}))
+    src = AccessTokenSource("http://x", http_get=helper, now_fn=lambda: NOW)
+    src.refresh()
+    assert helper.headers_sent == [{"X-Internal-Auth": "from-env"}]
+
+
+def test_401_raises_auth_helper_error_and_is_not_swallowed():
+    src = AccessTokenSource("http://x", http_get=FakeHelper(
+        (401, {"error": "UNAUTHORIZED"})), shared_secret="wrong")
+    with pytest.raises(AuthHelperError, match="401"):
+        src.refresh()
+
+
+def test_401_error_message_points_at_the_shared_secret():
+    src = AccessTokenSource("http://x", http_get=FakeHelper(
+        (401, {"error": "UNAUTHORIZED"})), shared_secret="wrong")
+    with pytest.raises(AuthHelperError, match="INTERNAL_AUTH_SECRET"):
+        src.refresh()

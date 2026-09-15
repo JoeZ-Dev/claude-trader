@@ -6,10 +6,16 @@ refresh token. It fetches short-lived access tokens from `companion-auth`
 over the internal `joelab-ingress` network:
 
     GET {AUTH_HELPER_URL}/access_token
+        X-Internal-Auth: <INTERNAL_AUTH_SECRET>
         200 -> {"access_token": str, "expires_at": <unix int>, "source": str}
-        409 -> {"error": "AUTH_REQUIRED", "message": str, ...}   (not bootstrapped)
+        401 -> {"error": "UNAUTHORIZED"}                          (bad/missing shared secret)
+        409 -> {"error": "AUTH_REQUIRED", "message": str, ...}    (not bootstrapped)
 
-(Contract from `tools/auth_helper/server.py` in the ToS_Companion repo.)
+(Contract from `companion-auth`'s own `app.py`.) `X-Internal-Auth` is the
+service's actual security boundary -- Cloudflare path-scoping is
+defense-in-depth on top of it, not a substitute -- so every request carries
+it, and a 401 is raised as a distinct, actionable error rather than falling
+into the generic upstream-failure path.
 
 Because the response carries no `refresh_token`, schwab-py's built-in
 auto-refresh (authlib, which needs a `refresh_token` in the token dict it
@@ -24,9 +30,11 @@ does not build the schwab-py client or manage the stream.
 """
 from __future__ import annotations
 
+import os
 import time
 
 LEEWAY_SECONDS = 300  # matches schwab-py's authlib leeway convention
+INTERNAL_AUTH_HEADER = "X-Internal-Auth"
 
 
 class AuthRequired(RuntimeError):
@@ -39,10 +47,10 @@ class AuthHelperError(RuntimeError):
     """The helper responded in a way we can't use (bad status or payload)."""
 
 
-def _httpx_get(url: str):
+def _httpx_get(url: str, headers: dict | None = None):
     import httpx
 
-    resp = httpx.get(url, timeout=10.0)
+    resp = httpx.get(url, headers=headers, timeout=10.0)
     try:
         payload = resp.json()
     except Exception:
@@ -52,11 +60,12 @@ def _httpx_get(url: str):
 
 class AccessTokenSource:
     def __init__(self, base_url: str, *, http_get=None, now_fn=time.time,
-                 leeway_seconds: int = LEEWAY_SECONDS) -> None:
+                 leeway_seconds: int = LEEWAY_SECONDS, shared_secret: str | None = None) -> None:
         self._base = base_url.rstrip("/")
         self._http_get = http_get or _httpx_get
         self._now = now_fn
         self._leeway = leeway_seconds
+        self._secret = shared_secret if shared_secret is not None else os.environ.get("INTERNAL_AUTH_SECRET", "")
         self._access_token: str | None = None
         self._expires_at: float = 0.0
         self._creation_ts: float = 0.0
@@ -71,7 +80,14 @@ class AccessTokenSource:
 
     def refresh(self) -> str:
         """Unconditionally fetch a fresh access token from the helper."""
-        status, payload = self._http_get(f"{self._base}/access_token")
+        status, payload = self._http_get(
+            f"{self._base}/access_token",
+            headers={INTERNAL_AUTH_HEADER: self._secret},
+        )
+        if status == 401:
+            raise AuthHelperError(
+                "companion-auth rejected X-Internal-Auth (401) -- check "
+                "INTERNAL_AUTH_SECRET matches companion-auth's .env")
         if status == 409:
             msg = (payload or {}).get("message") if isinstance(payload, dict) else None
             raise AuthRequired(msg or "companion-auth has no token; run its bootstrap OAuth")

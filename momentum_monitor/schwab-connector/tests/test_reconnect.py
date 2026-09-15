@@ -22,7 +22,7 @@ class FakeHelper:
         self.responses = list(responses)
         self.calls = 0
 
-    def __call__(self, url):
+    def __call__(self, url, headers=None):
         self.calls += 1
         if self.responses:
             return self.responses.pop(0)

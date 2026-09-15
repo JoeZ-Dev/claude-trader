@@ -37,6 +37,9 @@ services:
       # name on joelab-ingress. Port is pinned by the joelab side -- fill it in:
       #   AUTH_HELPER_URL=http://companion-auth:<port>
       AUTH_HELPER_URL: "${AUTH_HELPER_URL:-}"
+      # Shared secret sent as X-Internal-Auth on every companion-auth request.
+      # Must match INTERNAL_AUTH_SECRET in companion-auth's own .env.
+      INTERNAL_AUTH_SECRET: "${INTERNAL_AUTH_SECRET:-}"
     volumes:
       - ./schwab-connector/data:/data
     networks:
