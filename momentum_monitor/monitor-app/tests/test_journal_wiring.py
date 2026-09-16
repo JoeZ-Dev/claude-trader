@@ -126,6 +126,22 @@ def test_entry_does_not_duplicate_on_subsequent_confirmed_polls(tmp_path):
     assert store.open_position_for("AEHL") is not None
 
 
+def test_root_page_renders_open_position_after_real_entry(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch([_pre_break_bars(), _break_bars(), _pullback_bars()])
+
+    with _client(fetch, journal_store=store) as c:
+        assert _wait_until(lambda: store.open_position_for("AEHL") is not None)
+        page = c.get("/").text
+        # "No open virtual position" also appears verbatim inside the page's
+        # embedded JS fallback (always present as source, regardless of
+        # state), so that string alone isn't a safe assertion here -- the
+        # real, meaningful proof is the entry price actually showing up in
+        # the server-rendered #journal-open content.
+        journal_open_html = page.split('id="journal-open">', 1)[1].split("</div>", 1)[0]
+        assert "9.8" in journal_open_html
+
+
 # -- trailing stop, wired end to end -------------------------------------
 
 def test_stop_exit_recorded_in_journal_store(tmp_path):

@@ -276,120 +276,344 @@ class Poller:
         self._journal_was_confirmed = tick.was_confirmed_after
 
 
-def _journal_html(journal: dict) -> str:
-    open_block = journal.get("open")
-    if open_block is not None:
-        open_html = (
-            "<table>"
-            f"<tr><th>symbol</th><td>{html.escape(str(open_block['symbol']))}</td></tr>"
-            f"<tr><th>entry price</th><td>{open_block['entry_price']}</td></tr>"
-            f"<tr><th>trailing stop</th><td>{open_block['stop_level']}</td></tr>"
-            f"<tr><th>unrealized P&amp;L %</th><td>{open_block['unrealized_pnl_pct']}</td></tr>"
-            "</table>"
-        )
-    else:
-        open_html = "<p>No open virtual position.</p>"
+# -- rendering helpers shared in spirit (deliberately, minimally
+# duplicated -- see _wrap's script block) between the Python first-paint
+# render below and the client-side JS that updates the same elements in
+# place on every poll after that. "Single file, no framework, no build
+# step" (this session's explicit constraint) rules out sharing one
+# template between server and client, so a small, mirrored pair of
+# renderers -- kept short and named identically in spirit on both sides --
+# is the deliberate tradeoff, not an oversight.
 
-    closed = journal.get("recent_closed") or []
-    if closed:
-        rows = "".join(
+def _fmt(v, decimals: int = 4) -> str:
+    if v is None:
+        return "—"
+    if isinstance(v, float):
+        return f"{v:.{decimals}f}"
+    return html.escape(str(v))
+
+
+def _sign_class(v) -> str:
+    if v is None:
+        return ""
+    return "pos" if v >= 0 else "neg"
+
+
+def _cmp_class(a, b) -> str:
+    """Class for `a` relative to reference `b` (e.g. price vs VWAP) --
+    'pos' at or above, 'neg' below. Comparison-based, not a sign check."""
+    if a is None or b is None:
+        return ""
+    return "pos" if a >= b else "neg"
+
+
+def _level_block_html(title: str, block: dict | None) -> str:
+    if block is None:
+        return f"<h3>{html.escape(title)}</h3><p class='muted'>none on this side of price</p>"
+    c, h = block["components"], block["hold"]
+    badge = (
+        "<span class='badge badge-confirmed'>confirmed</span>" if h["confirmed"]
+        else "<span class='badge badge-pending'>not confirmed</span>"
+    )
+    return (
+        f"<h3>{html.escape(title)} @ {_fmt(block['price'], 2)}</h3>"
+        "<table class='detail'>"
+        f"<tr><th>strength</th><td>{_fmt(block['strength_score'], 2)}</td></tr>"
+        f"<tr><th>touch count</th><td>{c['touch_count']}</td></tr>"
+        f"<tr><th>touch volume</th><td>{_fmt(c['total_touch_volume'], 0)}</td></tr>"
+        f"<tr><th>round-number bonus</th><td>{_fmt(c['round_number_bonus'], 2)}</td></tr>"
+        f"<tr><th>hold direction</th><td>{html.escape(h['direction'])}</td></tr>"
+        f"<tr><th>consecutive closes</th><td>{h['consecutive_bars']} / {h['required_bars']}</td></tr>"
+        f"<tr><th>hold confirmed</th><td>{badge}</td></tr>"
+        f"<tr><th>failed attempts</th><td>{h['failed_attempts']}</td></tr>"
+        "</table>"
+    )
+
+
+def _journal_open_html(open_block: dict | None) -> str:
+    if open_block is None:
+        return "<p class='muted'>No open virtual position.</p>"
+    cls = _sign_class(open_block["unrealized_pnl_pct"])
+    return (
+        "<table class='detail'>"
+        f"<tr><th>symbol</th><td>{html.escape(str(open_block['symbol']))}</td></tr>"
+        f"<tr><th>entry price</th><td>{_fmt(open_block['entry_price'], 2)}</td></tr>"
+        f"<tr><th>trailing stop</th><td>{_fmt(open_block['stop_level'], 2)}</td></tr>"
+        f"<tr><th>unrealized P&amp;L %</th>"
+        f"<td class='{cls}'>{_fmt(open_block['unrealized_pnl_pct'], 2)}%</td></tr>"
+        "</table>"
+    )
+
+
+def _journal_closed_rows_html(closed: list[dict]) -> str:
+    if not closed:
+        return "<tr><td colspan='5' class='muted'>No closed trades yet.</td></tr>"
+    rows = []
+    for t in closed:
+        cls = _sign_class(t["realized_pnl_pct"])
+        pnl = "" if t["realized_pnl_pct"] is None else f"{_fmt(t['realized_pnl_pct'], 2)}%"
+        rows.append(
             "<tr>"
             f"<td>{html.escape(str(t['symbol']))}</td>"
-            f"<td>{t['entry_price']}</td><td>{t['exit_price']}</td>"
+            f"<td>{_fmt(t['entry_price'], 2)}</td><td>{_fmt(t['exit_price'], 2)}</td>"
             f"<td>{html.escape(str(t['exit_reason']))}</td>"
-            f"<td>{round(t['realized_pnl_pct'], 4) if t['realized_pnl_pct'] is not None else ''}</td>"
+            f"<td class='{cls}'>{pnl}</td>"
             "</tr>"
-            for t in closed
         )
-        closed_html = (
-            "<table><tr><th>symbol</th><th>entry</th><th>exit</th>"
-            "<th>reason</th><th>P&amp;L %</th></tr>" + rows + "</table>"
-        )
-    else:
-        closed_html = "<p>No closed trades yet.</p>"
-
-    return (
-        "<h2>Virtual position</h2>" + open_html
-        + "<h2>Recent closed trades</h2>" + closed_html
-    )
+    return "".join(rows)
 
 
 def _page(state: dict, journal: dict) -> str:
-    journal_body = _journal_html(journal)
     sym = html.escape(str(state.get("symbol") or "—"))
-    if state.get("status") != "ok":
-        if state.get("symbol"):
-            body = f"<p>Warming up — waiting for bars for <b>{sym}</b>.</p>"
-        else:
-            body = "<p>No symbol selected yet — enter a ticker below.</p>"
-        return _wrap(sym, body + journal_body)
+    is_ok = state.get("status") == "ok"
 
-    s = state["session"]
-    rows = [
-        ("Last price", state["last_price"]),
-        ("Bars", state["bar_count"]),
-        ("Last bar extended-hours", state["last_bar_is_extended"]),
-        ("VWAP (session)", s["vwap"]),
-        ("EMA 9", s["ema9"]),
-        ("EMA 20", s["ema20"]),
-        ("MACD", s["macd"]["macd"]),
-        ("MACD signal", s["macd"]["signal"]),
-        ("MACD histogram", s["macd"]["histogram"]),
-        ("Relative volume", s["relative_volume"]),
-    ]
-    table = "".join(
-        f"<tr><th>{html.escape(k)}</th><td>{html.escape(str(v))}</td></tr>"
-        for k, v in rows
-    )
+    if is_ok:
+        s = state["session"]
+        price_cls = _cmp_class(state["last_price"], s["vwap"])
+        ema9_cls = _cmp_class(state["last_price"], s["ema9"])
+        hist_cls = _sign_class(s["macd"]["histogram"])
+        price_val, bars_val = _fmt(state["last_price"], 2), str(state["bar_count"])
+        extended_val = "yes" if state["last_bar_is_extended"] else "no"
+        vwap_val, ema9_val, ema20_val = _fmt(s["vwap"]), _fmt(s["ema9"]), _fmt(s["ema20"])
+        macd_val = _fmt(s["macd"]["macd"], 6)
+        macd_sig_val = _fmt(s["macd"]["signal"], 6)
+        macd_hist_val = _fmt(s["macd"]["histogram"], 6)
+        relvol_val = _fmt(s["relative_volume"], 2)
+        resistance_html = _level_block_html("Resistance (nearest above)", state["levels"]["resistance"])
+        support_html = _level_block_html("Support (nearest below)", state["levels"]["support"])
+        banner_text, banner_display = "", "display:none"
+        main_display = ""
+    else:
+        price_cls = ema9_cls = hist_cls = ""
+        price_val = bars_val = extended_val = "—"
+        vwap_val = ema9_val = ema20_val = macd_val = macd_sig_val = macd_hist_val = relvol_val = "—"
+        resistance_html = support_html = ""
+        banner_text = (f"Warming up — waiting for bars for {sym}." if state.get("symbol")
+                      else "No symbol selected yet — enter a ticker below.")
+        banner_display, main_display = "", "display:none"
 
-    def level_html(title, block):
-        if block is None:
-            return f"<h2>{title}</h2><p>none on this side of price</p>"
-        c = block["components"]
-        h = block["hold"]
-        return (
-            f"<h2>{title} @ {block['price']}</h2>"
-            f"<table>"
-            f"<tr><th>strength</th><td>{block['strength_score']}</td></tr>"
-            f"<tr><th>touch count</th><td>{c['touch_count']}</td></tr>"
-            f"<tr><th>touch volume</th><td>{c['total_touch_volume']}</td></tr>"
-            f"<tr><th>round-number bonus</th><td>{c['round_number_bonus']}</td></tr>"
-            f"<tr><th>hold direction</th><td>{h['direction']}</td></tr>"
-            f"<tr><th>consecutive closes</th><td>{h['consecutive_bars']} / {h['required_bars']}</td></tr>"
-            f"<tr><th>hold confirmed</th><td>{h['confirmed']}</td></tr>"
-            f"<tr><th>failed attempts</th><td>{h['failed_attempts']}</td></tr>"
-            f"</table>"
-        )
+    journal_open_html = _journal_open_html(journal.get("open"))
+    journal_closed_rows = _journal_closed_rows_html(journal.get("recent_closed") or [])
 
-    body = (
-        f"<table>{table}</table>"
-        + level_html("Resistance (nearest above)", state["levels"]["resistance"])
-        + level_html("Support (nearest below)", state["levels"]["support"])
-        + journal_body
-    )
+    body = f"""
+<div id="banner" class="banner" style="{banner_display}">{html.escape(banner_text)}</div>
+<div id="main" style="{main_display}">
+  <section class="hero card">
+    <div class="hero-symbol">{sym}</div>
+    <div id="price-value" class="hero-price {price_cls}">{price_val}</div>
+  </section>
+
+  <section class="card">
+    <h2>Virtual position</h2>
+    <div id="journal-open">{journal_open_html}</div>
+  </section>
+
+  <section class="card">
+    <h2>Indicators</h2>
+    <table class="detail">
+      <tr><th>Bars</th><td id="ind-bars">{bars_val}</td></tr>
+      <tr><th>Last bar extended-hours</th><td id="ind-extended">{extended_val}</td></tr>
+      <tr><th>VWAP (session)</th><td id="ind-vwap">{vwap_val}</td></tr>
+      <tr><th>EMA 9</th><td id="ind-ema9" class="{ema9_cls}">{ema9_val}</td></tr>
+      <tr><th>EMA 20</th><td id="ind-ema20">{ema20_val}</td></tr>
+      <tr><th>MACD</th><td id="ind-macd">{macd_val}</td></tr>
+      <tr><th>MACD signal</th><td id="ind-macd-signal">{macd_sig_val}</td></tr>
+      <tr><th>MACD histogram</th><td id="ind-macd-hist" class="{hist_cls}">{macd_hist_val}</td></tr>
+      <tr><th>Relative volume</th><td id="ind-relvol">{relvol_val}</td></tr>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>Levels</h2>
+    <div id="resistance-block">{resistance_html}</div>
+    <div id="support-block">{support_html}</div>
+  </section>
+
+  <section class="card">
+    <h2>Recent closed trades</h2>
+    <table class="detail">
+      <tr><th>symbol</th><th>entry</th><th>exit</th><th>reason</th><th>P&amp;L %</th></tr>
+      <tbody id="journal-closed-tbody">{journal_closed_rows}</tbody>
+    </table>
+  </section>
+</div>
+"""
     return _wrap(sym, body)
 
 
 _SYMBOL_FORM = (
-    "<form method='post' action='/api/watch' style='margin:.5rem 0'>"
-    "<input name='symbol' placeholder='Ticker' maxlength='10' autocomplete='off' "
-    "style='text-transform:uppercase'>"
+    "<form method='post' action='/api/watch' class='ticker-form'>"
+    "<input name='symbol' placeholder='Ticker' maxlength='10' autocomplete='off'>"
     "<button type='submit'>Watch</button>"
     "</form>"
 )
+
+# Mirrors, in JS, the same helpers/templates as the Python side above --
+# see the module-level comment on _fmt for why this duplication exists.
+_SCRIPT = """
+function fmt(v, d) {
+  if (v === null || v === undefined) return '\\u2014';
+  if (typeof v === 'number') return v.toFixed(d === undefined ? 4 : d);
+  return String(v);
+}
+function signClass(v) {
+  if (v === null || v === undefined) return '';
+  return v >= 0 ? 'pos' : 'neg';
+}
+function cmpClass(a, b) {
+  if (a === null || a === undefined || b === null || b === undefined) return '';
+  return a >= b ? 'pos' : 'neg';
+}
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = String(s);
+  return d.innerHTML;
+}
+function levelBlockHtml(title, block) {
+  if (!block) {
+    return '<h3>' + esc(title) + '</h3><p class="muted">none on this side of price</p>';
+  }
+  const h = block.hold, c = block.components;
+  const badge = h.confirmed
+    ? '<span class="badge badge-confirmed">confirmed</span>'
+    : '<span class="badge badge-pending">not confirmed</span>';
+  return '<h3>' + esc(title) + ' @ ' + fmt(block.price, 2) + '</h3>' +
+    '<table class="detail">' +
+    '<tr><th>strength</th><td>' + fmt(block.strength_score, 2) + '</td></tr>' +
+    '<tr><th>touch count</th><td>' + c.touch_count + '</td></tr>' +
+    '<tr><th>touch volume</th><td>' + fmt(c.total_touch_volume, 0) + '</td></tr>' +
+    '<tr><th>round-number bonus</th><td>' + fmt(c.round_number_bonus, 2) + '</td></tr>' +
+    '<tr><th>hold direction</th><td>' + esc(h.direction) + '</td></tr>' +
+    '<tr><th>consecutive closes</th><td>' + h.consecutive_bars + ' / ' + h.required_bars + '</td></tr>' +
+    '<tr><th>hold confirmed</th><td>' + badge + '</td></tr>' +
+    '<tr><th>failed attempts</th><td>' + h.failed_attempts + '</td></tr>' +
+    '</table>';
+}
+function journalOpenHtml(open) {
+  if (!open) return '<p class="muted">No open virtual position.</p>';
+  const cls = signClass(open.unrealized_pnl_pct);
+  return '<table class="detail">' +
+    '<tr><th>symbol</th><td>' + esc(open.symbol) + '</td></tr>' +
+    '<tr><th>entry price</th><td>' + fmt(open.entry_price, 2) + '</td></tr>' +
+    '<tr><th>trailing stop</th><td>' + fmt(open.stop_level, 2) + '</td></tr>' +
+    '<tr><th>unrealized P&amp;L %</th><td class="' + cls + '">' + fmt(open.unrealized_pnl_pct, 2) + '%</td></tr>' +
+    '</table>';
+}
+function journalClosedRows(closed) {
+  if (!closed || !closed.length) {
+    return '<tr><td colspan="5" class="muted">No closed trades yet.</td></tr>';
+  }
+  return closed.map(function(t) {
+    const cls = signClass(t.realized_pnl_pct);
+    const pnl = t.realized_pnl_pct === null ? '' : fmt(t.realized_pnl_pct, 2) + '%';
+    return '<tr><td>' + esc(t.symbol) + '</td><td>' + fmt(t.entry_price, 2) + '</td>' +
+      '<td>' + fmt(t.exit_price, 2) + '</td><td>' + esc(t.exit_reason) + '</td>' +
+      '<td class="' + cls + '">' + pnl + '</td></tr>';
+  }).join('');
+}
+async function refresh() {
+  let data;
+  try {
+    const r = await fetch('/api/state');
+    data = await r.json();
+  } catch (e) {
+    return;  // keep showing the last-good render, same philosophy as the server's own _poll_ok
+  }
+  const banner = document.getElementById('banner');
+  const main = document.getElementById('main');
+  if (data.status !== 'ok') {
+    banner.textContent = data.symbol
+      ? ('Warming up \\u2014 waiting for bars for ' + data.symbol + '.')
+      : 'No symbol selected yet \\u2014 enter a ticker below.';
+    banner.style.display = '';
+    main.style.display = 'none';
+    return;
+  }
+  banner.style.display = 'none';
+  main.style.display = '';
+
+  const s = data.session;
+  const priceEl = document.getElementById('price-value');
+  priceEl.textContent = fmt(data.last_price, 2);
+  priceEl.className = 'hero-price ' + cmpClass(data.last_price, s.vwap);
+  document.getElementById('ind-bars').textContent = data.bar_count;
+  document.getElementById('ind-extended').textContent = data.last_bar_is_extended ? 'yes' : 'no';
+  document.getElementById('ind-vwap').textContent = fmt(s.vwap, 4);
+  const ema9El = document.getElementById('ind-ema9');
+  ema9El.textContent = fmt(s.ema9, 4);
+  ema9El.className = cmpClass(data.last_price, s.ema9);
+  document.getElementById('ind-ema20').textContent = fmt(s.ema20, 4);
+  document.getElementById('ind-macd').textContent = fmt(s.macd.macd, 6);
+  document.getElementById('ind-macd-signal').textContent = fmt(s.macd.signal, 6);
+  const histEl = document.getElementById('ind-macd-hist');
+  histEl.textContent = fmt(s.macd.histogram, 6);
+  histEl.className = signClass(s.macd.histogram);
+  document.getElementById('ind-relvol').textContent = fmt(s.relative_volume, 2);
+
+  document.getElementById('resistance-block').innerHTML =
+    levelBlockHtml('Resistance (nearest above)', data.levels.resistance);
+  document.getElementById('support-block').innerHTML =
+    levelBlockHtml('Support (nearest below)', data.levels.support);
+
+  document.getElementById('journal-open').innerHTML = journalOpenHtml(data.journal.open);
+  document.getElementById('journal-closed-tbody').innerHTML = journalClosedRows(data.journal.recent_closed);
+}
+refresh();
+setInterval(refresh, 4000);
+"""
+
+_STYLE = """
+:root{
+  --bg:#0b0e14; --card:#141822; --border:#232838; --text:#e6e9ef; --muted:#8b93a7;
+  --pos:#3ecf7e; --neg:#f0555a; --pending:#c9a227; --accent:#4f8cff;
+}
+*{box-sizing:border-box}
+body{font:15px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  margin:0;padding:1.5rem;background:var(--bg);color:var(--text);
+  max-width:52rem;margin-inline:auto}
+h1,h2,h3{margin:0 0 .5rem}
+h2{font-size:.95rem;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+h3{font-size:.9rem;color:var(--text)}
+.topbar{display:flex;align-items:center;justify-content:space-between;
+  gap:1rem;margin-bottom:1rem}
+.ticker-form{display:flex;gap:.4rem}
+.ticker-form input{text-transform:uppercase;background:var(--card);
+  border:1px solid var(--border);color:var(--text);border-radius:.4rem;
+  padding:.4rem .6rem;width:7rem}
+.ticker-form button{background:var(--accent);color:#fff;border:none;
+  border-radius:.4rem;padding:.4rem .8rem;cursor:pointer}
+.banner{background:var(--pending);color:#1a1400;padding:.6rem 1rem;
+  border-radius:.4rem;margin-bottom:1rem;font-weight:600}
+.card{background:var(--card);border:1px solid var(--border);
+  border-radius:.6rem;padding:1rem 1.2rem;margin-bottom:1rem}
+.hero{display:flex;align-items:baseline;gap:1rem}
+.hero-symbol{font-size:1.4rem;font-weight:700;letter-spacing:.02em}
+.hero-price{font-size:2.4rem;font-weight:700;font-variant-numeric:tabular-nums}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+table.detail th,table.detail td{padding:.3rem .5rem;text-align:left;
+  border-bottom:1px solid var(--border);font-size:.9rem}
+table.detail th{color:var(--muted);font-weight:500;width:45%}
+.pos{color:var(--pos);font-weight:600}
+.neg{color:var(--neg);font-weight:600}
+.muted{color:var(--muted)}
+.badge{display:inline-block;padding:.1rem .5rem;border-radius:1rem;
+  font-size:.78rem;font-weight:600}
+.badge-confirmed{background:rgba(62,207,126,.18);color:var(--pos)}
+.badge-pending{background:rgba(201,162,39,.18);color:var(--pending)}
+.footer{color:var(--muted);font-size:.8rem;margin-top:1rem}
+"""
 
 
 def _wrap(sym: str, body: str) -> str:
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
-        "<meta http-equiv=\"refresh\" content=\"5\">"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         f"<title>momentum monitor — {sym}</title>"
-        "<style>body{font:14px system-ui,sans-serif;margin:2rem;max-width:40rem}"
-        "table{border-collapse:collapse;margin:.5rem 0}"
-        "th,td{border:1px solid #ccc;padding:.25rem .6rem;text-align:left}"
-        "th{background:#f4f4f4}</style></head><body>"
-        f"<h1>{sym}</h1>{_SYMBOL_FORM}{body}"
-        "<p style='color:#888'>Read-only technical read. Not advice, not an order.</p>"
+        f"<style>{_STYLE}</style></head><body>"
+        f"<div class='topbar'><h1>{sym}</h1>{_SYMBOL_FORM}</div>"
+        f"{body}"
+        "<p class='footer'>Read-only technical read. Not advice, not an order.</p>"
+        f"<script>{_SCRIPT}</script>"
         "</body></html>"
     )
 

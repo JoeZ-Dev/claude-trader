@@ -101,7 +101,37 @@ def test_root_page_renders_key_numbers():
         html = c.get("/").text
         assert "AEHL" in html
         assert "VWAP" in html.upper()
-        assert 'http-equiv="refresh"' in html
+
+
+def test_root_page_has_no_meta_refresh():
+    # Regression guard: a full-page reload every few seconds (the original
+    # bug) is what caused the flicker/redraw -- meta-refresh must be gone,
+    # replaced by in-place JS polling.
+    with _client(FakeFetch([_bars(5)])) as c:
+        assert 'http-equiv="refresh"' not in c.get("/").text.lower()
+
+
+def test_root_page_polls_api_state_via_js_without_reloading():
+    with _client(FakeFetch([_bars(5)])) as c:
+        page = c.get("/").text
+        assert "setInterval" in page
+        assert "fetch(" in page
+        assert "/api/state" in page
+
+
+def test_root_page_has_stable_ids_for_js_to_update():
+    # The specific elements the polling JS updates in place -- if these
+    # ids drift out of sync between the Python-rendered shell and the JS,
+    # updates silently stop working with no error anywhere.
+    bars = _bars(30)
+    with _client(FakeFetch([bars])) as c:
+        assert _wait_until(lambda: c.get("/api/state").json().get("status") == "ok")
+        page = c.get("/").text
+        for expected_id in ("price-value", "ind-vwap", "ind-ema9", "ind-ema20",
+                            "ind-macd", "ind-macd-signal", "ind-macd-hist",
+                            "ind-relvol", "resistance-block", "support-block",
+                            "journal-open", "journal-closed-tbody", "banner"):
+            assert f'id="{expected_id}"' in page, f"missing id={expected_id}"
 
 
 def test_announce_watch_called_on_startup():
