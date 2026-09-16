@@ -7,6 +7,7 @@ in specs.md section 5 (internal only -- docker-compose does not publish a
 port for this service):
 
   POST /watch {"symbol": "..."}
+  POST /unwatch {"symbol": "..."}
   GET  /bars/{symbol}?since_ts={unix_seconds}  -> array of bar objects
                                                   (specs.md section 4 shape)
   GET  /health  -> {"status": "ok", "watching": [...], "connected": bool}
@@ -24,6 +25,7 @@ session -- see price_history.py's module docstring for the full story.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -75,6 +77,27 @@ class Connector:
         if key in self._tasks:
             return
         self._tasks[key] = asyncio.create_task(self._consume(key))
+
+    async def unwatch(self, symbol: str) -> bool:
+        """Stop live-streaming `symbol`: cancels its consume task and drops
+        it from `watching`. Idempotent -- unwatching a symbol that isn't
+        currently watched is a no-op returning False. Does NOT touch its
+        stored bars (BarStore) -- history stays on disk, only the live
+        subscription stops, same as any other restart-safe data in this
+        service. Awaits the cancelled task's actual teardown (not just
+        scheduling the cancellation) so a symbol removed from `watching`
+        here is fully stopped, not still mid-shutdown -- important because
+        the caller (monitor-app, switching which symbol it displays) may
+        re-watch a different symbol immediately after."""
+        key = symbol.upper()
+        task = self._tasks.pop(key, None)
+        self._sources.pop(key, None)
+        if task is None:
+            return False
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        return True
 
     def bars(self, symbol: str, since_ts: float) -> list[dict]:
         return self._store.since(symbol, since_ts)
@@ -162,6 +185,11 @@ def create_app(*, store: BarStore, source_factory, replay: bool,
     @app.post("/watch")
     async def watch(req: WatchRequest):
         connector.watch(req.symbol)
+        return {"watching": connector.watching}
+
+    @app.post("/unwatch")
+    async def unwatch(req: WatchRequest):
+        await connector.unwatch(req.symbol)
         return {"watching": connector.watching}
 
     @app.get("/bars/{symbol}")

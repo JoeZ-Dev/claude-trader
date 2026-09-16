@@ -54,11 +54,12 @@ def _wait_until(pred, timeout=3.0):
     return pred()
 
 
-def _client(fetch, *, symbol="AEHL", announce=None,
+def _client(fetch, *, symbol="AEHL", announce=None, unwatch=None,
             announce_retry_attempts=5, announce_retry_base_delay=0.02,
             announce_retry_max_delay=0.02):
     app = create_app(fetch_bars=fetch, watch_symbol=symbol,
                      poll_interval=0.05, announce_watch=announce,
+                     announce_unwatch=unwatch,
                      announce_retry_attempts=announce_retry_attempts,
                      announce_retry_base_delay=announce_retry_base_delay,
                      announce_retry_max_delay=announce_retry_max_delay)
@@ -226,6 +227,66 @@ def test_starting_with_no_symbol_then_watching_one_still_works():
         assert c.get("/api/state").json()["status"] == "warming_up"
         assert fetch.calls == []
         c.post("/api/watch", data={"symbol": "TSLA"})
+        assert _wait_until(lambda: c.get("/api/state").json().get("status") == "ok")
+
+
+# -- switching must unwatch the previous symbol, not just add the new one -
+#
+# Real gap found live (2026-09-16): schwab-connector accumulated 6
+# simultaneously-watched symbols (DLXY, KXIN, QCLS, RETO, SPCX, SPY) from
+# using the UI's ticker box repeatedly, despite the UI only ever showing
+# one. switch_symbol announced the new watch but never told
+# schwab-connector to drop the old one.
+
+def test_switch_symbol_unwatches_the_previous_symbol():
+    unwatched = []
+
+    async def unwatch(sym):
+        unwatched.append(sym)
+
+    with _client(FakeFetch([_bars(3), _bars(3, base=50.0)]), symbol="AEHL",
+                unwatch=unwatch) as c:
+        assert _wait_until(lambda: c.get("/api/state").json().get("status") == "ok")
+        c.post("/api/watch", data={"symbol": "MSFT"})
+        assert _wait_until(lambda: unwatched == ["AEHL"])
+
+
+def test_first_watch_with_no_prior_symbol_does_not_call_unwatch():
+    unwatched = []
+
+    async def unwatch(sym):
+        unwatched.append(sym)
+
+    fetch = FakeFetch([_bars(3)])
+    with _client(fetch, symbol=None, unwatch=unwatch) as c:
+        c.post("/api/watch", data={"symbol": "MSFT"})
+        assert _wait_until(lambda: c.get("/api/state").json().get("symbol") == "MSFT")
+        time.sleep(0.1)
+        assert unwatched == []
+
+
+def test_switching_to_same_symbol_does_not_call_unwatch():
+    unwatched = []
+
+    async def unwatch(sym):
+        unwatched.append(sym)
+
+    with _client(FakeFetch([_bars(3)]), symbol="AEHL", unwatch=unwatch) as c:
+        assert _wait_until(lambda: c.get("/api/state").json().get("status") == "ok")
+        c.post("/api/watch", data={"symbol": "aehl"})
+        time.sleep(0.1)
+        assert unwatched == []
+
+
+def test_unwatch_failure_does_not_block_switching_to_new_symbol():
+    async def failing_unwatch(sym):
+        raise RuntimeError("schwab-connector unreachable")
+
+    with _client(FakeFetch([_bars(3), _bars(3, base=50.0)]), symbol="AEHL",
+                unwatch=failing_unwatch) as c:
+        assert _wait_until(lambda: c.get("/api/state").json().get("status") == "ok")
+        c.post("/api/watch", data={"symbol": "MSFT"})
+        assert _wait_until(lambda: c.get("/api/state").json().get("symbol") == "MSFT")
         assert _wait_until(lambda: c.get("/api/state").json().get("status") == "ok")
 
 

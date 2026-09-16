@@ -10,10 +10,15 @@ state (state.build_state) after every poll. Serves:
                       with a ticker text box for switching symbols
   POST /api/watch  -> {symbol: "..."} (urlencoded form) switches which
                       symbol the poller watches, without a restart -- see
-                      Poller.switch_symbol. Redirects back to / (303).
+                      Poller.switch_symbol, which also unwatches whatever
+                      symbol was previously watched (via announce_unwatch)
+                      so switching doesn't accumulate watched symbols on
+                      schwab-connector indefinitely. Redirects back to /
+                      (303).
 
-create_app() takes fetch_bars / announce_watch as callables so tests inject
-fakes; main.py binds them to httpx calls against schwab-connector.
+create_app() takes fetch_bars / announce_watch / announce_unwatch as
+callables so tests inject fakes; main.py binds them to httpx calls against
+schwab-connector.
 """
 from __future__ import annotations
 
@@ -51,6 +56,7 @@ ANNOUNCE_RETRY_MAX_DELAY_SECONDS = 8.0
 
 class Poller:
     def __init__(self, *, fetch_bars, watch_symbol, poll_interval, announce_watch,
+                 announce_unwatch=None,
                  announce_retry_attempts=ANNOUNCE_RETRY_ATTEMPTS,
                  announce_retry_base_delay=ANNOUNCE_RETRY_BASE_DELAY_SECONDS,
                  announce_retry_max_delay=ANNOUNCE_RETRY_MAX_DELAY_SECONDS):
@@ -58,6 +64,7 @@ class Poller:
         self._initial_symbol = watch_symbol.upper() if watch_symbol else None
         self._interval = poll_interval
         self._announce_watch = announce_watch
+        self._announce_unwatch = announce_unwatch
         self._announce_retry_attempts = announce_retry_attempts
         self._announce_retry_base_delay = announce_retry_base_delay
         self._announce_retry_max_delay = announce_retry_max_delay
@@ -86,13 +93,19 @@ class Poller:
         history and re-announces the watch to schwab-connector (which itself
         backfills the new symbol's session -- see price_history.py -- so
         switching gets the same correct-from-market-open behavior a fresh
-        watch always has, not a second-class cold start).
+        watch always has, not a second-class cold start). Also unwatches
+        whatever symbol was previously being watched, restoring the
+        one-symbol-at-a-time invariant -- without this, schwab-connector
+        accumulates every symbol ever typed into the ticker box forever
+        (confirmed live: 6 simultaneously-watched symbols from normal use
+        of this box before this was fixed).
 
         A blank/invalid symbol, or the symbol already being watched, is a
         silent no-op -- returns False. Returns True if it actually switched."""
         new_symbol = new_symbol.strip().upper()
         if not new_symbol or new_symbol == self._symbol or not _VALID_SYMBOL.match(new_symbol):
             return False
+        old_symbol = self._symbol
         self._symbol = new_symbol
         self._bars = []
         self._last_ts = 0.0
@@ -100,6 +113,20 @@ class Poller:
         self._state = build_state([], new_symbol)
         if self._announce_watch is not None:
             await self._announce_watch_with_retry()
+        if old_symbol is not None and self._announce_unwatch is not None:
+            # Best-effort, unlike announce_watch's retries: a failure here
+            # just leaves one stale symbol watched on schwab-connector
+            # (annoying, not broken -- the new symbol above is what's
+            # actually displayed and it's already watched), so it isn't
+            # worth delaying the switch the user is actively waiting on.
+            try:
+                await self._announce_unwatch(old_symbol)
+            except Exception as exc:
+                logger.warning(
+                    "announce_unwatch(%s) failed; schwab-connector will keep "
+                    "watching it until explicitly unwatched again: %s",
+                    old_symbol, exc,
+                )
         return True
 
     async def _announce_watch_with_retry(self) -> None:
@@ -228,12 +255,13 @@ def _wrap(sym: str, body: str) -> str:
 
 
 def create_app(*, fetch_bars, watch_symbol, poll_interval: float = 5.0,
-               announce_watch=None,
+               announce_watch=None, announce_unwatch=None,
                announce_retry_attempts=ANNOUNCE_RETRY_ATTEMPTS,
                announce_retry_base_delay=ANNOUNCE_RETRY_BASE_DELAY_SECONDS,
                announce_retry_max_delay=ANNOUNCE_RETRY_MAX_DELAY_SECONDS) -> FastAPI:
     poller = Poller(fetch_bars=fetch_bars, watch_symbol=watch_symbol,
                     poll_interval=poll_interval, announce_watch=announce_watch,
+                    announce_unwatch=announce_unwatch,
                     announce_retry_attempts=announce_retry_attempts,
                     announce_retry_base_delay=announce_retry_base_delay,
                     announce_retry_max_delay=announce_retry_max_delay)

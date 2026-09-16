@@ -133,6 +133,66 @@ def test_boots_without_working_source(tmp_path):
         assert c.get("/bars/AEHL").json() == []
 
 
+def test_unwatch_removes_symbol_from_watching_list(tmp_path):
+    app, _ = _app(tmp_path)
+    with TestClient(app) as c:
+        c.post("/watch", json={"symbol": "AEHL"})
+        _wait_for_bars(c, "AEHL", want=1)
+        assert c.get("/health").json()["watching"] == ["AEHL"]
+
+        r = c.post("/unwatch", json={"symbol": "AEHL"})
+        assert r.status_code == 200
+        assert c.get("/health").json()["watching"] == []
+
+
+def test_unwatch_only_removes_the_named_symbol(tmp_path):
+    app, _ = _app(tmp_path)
+    with TestClient(app) as c:
+        c.post("/watch", json={"symbol": "AEHL"})
+        c.post("/watch", json={"symbol": "SPY"})
+        _wait_for_bars(c, "AEHL", want=1)
+        _wait_for_bars(c, "SPY", want=1)
+        assert c.get("/health").json()["watching"] == ["AEHL", "SPY"]
+
+        c.post("/unwatch", json={"symbol": "AEHL"})
+        assert c.get("/health").json()["watching"] == ["SPY"]
+
+
+def test_unwatch_unknown_symbol_is_a_noop_200(tmp_path):
+    app, _ = _app(tmp_path)
+    with TestClient(app) as c:
+        r = c.post("/unwatch", json={"symbol": "NOPE"})
+        assert r.status_code == 200
+        assert c.get("/health").json()["watching"] == []
+
+
+def test_unwatch_is_case_insensitive(tmp_path):
+    app, _ = _app(tmp_path)
+    with TestClient(app) as c:
+        c.post("/watch", json={"symbol": "AEHL"})
+        _wait_for_bars(c, "AEHL", want=1)
+        c.post("/unwatch", json={"symbol": "aehl"})
+        assert c.get("/health").json()["watching"] == []
+
+
+def test_unwatch_then_rewatch_same_symbol_works(tmp_path):
+    app, _ = _app(tmp_path)
+    with TestClient(app) as c:
+        c.post("/watch", json={"symbol": "AEHL"})
+        _wait_for_bars(c, "AEHL", want=1)
+        c.post("/unwatch", json={"symbol": "AEHL"})
+        assert c.get("/health").json()["watching"] == []
+
+        c.post("/watch", json={"symbol": "AEHL"})
+        assert c.get("/health").json()["watching"] == ["AEHL"]
+
+
+def test_unwatch_requires_symbol(tmp_path):
+    app, _ = _app(tmp_path)
+    with TestClient(app) as c:
+        assert c.post("/unwatch", json={}).status_code == 422
+
+
 def _backfill_bar(ts, close, *, vol=1000.0):
     return {"ts": ts, "open": close, "high": close, "low": close,
             "close": close, "volume": vol, "is_extended": False}

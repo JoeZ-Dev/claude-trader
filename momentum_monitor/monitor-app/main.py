@@ -1,6 +1,6 @@
 """
 Production wiring for monitor-app. Binds create_app's fetch_bars /
-announce_watch to httpx calls against schwab-connector.
+announce_watch / announce_unwatch to httpx calls against schwab-connector.
 
 Environment:
   SCHWAB_CONNECTOR_URL  base URL of schwab-connector   (default http://schwab-connector:7878)
@@ -36,5 +36,11 @@ async def announce_watch(symbol: str):
     r.raise_for_status()
 
 
+async def announce_unwatch(symbol: str):
+    r = await _client.post(f"{CONNECTOR_URL}/unwatch", json={"symbol": symbol})
+    r.raise_for_status()
+
+
 app = create_app(fetch_bars=fetch_bars, watch_symbol=WATCH_SYMBOL,
-                 poll_interval=POLL_INTERVAL, announce_watch=announce_watch)
+                 poll_interval=POLL_INTERVAL, announce_watch=announce_watch,
+                 announce_unwatch=announce_unwatch)

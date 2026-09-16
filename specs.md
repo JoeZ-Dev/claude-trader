@@ -279,6 +279,13 @@ principle, with no code living loose at repo root:
     ones. A backfill failure (e.g. companion-auth unreachable) is
     non-fatal: live streaming still starts. See
     `momentum_monitor/schwab-connector/price_history.py`.
+  - `POST /unwatch {"symbol": "..."}` — stops live-streaming a symbol
+    (cancels its consume task, drops it from `watching`) without touching
+    its stored bars — history stays on disk, only the live subscription
+    stops. Idempotent: unwatching a symbol not currently watched is a
+    no-op, 200 either way. Awaits the cancelled task's actual teardown
+    before returning, not just scheduling the cancellation, since the
+    caller may immediately watch a different symbol right after.
   - `GET /bars/{symbol}?since_ts={unix_seconds}` → array of bar objects
     per the shape in section 4.
   - `GET /health` → `{"status": "ok", "watching": [...], "connected": bool}`
@@ -300,7 +307,14 @@ principle, with no code living loose at repo root:
   is not a second-class cold start. A poll already in flight for the OLD
   symbol when a switch lands has its result discarded rather than
   appended to the new symbol's just-reset series (`_poll_once` re-checks
-  the current symbol after the fetch's `await` returns).
+  the current symbol after the fetch's `await` returns). `switch_symbol`
+  also calls `POST /unwatch` (section 5) on whatever symbol it was
+  PREVIOUSLY watching, restoring the one-symbol-at-a-time invariant —
+  first shipped without this and confirmed live to accumulate every
+  symbol ever typed into the box (6 simultaneously watched from normal
+  use before the fix); this stays a genuine invariant, not a "usually
+  fine" convention: this repo does not run multi-symbol concurrently
+  (see roadmap phase 2, which this feature is explicitly NOT).
 - **`momentum_monitor/docker-compose.yml`** — orchestrates all three.
 
 ### 6. Roadmap / phases
@@ -308,7 +322,17 @@ principle, with no code living loose at repo root:
 1. **(current)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,
    no LLM.
-2. Multi-symbol (4-6 concurrent), same architecture extended.
+2. Multi-symbol (4-6 concurrent), same architecture extended. Not the same
+   thing as the phase-1 ticker-switch box (section 5) — that box
+   deliberately unwatches the previous symbol on every switch specifically
+   to STAY one-symbol-at-a-time. Actual concurrent multi-symbol support is
+   a distinct, larger decision (schwab-connector already technically
+   allows N simultaneously-watched symbols via repeated `POST /watch` with
+   no built-in cap — that capability existing is not the same as this
+   phase being started) that needs its own explicit design pass and
+   testing under real concurrent load, not backing into it silently
+   through a convenience feature the way section 5's incident did before
+   the unwatch fix.
 3. Event-triggered LLM narration via `claude-connector`, firing only on
    meaningful state changes (level hold-confirmed, volume threshold
    crossed, MACD cross, retest, sharp reversal) — never polled.
