@@ -13,10 +13,18 @@ port for this service):
 
 create_app() takes its dependencies as arguments so tests can inject a
 ReplayStreamSource and a temp BarStore. main.py wires the real ones.
+
+`history_fetcher` (optional) is an `async def (symbol) -> list[dict]` that
+backfills the current day's bars from Schwab's price-history endpoint (see
+price_history.py) before live tick aggregation starts. Without it, a
+symbol watched mid-session would have its VWAP/EMA/MACD/level-detection
+compute only over bars captured since POST /watch, not over the actual
+session -- see price_history.py's module docstring for the full story.
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from contextlib import asynccontextmanager
 
@@ -25,6 +33,8 @@ from pydantic import BaseModel
 
 from aggregator import BUCKET_SECONDS, BarAggregator
 from store import BarStore
+
+logger = logging.getLogger("schwab-connector.backfill")
 
 FLUSH_INTERVAL_SECONDS = 2.0
 
@@ -41,12 +51,14 @@ class _DisconnectedSource:
 
 class Connector:
     def __init__(self, *, store: BarStore, source_factory, replay: bool,
-                 now_fn=time.time, flush_interval: float = FLUSH_INTERVAL_SECONDS):
+                 now_fn=time.time, flush_interval: float = FLUSH_INTERVAL_SECONDS,
+                 history_fetcher=None):
         self._store = store
         self._source_factory = source_factory
         self._replay = replay
         self._now_fn = now_fn
         self._flush_interval = flush_interval
+        self._history_fetcher = history_fetcher
         self._sources: dict[str, object] = {}
         self._tasks: dict[str, asyncio.Task] = {}
 
@@ -83,6 +95,7 @@ class Connector:
             self._sources[symbol] = _DisconnectedSource()
             return
         self._sources[symbol] = source
+        await self._maybe_backfill(symbol)
         agg = BarAggregator()
         last_tick_ts = 0.0
 
@@ -101,6 +114,26 @@ class Connector:
             if flusher is not None:
                 flusher.cancel()
 
+    async def _maybe_backfill(self, symbol: str) -> None:
+        """Fetch and store today's history for a genuinely new symbol,
+        before any live bars are appended. Skipped if the store already has
+        bars for this symbol (a restart, or a symbol already backfilled) --
+        both to avoid a wasted refetch and because re-inserting old bars
+        after newer live bars exist would trip the store's monotonic-append
+        guard and silently drop those newer bars instead of the redundant
+        old ones."""
+        if self._history_fetcher is None or self._store.since(symbol, 0.0):
+            return
+        try:
+            bars = await self._history_fetcher(symbol)
+        except Exception:
+            logger.warning("backfill failed for %s; starting live-only", symbol,
+                           exc_info=True)
+            return
+        if bars:
+            self._store.append_many(symbol, bars)
+        logger.info("backfilled %d bar(s) for %s", len(bars), symbol)
+
     async def _flush_loop(self, symbol: str, agg: BarAggregator) -> None:
         while True:
             await asyncio.sleep(self._flush_interval)
@@ -113,9 +146,10 @@ class Connector:
 
 
 def create_app(*, store: BarStore, source_factory, replay: bool,
-               now_fn=time.time) -> FastAPI:
+               now_fn=time.time, history_fetcher=None) -> FastAPI:
     connector = Connector(store=store, source_factory=source_factory,
-                          replay=replay, now_fn=now_fn)
+                          replay=replay, now_fn=now_fn,
+                          history_fetcher=history_fetcher)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):

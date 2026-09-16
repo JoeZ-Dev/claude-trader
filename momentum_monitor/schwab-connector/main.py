@@ -28,6 +28,7 @@ import os
 
 from app import create_app
 from events import log_event
+from price_history import fetch_today_bars
 from reconnect import ReconnectingStreamSource
 from store import BarStore
 from stream import ReplayStreamSource, SchwabStreamSource
@@ -49,6 +50,7 @@ if STREAM_SOURCE == "replay":
     def _source_factory():
         return ReplayStreamSource(REPLAY_PATH, pace=True)
     _replay = True
+    _history_fetcher = None  # replay fixtures are hand-crafted; no session to backfill
 else:
     def _build_client(schwab_token: dict):
         # companion-auth vends access-token-only responses, so schwab-py's own
@@ -75,4 +77,19 @@ else:
         )
     _replay = False
 
-app = create_app(store=_store, source_factory=_source_factory, replay=_replay)
+    async def _history_fetcher(symbol: str):
+        # One-shot: a fresh token + client, used once for the price-history
+        # call and discarded. Unlike the streaming path (ReconnectingStreamSource),
+        # this doesn't need to survive 30 minutes, so it doesn't need the
+        # reconnect machinery -- just a valid token at call time. See
+        # price_history.py for why this backfill exists at all.
+        if not AUTH_HELPER_URL:
+            raise RuntimeError(
+                "AUTH_HELPER_URL is not set; cannot reach companion-auth for a token")
+        token_source = AccessTokenSource(AUTH_HELPER_URL, shared_secret=INTERNAL_AUTH_SECRET)
+        token_source.refresh()
+        client = _build_client(token_source.as_schwab_token())
+        return await fetch_today_bars(client, symbol)
+
+app = create_app(store=_store, source_factory=_source_factory, replay=_replay,
+                 history_fetcher=_history_fetcher)

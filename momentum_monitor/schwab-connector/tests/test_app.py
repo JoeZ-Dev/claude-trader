@@ -29,7 +29,7 @@ def _fixture(tmp_path):
     return p
 
 
-def _app(tmp_path):
+def _app(tmp_path, *, history_fetcher=None):
     fx = _fixture(tmp_path)
     store = BarStore(tmp_path / "bars")
     return create_app(
@@ -37,6 +37,7 @@ def _app(tmp_path):
         source_factory=lambda: ReplayStreamSource(fx),
         replay=True,
         now_fn=lambda: RTH_1030 + 30,
+        history_fetcher=history_fetcher,
     ), store
 
 
@@ -130,6 +131,70 @@ def test_boots_without_working_source(tmp_path):
         assert body["watching"] == ["AEHL"]
         assert body["connected"] is False
         assert c.get("/bars/AEHL").json() == []
+
+
+def _backfill_bar(ts, close, *, vol=1000.0):
+    return {"ts": ts, "open": close, "high": close, "low": close,
+            "close": close, "volume": vol, "is_extended": False}
+
+
+def test_watch_backfills_history_before_live_bars_appear(tmp_path):
+    backfilled = [
+        _backfill_bar(RTH_1030 - 1200, 9.0),
+        _backfill_bar(RTH_1030 - 600, 9.5),
+    ]
+    calls = []
+
+    async def history_fetcher(symbol):
+        calls.append(symbol)
+        return backfilled
+
+    app, _ = _app(tmp_path, history_fetcher=history_fetcher)
+    with TestClient(app) as c:
+        c.post("/watch", json={"symbol": "AEHL"})
+        bars = _wait_for_bars(c, "AEHL", want=len(backfilled) + 3)
+        assert calls == ["AEHL"]
+        assert [b["ts"] for b in bars] == \
+            [b["ts"] for b in backfilled] + [b["ts"] for b in FIXTURE_BARS]
+        assert bars[0]["close"] == 9.0
+
+
+def test_watch_skips_backfill_when_symbol_already_has_bars(tmp_path):
+    # Simulates a restart: the store already holds bars for this symbol
+    # (from a previous backfill or live streaming), so re-fetching history
+    # would be wasteful and risks the store's monotonic-append guard
+    # silently dropping subsequent live bars whose ts falls behind a
+    # re-fetched backfill bar's ts.
+    store = BarStore(tmp_path / "bars")
+    store.append("AEHL", _backfill_bar(RTH_1030 - 600, 8.0))
+
+    def history_fetcher(symbol):
+        raise AssertionError("history_fetcher must not be called for an "
+                              "already-known symbol")
+
+    fx = _fixture(tmp_path)
+    app = create_app(
+        store=store,
+        source_factory=lambda: ReplayStreamSource(fx),
+        replay=True,
+        now_fn=lambda: RTH_1030 + 30,
+        history_fetcher=history_fetcher,
+    )
+    with TestClient(app) as c:
+        c.post("/watch", json={"symbol": "AEHL"})
+        bars = _wait_for_bars(c, "AEHL", want=1 + 3)
+        assert bars[0]["ts"] == RTH_1030 - 600
+
+
+def test_watch_backfill_failure_does_not_block_live_streaming(tmp_path):
+    async def failing_history_fetcher(symbol):
+        raise RuntimeError("companion-auth unreachable")
+
+    app, _ = _app(tmp_path, history_fetcher=failing_history_fetcher)
+    with TestClient(app) as c:
+        c.post("/watch", json={"symbol": "AEHL"})
+        bars = _wait_for_bars(c, "AEHL", want=3)
+        assert [b["ts"] for b in bars] == [b["ts"] for b in FIXTURE_BARS]
 
 
 def test_bars_survive_new_app_on_same_store_dir(tmp_path):

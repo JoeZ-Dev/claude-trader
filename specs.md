@@ -144,7 +144,20 @@ principle, with no code living loose at repo root:
   append-mostly, single-symbol log; includes non-monotonic-bar dedup so
   a container restart doesn't duplicate entries). Internal API only
   (not published to host):
-  - `POST /watch {"symbol": "..."}`
+  - `POST /watch {"symbol": "..."}` — for a symbol with no bars already
+    on disk, backfills the current trading day's bars (Schwab
+    price-history endpoint, 1-minute granularity — the endpoint's finest
+    resolution, extended hours included) before starting live-stream
+    aggregation, so a symbol added mid-session still gets a session VWAP
+    anchored at market open (or the first extended-hours bar) instead of
+    at whenever it happened to be watched. A symbol that already has
+    bars (a restart, or a symbol already backfilled) skips this — both
+    to avoid a wasted refetch and because re-inserting old bars behind
+    already-stored newer ones would trip the store's monotonic-append
+    dedup and silently drop the newer bars instead of the redundant old
+    ones. A backfill failure (e.g. companion-auth unreachable) is
+    non-fatal: live streaming still starts. See
+    `momentum_monitor/schwab-connector/price_history.py`.
   - `GET /bars/{symbol}?since_ts={unix_seconds}` → array of bar objects
     per the shape in section 4.
   - `GET /health` → `{"status": "ok", "watching": [...], "connected": bool}`
