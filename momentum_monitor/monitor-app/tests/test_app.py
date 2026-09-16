@@ -1,5 +1,7 @@
+import asyncio
 import os
 import sys
+import threading
 import time
 
 _APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -52,9 +54,14 @@ def _wait_until(pred, timeout=3.0):
     return pred()
 
 
-def _client(fetch, *, symbol="AEHL", announce=None):
+def _client(fetch, *, symbol="AEHL", announce=None,
+            announce_retry_attempts=5, announce_retry_base_delay=0.02,
+            announce_retry_max_delay=0.02):
     app = create_app(fetch_bars=fetch, watch_symbol=symbol,
-                     poll_interval=0.05, announce_watch=announce)
+                     poll_interval=0.05, announce_watch=announce,
+                     announce_retry_attempts=announce_retry_attempts,
+                     announce_retry_base_delay=announce_retry_base_delay,
+                     announce_retry_max_delay=announce_retry_max_delay)
     return TestClient(app)
 
 
@@ -106,12 +113,146 @@ def test_announce_watch_called_on_startup():
         assert _wait_until(lambda: seen == ["AEHL"])
 
 
+def test_announce_watch_retries_and_recovers_after_transient_failures():
+    calls = []
+
+    async def flaky_announce(sym):
+        calls.append(sym)
+        if len(calls) < 3:            # first two attempts fail
+            raise RuntimeError("connector not listening yet")
+        # third attempt succeeds
+
+    with _client(FakeFetch([_bars(5)]), announce=flaky_announce) as c:
+        assert _wait_until(lambda: len(calls) == 3)
+        # confirm it actually reached the "watched and working" end state,
+        # not just that the retry loop ran three times
+        assert _wait_until(lambda: c.get("/api/state").json().get("status") == "ok")
+
+
+def test_announce_watch_gives_up_after_exhausting_retries_but_keeps_polling():
+    async def always_fails(sym):
+        raise RuntimeError("connector unreachable")
+
+    fetch = FakeFetch([_bars(5)])
+    with _client(fetch, announce=always_fails, announce_retry_attempts=2) as c:
+        # polling still proceeds even though announce_watch never succeeds
+        assert _wait_until(lambda: c.get("/api/state").json().get("status") == "ok")
+
+
 def test_no_symbol_configured_stays_warming_up():
     fetch = FakeFetch([_bars(10)])
     with _client(fetch, symbol=None) as c:
         time.sleep(0.2)
         assert c.get("/api/state").json()["status"] == "warming_up"
         assert fetch.calls == []
+
+
+# -- switching the watched symbol at runtime, via POST /api/watch --------
+
+def test_watch_form_present_on_root_page():
+    with _client(FakeFetch([[]]), symbol=None) as c:
+        page = c.get("/").text
+        assert "/api/watch" in page
+        assert "<input" in page
+
+
+def test_no_symbol_shows_prompt_to_enter_one():
+    with _client(FakeFetch([[]]), symbol=None) as c:
+        assert "enter a ticker" in c.get("/").text.lower()
+
+
+def test_post_watch_starts_watching_a_new_symbol():
+    seen = []
+
+    async def announce(sym):
+        seen.append(sym)
+
+    fetch = FakeFetch([_bars(5, base=50.0)])
+    with _client(fetch, symbol=None, announce=announce) as c:
+        r = c.post("/api/watch", data={"symbol": "msft"})
+        assert r.status_code in (200, 303)
+        assert _wait_until(lambda: c.get("/api/state").json().get("symbol") == "MSFT")
+        assert _wait_until(lambda: c.get("/api/state").json().get("status") == "ok")
+        assert seen == ["MSFT"]
+
+
+def test_post_watch_redirects_to_root():
+    with _client(FakeFetch([[]]), symbol=None) as c:
+        r = c.post("/api/watch", data={"symbol": "MSFT"}, follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/"
+
+
+def test_post_watch_resets_bars_when_switching_symbols():
+    fetch = FakeFetch([_bars(30), _bars(3, base=50.0)])
+    with _client(fetch) as c:  # starts on AEHL
+        assert _wait_until(lambda: c.get("/api/state").json().get("bar_count") == 30)
+        c.post("/api/watch", data={"symbol": "MSFT"})
+        assert _wait_until(lambda: c.get("/api/state").json().get("symbol") == "MSFT")
+        assert _wait_until(lambda: c.get("/api/state").json().get("bar_count") == 3)
+
+
+def test_post_watch_same_symbol_is_a_noop():
+    fetch = FakeFetch([_bars(30)])
+    with _client(fetch) as c:
+        assert _wait_until(lambda: c.get("/api/state").json().get("bar_count") == 30)
+        c.post("/api/watch", data={"symbol": "aehl"})
+        time.sleep(0.15)
+        # still 30 -- no reset, and only one batch was ever queued for fetch
+        assert c.get("/api/state").json()["bar_count"] == 30
+
+
+def test_post_watch_ignores_blank_symbol():
+    fetch = FakeFetch([_bars(10)])
+    with _client(fetch) as c:
+        assert _wait_until(lambda: c.get("/api/state").json().get("status") == "ok")
+        c.post("/api/watch", data={"symbol": "   "})
+        time.sleep(0.1)
+        assert c.get("/api/state").json()["symbol"] == "AEHL"
+
+
+def test_post_watch_rejects_invalid_characters():
+    fetch = FakeFetch([_bars(10)])
+    with _client(fetch) as c:
+        assert _wait_until(lambda: c.get("/api/state").json().get("status") == "ok")
+        c.post("/api/watch", data={"symbol": "AB/CD"})
+        time.sleep(0.1)
+        assert c.get("/api/state").json()["symbol"] == "AEHL"
+
+
+def test_starting_with_no_symbol_then_watching_one_still_works():
+    fetch = FakeFetch([_bars(4, base=20.0)])
+    with _client(fetch, symbol=None) as c:
+        assert c.get("/api/state").json()["status"] == "warming_up"
+        assert fetch.calls == []
+        c.post("/api/watch", data={"symbol": "TSLA"})
+        assert _wait_until(lambda: c.get("/api/state").json().get("status") == "ok")
+
+
+def test_switch_symbol_during_inflight_poll_discards_stale_result():
+    # A switch_symbol() landing while a poll for the OLD symbol is still
+    # in flight must not let that in-flight fetch's result get appended to
+    # the NEW symbol's (just-reset) bar list.
+    release = threading.Event()
+    calls = []
+
+    async def fetch(symbol, since_ts):
+        calls.append((symbol, since_ts))
+        if symbol == "AEHL" and len(calls) == 1:
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+            return _bars(5)  # stale by the time it returns -- must be discarded
+        if symbol == "MSFT":
+            return _bars(3, base=50.0)
+        return []
+
+    with _client(fetch, symbol="AEHL") as c:
+        time.sleep(0.1)  # let the first (now-blocked) AEHL fetch start
+        c.post("/api/watch", data={"symbol": "MSFT"})
+        release.set()
+        assert _wait_until(lambda: c.get("/api/state").json().get("symbol") == "MSFT")
+        assert _wait_until(lambda: c.get("/api/state").json().get("status") == "ok")
+        assert c.get("/api/state").json()["bar_count"] == 3
 
 
 def test_api_state_survives_fetch_error():

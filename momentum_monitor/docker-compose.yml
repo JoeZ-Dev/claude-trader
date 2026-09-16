@@ -46,6 +46,18 @@ services:
       - monitor-net
       - joelab-ingress
     restart: unless-stopped
+    healthcheck:
+      # /health always returns 200 once FastAPI is up, live or replay mode,
+      # regardless of "connected" -- this is a readiness probe, not a
+      # Schwab-stream-up probe. monitor-app's depends_on waits on this so its
+      # one-shot POST /watch on startup lands after uvicorn is actually
+      # listening, not just after the container process has started.
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:7878/health', timeout=3)"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   monitor-app:
     build:
@@ -58,7 +70,8 @@ services:
       WATCH_SYMBOL: "${WATCH_SYMBOL:-}"
       POLL_INTERVAL: "${POLL_INTERVAL:-5}"
     depends_on:
-      - schwab-connector
+      schwab-connector:
+        condition: service_healthy
     networks:
       - monitor-net
     restart: unless-stopped

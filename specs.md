@@ -289,7 +289,18 @@ principle, with no code living loose at repo root:
 - **`momentum_monitor/monitor-app/`** — the FastAPI web app. Holds no
   credentials. Polls `schwab-connector` for bars, runs them through
   `momentum_monitor/core/`, serves a web view. The only container with a
-  port published to the host (`8012`).
+  port published to the host (`8012`). `WATCH_SYMBOL` is only the
+  STARTING symbol (optional — unset means idle, no symbol watched until
+  one is entered): the page has a ticker text box (`POST /api/watch
+  {"symbol": "..."}` as a urlencoded form) that switches which symbol the
+  running container watches, without a restart. `Poller.switch_symbol`
+  (app.py) resets the accumulated bar history and re-announces the watch
+  to `schwab-connector`, which backfills the new symbol's session the
+  same as any fresh watch (section 5, `POST /watch`) — switching symbols
+  is not a second-class cold start. A poll already in flight for the OLD
+  symbol when a switch lands has its result discarded rather than
+  appended to the new symbol's just-reset series (`_poll_once` re-checks
+  the current symbol after the fetch's `await` returns).
 - **`momentum_monitor/docker-compose.yml`** — orchestrates all three.
 
 ### 6. Roadmap / phases
