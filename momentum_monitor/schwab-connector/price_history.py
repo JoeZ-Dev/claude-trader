@@ -31,16 +31,27 @@ macd / detect_levels (momentum_monitor/core) take a plain bar list and
 don't assume uniform spacing, so a series that's 1-minute-granularity early
 and 10s-granularity later is a correct input, not a bug.
 
-periodType=day/period=1 (via get_price_history directly, NOT the
-get_price_history_every_minute convenience wrapper, which always sends a
-broad default date range alongside period=1 and documents itself as
-returning "up to 48 days of data" as a result) is what actually constrains
-the request to the current trading day, matching what a chart's default
-"1 Day" view shows.
+Date range: an explicit start_datetime/end_datetime pair is used, NOT
+period_type=DAY/period=ONE_DAY. That period-based form was tried first and
+confirmed LIVE (backfilling QCLS on 2026-09-16, against the real Schwab
+API, not a guess) to return the PREVIOUS completed trading day when no
+date range is also given, not the current in-progress session -- matching
+get_price_history's own docstring ("end_datetime: ... Default is previous
+trading day"). That silently reproduced this exact cold-start VWAP bug one
+day later, since the live bar was the only one left matching "today" once
+session_bars_for_vwap (monitor-app/state.py) filtered by calendar date. An
+explicit range (today's NY midnight through now) sidesteps Schwab's
+period-based default entirely and is unambiguous about what "today" means.
 """
 from __future__ import annotations
 
+import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from aggregator import is_extended_hours
+
+_NY = ZoneInfo("America/New_York")
 
 
 def candles_to_bars(candles: list[dict]) -> list[dict]:
@@ -69,22 +80,28 @@ def candles_to_bars(candles: list[dict]) -> list[dict]:
     return out
 
 
-async def fetch_today_bars(client, symbol: str) -> list[dict]:
-    """Fetch the current trading day's bars at 1-minute granularity
+async def fetch_today_bars(client, symbol: str, *, now_fn=time.time) -> list[dict]:
+    """Fetch the current trading day's bars so far, at 1-minute granularity
     (Schwab's finest available resolution), including extended hours, and
     return them in the bar contract shape, oldest first.
+
+    Requests an explicit [today's NY midnight, now] range rather than
+    period_type=DAY/period=ONE_DAY -- see the module docstring for why the
+    period-based form is a trap that silently returns yesterday.
 
     Raises on any non-2xx response or network failure. Callers decide
     whether that's fatal -- Connector._consume (app.py) treats a backfill
     failure as non-fatal: live streaming still starts, so a transient
     price-history error doesn't block the whole pipeline the way a
     permanently-cold-started VWAP silently would."""
+    now = datetime.fromtimestamp(now_fn(), _NY)
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
     resp = await client.get_price_history(
         symbol,
-        period_type=client.PriceHistory.PeriodType.DAY,
-        period=client.PriceHistory.Period.ONE_DAY,
         frequency_type=client.PriceHistory.FrequencyType.MINUTE,
         frequency=client.PriceHistory.Frequency.EVERY_MINUTE,
+        start_datetime=start_of_day,
+        end_datetime=now,
         need_extended_hours_data=True,
     )
     resp.raise_for_status()

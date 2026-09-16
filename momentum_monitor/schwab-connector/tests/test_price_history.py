@@ -1,6 +1,8 @@
 import asyncio
 import os
 import sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -9,6 +11,7 @@ import pytest
 from price_history import candles_to_bars, fetch_today_bars
 
 RTH_1030 = 1756909800  # 2025-09-03 10:30:00 ET, a Wednesday
+_NY = ZoneInfo("America/New_York")
 
 
 # -- candles_to_bars (pure mapping) -----------------------------------------
@@ -94,27 +97,37 @@ class _FakeClient:
         return self._response
 
 
-def test_fetch_today_bars_requests_current_day_minute_granularity():
+def test_fetch_today_bars_requests_explicit_start_end_for_current_session():
+    # Regression test. period_type=DAY/period=ONE_DAY with no explicit date
+    # range was confirmed -- live, against the real Schwab API, backfilling
+    # QCLS on 2026-09-16 -- to return the PREVIOUS completed trading day
+    # (9/15), not the current in-progress one, per get_price_history's own
+    # docstring ("end_datetime: ... Default is previous trading day"). That
+    # silently reproduced the exact cold-start VWAP bug this backfill exists
+    # to fix, just one day later. An explicit start/end range sidesteps
+    # Schwab's period-based default entirely.
     resp = _FakeResponse(200, {"candles": [
         {"datetime": RTH_1030 * 1000, "open": 1.0, "high": 1.0,
          "low": 1.0, "close": 1.0, "volume": 1},
     ]})
     client = _FakeClient(resp)
+    now = datetime(2026, 9, 16, 12, 0, 0, tzinfo=_NY)
 
-    bars = asyncio.run(fetch_today_bars(client, "QCLS"))
+    bars = asyncio.run(fetch_today_bars(client, "QCLS", now_fn=now.timestamp))
 
     assert len(client.calls) == 1
     symbol, kwargs = client.calls[0]
     assert symbol == "QCLS"
-    assert kwargs["period_type"] == _FakePriceHistoryNs.PeriodType.DAY
-    assert kwargs["period"] == _FakePriceHistoryNs.Period.ONE_DAY
     assert kwargs["frequency_type"] == _FakePriceHistoryNs.FrequencyType.MINUTE
     assert kwargs["frequency"] == _FakePriceHistoryNs.Frequency.EVERY_MINUTE
     assert kwargs["need_extended_hours_data"] is True
-    # No explicit date range: periodType=day/period=1 alone means "current
-    # trading day", matching what a chart's default "1 Day" view shows.
-    assert "start_datetime" not in kwargs
-    assert "end_datetime" not in kwargs
+    # period_type/period must be absent: get_price_history's own docstring
+    # says period "should not be provided if start_datetime and
+    # end_datetime" are -- mixing them is what caused the wrong-day bug.
+    assert "period_type" not in kwargs
+    assert "period" not in kwargs
+    assert kwargs["start_datetime"] == datetime(2026, 9, 16, 0, 0, 0, tzinfo=_NY)
+    assert kwargs["end_datetime"] == now
     assert bars == [{"ts": RTH_1030, "open": 1.0, "high": 1.0, "low": 1.0,
                      "close": 1.0, "volume": 1.0, "is_extended": False}]
 
