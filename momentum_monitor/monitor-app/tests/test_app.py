@@ -130,8 +130,20 @@ def test_root_page_has_stable_ids_for_js_to_update():
         for expected_id in ("price-value", "ind-vwap", "ind-ema9", "ind-ema20",
                             "ind-macd", "ind-macd-signal", "ind-macd-hist",
                             "ind-relvol", "resistance-block", "support-block",
-                            "journal-open", "journal-closed-tbody", "banner"):
+                            "journal-open", "journal-closed-tbody", "banner",
+                            "poll-toggle", "poll-status"):
             assert f'id="{expected_id}"' in page, f"missing id={expected_id}"
+
+
+def test_root_page_has_a_pause_polling_toggle():
+    # The whole point of switching off meta-refresh was to stop wasting
+    # requests when nobody's watching -- a manual pause/resume toggle for
+    # the JS polling itself, not just "no full-page reload".
+    with _client(FakeFetch([_bars(5)])) as c:
+        page = c.get("/").text
+        assert "clearInterval" in page
+        assert "poll-toggle" in page
+        assert "localStorage" in page  # preference persists across reloads
 
 
 def test_announce_watch_called_on_startup():

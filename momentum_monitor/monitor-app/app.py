@@ -448,6 +448,16 @@ _SYMBOL_FORM = (
     "</form>"
 )
 
+# Live-polling toggle -- separate from the ticker form above (a page
+# nobody's watching still burns a schwab-connector/API request every poll
+# interval; this lets that stop without navigating away).
+_POLL_TOGGLE = (
+    "<div class='poll-controls'>"
+    "<span id=\"poll-status\" class='muted'>live</span>"
+    "<button type='button' id=\"poll-toggle\">Pause updates</button>"
+    "</div>"
+)
+
 # Mirrors, in JS, the same helpers/templates as the Python side above --
 # see the module-level comment on _fmt for why this duplication exists.
 _SCRIPT = """
@@ -558,8 +568,43 @@ async function refresh() {
   document.getElementById('journal-open').innerHTML = journalOpenHtml(data.journal.open);
   document.getElementById('journal-closed-tbody').innerHTML = journalClosedRows(data.journal.recent_closed);
 }
-refresh();
-setInterval(refresh, 4000);
+
+// Pause/resume the polling loop itself -- a page left open but not being
+// watched otherwise keeps hitting /api/state every POLL_MS forever for no
+// reason. Preference persists in localStorage (best-effort: private
+// browsing / blocked storage just falls back to "live" every load, never
+// breaks the toggle itself).
+const POLL_MS = 4000;
+let pollTimer = null;
+
+function setPolling(enabled) {
+  const toggle = document.getElementById('poll-toggle');
+  const status = document.getElementById('poll-status');
+  if (enabled) {
+    if (!pollTimer) {
+      refresh();
+      pollTimer = setInterval(refresh, POLL_MS);
+    }
+    toggle.textContent = 'Pause updates';
+    status.textContent = 'live';
+  } else {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    toggle.textContent = 'Resume updates';
+    status.textContent = 'paused';
+  }
+  try { localStorage.setItem('pollingPaused', enabled ? '0' : '1'); } catch (e) {}
+}
+
+let startEnabled = true;
+try { startEnabled = localStorage.getItem('pollingPaused') !== '1'; } catch (e) {}
+
+document.getElementById('poll-toggle').addEventListener('click', function () {
+  setPolling(pollTimer === null);
+});
+setPolling(startEnabled);
 """
 
 _STYLE = """
@@ -575,13 +620,17 @@ h1,h2,h3{margin:0 0 .5rem}
 h2{font-size:.95rem;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
 h3{font-size:.9rem;color:var(--text)}
 .topbar{display:flex;align-items:center;justify-content:space-between;
-  gap:1rem;margin-bottom:1rem}
+  flex-wrap:wrap;gap:1rem;margin-bottom:1rem}
 .ticker-form{display:flex;gap:.4rem}
 .ticker-form input{text-transform:uppercase;background:var(--card);
   border:1px solid var(--border);color:var(--text);border-radius:.4rem;
   padding:.4rem .6rem;width:7rem}
 .ticker-form button{background:var(--accent);color:#fff;border:none;
   border-radius:.4rem;padding:.4rem .8rem;cursor:pointer}
+.poll-controls{display:flex;align-items:center;gap:.5rem;font-size:.85rem}
+.poll-controls button{background:var(--card);color:var(--text);
+  border:1px solid var(--border);border-radius:.4rem;padding:.4rem .8rem;
+  cursor:pointer}
 .banner{background:var(--pending);color:#1a1400;padding:.6rem 1rem;
   border-radius:.4rem;margin-bottom:1rem;font-weight:600}
 .card{background:var(--card);border:1px solid var(--border);
@@ -610,7 +659,7 @@ def _wrap(sym: str, body: str) -> str:
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         f"<title>momentum monitor — {sym}</title>"
         f"<style>{_STYLE}</style></head><body>"
-        f"<div class='topbar'><h1>{sym}</h1>{_SYMBOL_FORM}</div>"
+        f"<div class='topbar'><h1>{sym}</h1>{_SYMBOL_FORM}{_POLL_TOGGLE}</div>"
         f"{body}"
         "<p class='footer'>Read-only technical read. Not advice, not an order.</p>"
         f"<script>{_SCRIPT}</script>"
