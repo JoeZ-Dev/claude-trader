@@ -113,6 +113,31 @@ full reconnects) - that would reach past schwab-py's supported interface,
 which contradicts the original reason for choosing a vetted library over
 hand-rolling this layer.
 
+**Price-history date-range quirk (platform-enforced, confirmed live):**
+`GET /marketdata/v1/pricehistory` (wrapped by schwab-py's
+`get_price_history`), when called with `periodType=day&period=1` and no
+explicit `startDate`/`endDate`, returns the PREVIOUS completed trading
+day's candles, not the current in-progress session. This is not a guess —
+it was caught live, backfilling QCLS on 2026-09-16: the request returned
+9/15's full session while the market was mid-session on 9/16, silently
+reproducing the exact cold-start VWAP bug the backfill in section 5 exists
+to fix, just pointed at the wrong day instead of no day. It matches
+schwab-py's own docstring for `get_price_history`'s `end_datetime`
+parameter ("Default is previous trading day") — that default apparently
+still applies server-side even when a period/periodType pair is given
+instead of an explicit range; period-based and range-based requests are
+NOT independent, mutually-exclusive modes the way the parameter names
+suggest. The fix is to always pass an explicit `start_datetime`/
+`end_datetime` range (today's exchange-local midnight through now) when
+the intent is "today's session so far," and never rely on
+`period_type`/`period` alone for that. See
+`momentum_monitor/schwab-connector/price_history.py`
+(`fetch_today_bars`), which does this and carries a regression test
+(`tests/test_price_history.py`) pinning the explicit-range behavior. Do
+not simplify this back to `period_type=DAY, period=1` alone — it looks
+more correct/idiomatic on a casual read of schwab-py's API, and silently
+reintroduces this exact bug.
+
 Bar shape (the contract between `schwab-connector` and everything else):
 ```
 {
