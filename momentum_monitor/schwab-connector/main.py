@@ -87,7 +87,7 @@ else:
             raise RuntimeError(
                 "AUTH_HELPER_URL is not set; cannot reach companion-auth for a token")
         token_source = AccessTokenSource(AUTH_HELPER_URL, shared_secret=INTERNAL_AUTH_SECRET)
-        token_source.refresh()
+        await token_source.refresh_async()
         client = _build_client(token_source.as_schwab_token())
         return await fetch_today_bars(client, symbol)
 

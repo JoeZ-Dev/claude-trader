@@ -211,6 +211,56 @@ def test_auth_helper_error_does_not_crash_and_retries():
     assert h.sleeps == [60.0]
 
 
+def test_backs_off_when_a_fresh_refresh_is_immediately_stale_again():
+    # Reproduces a real incident (2026-09-16): companion-auth served an
+    # already-near-expiry (per this side's leeway) token on every refresh
+    # for a full hour. Without a backoff, budget<=0 fires before a single
+    # tick is ever consumed, and the outer loop immediately refreshes and
+    # reconnects again with no delay -- confirmed live as ~13 reconnects/sec
+    # against companion-auth, sustained, not a one-off blip.
+    calls = {"n": 0}
+
+    def always_near_expiry_helper(url, headers=None):
+        calls["n"] += 1
+        # leeway=300 (AccessTokenSource default) -> stale_at() = NOW+100-300
+        # = NOW-200, already stale the instant it's fetched.
+        return 200, {"access_token": f"tok{calls['n']}", "expires_at": NOW + 100}
+
+    token_source = AccessTokenSource("http://companion-auth:9999",
+                                     http_get=always_near_expiry_helper,
+                                     now_fn=lambda: NOW)
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    events = []
+    src = ReconnectingStreamSource(
+        token_source=token_source,
+        build_client=lambda token: object(),
+        make_source=lambda client: FakeInner([("hang", 10)]),
+        sleep_fn=fake_sleep,
+        auth_retry_seconds=60.0,
+        on_event=lambda name, **kw: events.append(name),
+    )
+
+    async def drive():
+        agen = src.ticks("X").__aiter__()
+        try:
+            await asyncio.wait_for(agen.__anext__(), timeout=0.2)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            await agen.aclose()
+
+    run(drive())
+
+    assert calls["n"] > 1, "expected more than one refresh within the window"
+    assert sleeps, "expected a backoff sleep between zero-tick reconnect cycles"
+    assert all(s == 60.0 for s in sleeps)
+    assert "stale_immediately_after_refresh" in events
+
+
 def test_connected_is_false_after_generator_closed_mid_gap():
     h = Harness(
         inners=[FakeInner([("tick", {"ts": 1}), ("end",)]),

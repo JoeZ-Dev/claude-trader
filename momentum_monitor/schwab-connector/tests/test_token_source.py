@@ -1,5 +1,7 @@
+import asyncio
 import os
 import sys
+import time as _time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -160,3 +162,56 @@ def test_401_error_message_points_at_the_shared_secret():
         (401, {"error": "UNAUTHORIZED"})), shared_secret="wrong")
     with pytest.raises(AuthHelperError, match="INTERNAL_AUTH_SECRET"):
         src.refresh()
+
+
+# -- refresh_async: must not block the event loop -----------------------
+#
+# refresh()'s default http_get uses synchronous httpx.get(). Called
+# directly from async code (reconnect.py's ReconnectingStreamSource.ticks,
+# which runs as an asyncio task), a slow or hanging companion-auth request
+# blocks the WHOLE event loop for its duration -- confirmed live
+# (2026-09-16): during a reconnect storm, schwab-connector's own /health
+# handler (same process, same event loop) went unresponsive long enough to
+# fail its docker-compose healthcheck. refresh_async() exists specifically
+# so this call site can await it without that risk.
+
+def test_refresh_async_returns_same_result_as_refresh():
+    helper = FakeHelper((200, {"access_token": "abc", "expires_at": NOW + 1800}))
+    src = AccessTokenSource("http://x", http_get=helper, now_fn=lambda: NOW)
+    assert asyncio.run(src.refresh_async()) == "abc"
+    assert src.current() == "abc"
+
+
+def test_refresh_async_propagates_auth_required():
+    src = AccessTokenSource("http://x", http_get=FakeHelper(
+        (409, {"error": "AUTH_REQUIRED", "message": "Run bootstrap.py"})))
+    with pytest.raises(AuthRequired, match="bootstrap"):
+        asyncio.run(src.refresh_async())
+
+
+def test_refresh_async_does_not_block_the_event_loop():
+    def slow_http_get(url, headers=None):
+        _time.sleep(0.2)  # simulates a slow synchronous network call
+        return 200, {"access_token": "A", "expires_at": NOW + 3600}
+
+    src = AccessTokenSource("http://x", http_get=slow_http_get, now_fn=lambda: NOW)
+
+    async def scenario():
+        ticks = {"n": 0}
+
+        async def ticker():
+            while True:
+                ticks["n"] += 1
+                await asyncio.sleep(0.01)
+
+        ticker_task = asyncio.create_task(ticker())
+        token = await src.refresh_async()
+        ticker_task.cancel()
+        return token, ticks["n"]
+
+    token, tick_count = asyncio.run(scenario())
+    assert token == "A"
+    # A blocking refresh_async() would starve the loop for the full 0.2s
+    # sleep, so the concurrent ticker would get ~0 chances to run. A
+    # non-blocking one lets it tick roughly every 0.01s throughout.
+    assert tick_count >= 5

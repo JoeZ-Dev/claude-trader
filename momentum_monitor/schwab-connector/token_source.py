@@ -30,6 +30,7 @@ does not build the schwab-py client or manage the stream.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 
@@ -77,6 +78,20 @@ class AccessTokenSource:
         if self._access_token is None or self.is_stale():
             self.refresh()
         return self._access_token  # type: ignore[return-value]
+
+    async def refresh_async(self) -> str:
+        """Same as refresh(), but safe to call from an asyncio event loop:
+        runs the underlying synchronous HTTP call (httpx.get by default) in
+        a thread executor instead of blocking the loop for its duration.
+
+        Added specifically for ReconnectingStreamSource.ticks() (reconnect.py),
+        which calls this on every reconnect. Confirmed live (2026-09-16):
+        a reconnect loop that calls the synchronous refresh() directly can
+        starve this whole process's event loop -- which explained an
+        otherwise-puzzling docker-compose healthcheck failure during that
+        incident, since /health (FastAPI, same process) shares the loop
+        being starved."""
+        return await asyncio.to_thread(self.refresh)
 
     def refresh(self) -> str:
         """Unconditionally fetch a fresh access token from the helper."""

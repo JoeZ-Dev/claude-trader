@@ -160,6 +160,55 @@ full reconnects) - that would reach past schwab-py's supported interface,
 which contradicts the original reason for choosing a vetted library over
 hand-rolling this layer.
 
+**Reconnect-storm incident (2026-09-16, root-caused and fixed):** for a
+full hour, `schwab-connector` reconnected roughly every ~15-75ms instead
+of every ~30 minutes — 46,695 reconnects, confirmed via
+`docker compose logs`, hammering `companion-auth`'s `/access_token`
+endpoint at ~13 requests/second sustained the whole time. Root cause:
+`ReconnectingStreamSource.ticks()` (reconnect.py) calls
+`token_source.refresh_async()` unconditionally at the top of every loop
+iteration and trusts that a fresh refresh yields a non-stale
+`seconds_until_stale()` budget — true under normal operation (a real
+~30-minute token lifetime), but nothing enforced it. Because
+`companion-auth` was, during that window, serving an already-near-expiry
+cached token on every request (root cause on that side not confirmed —
+`companion-auth` is a separate repo/service, out of this one's reach —
+but directly observed post-recovery: five rapid `/access_token` calls
+against the healthy `companion-auth` all returned the identical cached
+token, confirming it caches rather than re-hitting Schwab per-request, so
+this was very likely a stuck/stale cache entry on that side, not
+`schwab-connector` exhausting Schwab's real OAuth endpoint), every
+`refresh_async()` call kept producing an already-stale budget, so
+`_consume_until_stale` returned immediately — zero ticks, no `await`
+anywhere in that path — and the outer loop refreshed and reconnected
+again immediately, forever. This was worse than wasteful: reproduced
+directly in a regression test (`tests/test_reconnect.py`,
+`test_backs_off_when_a_fresh_refresh_is_immediately_stale_again`), a
+tight zero-await loop like this doesn't just hammer the auth helper, it
+starves THIS PROCESS's own asyncio event loop, since nothing in the path
+ever yields control back to it. That's the confirmed explanation for why
+`schwab-connector` showed `(unhealthy)` in `docker compose ps` during the
+incident — its own `/health` handler (FastAPI, same process) shares the
+event loop the reconnect loop was starving.
+
+Two fixes, both committed: (1) `ticks()` now tracks whether a cycle
+yielded any ticks at all; if not, it `await`s the same
+`auth_retry_seconds` backoff the auth-error path already used, before
+looping back — this alone fixes both the hammering and the starvation,
+since awaiting anything hands control back to the loop. (2)
+`AccessTokenSource.refresh()`'s default HTTP call
+(`httpx.get`) is synchronous, and was previously called directly from
+async code at both reconnect call sites — meaning even in NORMAL
+operation, a slow `companion-auth` response would block this whole
+process for the call's duration, not just during a storm. Added
+`refresh_async()` (runs `refresh()` in a thread executor via
+`asyncio.to_thread`, proven non-blocking by
+`test_refresh_async_does_not_block_the_event_loop` in
+`tests/test_token_source.py`), and switched both `reconnect.py` and
+`main.py`'s one-shot backfill token fetch to use it instead of the
+synchronous `refresh()`. `refresh()` itself is unchanged and still used
+directly by anything that isn't running on this process's event loop.
+
 **Price-history date-range quirk (platform-enforced, confirmed live):**
 `GET /marketdata/v1/pricehistory` (wrapped by schwab-py's
 `get_price_history`), when called with `periodType=day&period=1` and no

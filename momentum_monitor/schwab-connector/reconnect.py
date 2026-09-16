@@ -6,10 +6,14 @@ self-refresh (see specs.md section 4). This wrapper keeps a live stream
 going across the ~30-minute access-token lifetime by managing renewal
 explicitly:
 
-- Before each (re)connect it calls `token_source.refresh()` for a fresh
-  access token, then `build_client(token_source.as_schwab_token())` to make
-  a new schwab-py client (via `client_from_access_functions`), then
-  `make_source(client)` for a new inner stream source.
+- Before each (re)connect it calls `token_source.refresh_async()` for a
+  fresh access token (the async, thread-executor-backed variant of
+  `refresh()` -- see token_source.py; calling the synchronous `refresh()`
+  directly here would block this whole process's event loop for the
+  HTTP call's duration on every single reconnect), then
+  `build_client(token_source.as_schwab_token())` to make a new schwab-py
+  client (via `client_from_access_functions`), then `make_source(client)`
+  for a new inner stream source.
 - It consumes ticks from the inner source until EITHER the token is within
   its leeway of expiry (`token_source.seconds_until_stale()` reaches 0 --
   the proactive path, so there is no dropped-tick window) OR the inner
@@ -19,6 +23,17 @@ explicitly:
 - `AuthRequired` / `AuthHelperError` from the token source are caught, not
   allowed to crash the consume task: it emits an event, sleeps
   `auth_retry_seconds`, and retries.
+- If a fresh refresh_async() immediately produces an already-stale budget
+  (zero ticks consumed before the proactive-refresh path fires), that
+  same `auth_retry_seconds` backoff applies before looping back to
+  refresh again. Confirmed live (2026-09-16): without this, a
+  persistently-stale-token condition (e.g. the auth helper serving an
+  already-near-expiry cached token) turns into a tight, zero-await
+  busy-loop -- observed at ~13 reconnects/sec against the auth helper,
+  sustained for a full hour, and severe enough to starve this process's
+  own event loop (which stalled /health handling badly enough to fail
+  the docker-compose healthcheck) since nothing in that path awaited
+  anything.
 
 Presents the same interface as the other stream sources: an async
 `ticks(symbol)` generator and a `connected` property.
@@ -66,7 +81,7 @@ class ReconnectingStreamSource:
             while True:
                 # 1. fresh access token
                 try:
-                    self._token_source.refresh()
+                    await self._token_source.refresh_async()
                 except (AuthRequired, AuthHelperError) as exc:
                     self._connected = False
                     self._on_event("auth_error", error=exc)
@@ -89,9 +104,18 @@ class ReconnectingStreamSource:
                 first = False
 
                 # 3. consume until token near-expiry, or inner ends/errors
+                got_a_tick = False
                 async for tick in self._consume_until_stale(inner, symbol):
+                    got_a_tick = True
                     yield tick
                 self._connected = False
+                if not got_a_tick:
+                    # A fresh refresh_async() immediately produced an
+                    # already-stale budget -- see module docstring. Back
+                    # off instead of looping straight back into another
+                    # refresh with no delay.
+                    self._on_event("stale_immediately_after_refresh")
+                    await self._sleep(self._auth_retry_seconds)
                 # loop -> refresh + rebuild + reconnect
         finally:
             self._connected = False

@@ -13,7 +13,8 @@ import logging
 
 logger = logging.getLogger("schwab-connector.stream")
 
-_WARNING_EVENTS = {"auth_error", "build_error", "stream_error"}
+_WARNING_EVENTS = {"auth_error", "build_error", "stream_error",
+                   "stale_immediately_after_refresh"}
 
 
 def format_event(name: str, **kwargs) -> str:
