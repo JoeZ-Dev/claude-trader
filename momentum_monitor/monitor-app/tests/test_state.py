@@ -7,8 +7,17 @@ sys.path.insert(0, _APP_DIR)
 _CORE = os.path.join(os.path.dirname(_APP_DIR), "core")
 sys.path.insert(0, _CORE)
 
-from levels import Level  # from core, via _CORE on sys.path
-from state import build_state, select_levels, session_bars_for_vwap
+from indicators import ema, relative_volume, session_vwap  # from core
+from levels import Level, detect_levels, evaluate_hold  # from core
+from state import (
+    LIVE_BAR_MAX_GAP_SECONDS,
+    RELVOL_LOOKBACK,
+    REQUIRED_HOLD_BARS,
+    build_state,
+    live_cadence_tail,
+    select_levels,
+    session_bars_for_vwap,
+)
 
 
 def _load_demo_session():
@@ -114,6 +123,118 @@ def test_build_state_short_history_does_not_crash():
     assert st["status"] == "ok"
     assert st["session"]["relative_volume"] == 1.0  # fewer than lookback bars
     assert "histogram" in st["session"]["macd"]
+
+
+# -- live_cadence_tail ---------------------------------------------------
+
+def test_live_cadence_tail_returns_everything_when_uniformly_spaced():
+    bars = [{"ts": i * 10} for i in range(5)]
+    assert live_cadence_tail(bars) == bars
+
+
+def test_live_cadence_tail_isolates_segment_after_a_large_gap():
+    backfill = [{"ts": t} for t in (0, 60, 120)]
+    live = [{"ts": t} for t in (300, 310, 320)]
+    assert live_cadence_tail(backfill + live) == live
+
+
+def test_live_cadence_tail_empty_list():
+    assert live_cadence_tail([]) == []
+
+
+def test_live_cadence_tail_single_bar():
+    bars = [{"ts": 100}]
+    assert live_cadence_tail(bars) == bars
+
+
+def test_live_cadence_tail_gap_exactly_at_threshold_still_counts_as_live():
+    bars = [{"ts": 0}, {"ts": LIVE_BAR_MAX_GAP_SECONDS}]
+    assert live_cadence_tail(bars) == bars
+
+
+# -- build_state: backfill (coarse/irregular) vs. live (uniform 10s) -----
+#
+# Backfilled bars (schwab-connector/price_history.py) are Schwab
+# price-history candles, no finer than 1 minute and with zero-volume
+# minutes skipped entirely -- irregular, never as tight as 10s apart.
+# Live bars (schwab-connector/aggregator.py) are always exactly
+# BUCKET_SECONDS=10 apart once streaming starts. Bar-count-windowed
+# functions (ema/macd/relative_volume/hold-confirmation) implicitly assume
+# uniform bar width, so mixing the two would make a "9-period EMA" mean 9
+# minutes one moment and 90 seconds the next. session_vwap and
+# detect_levels are not window-based this way and are meant to see the
+# whole session, backfill included -- see specs.md section 3 for the full
+# rationale and the explicitly-deferred time-aware alternative.
+
+def _flat_backfill_bars(price: float, count: int = 10, step: int = 60):
+    return [{"ts": i * step, "open": price, "high": price, "low": price,
+             "close": price, "volume": 5000.0, "is_extended": False}
+            for i in range(count)]
+
+
+def _flat_live_bars(price: float, start_ts: int, count: int = 5, step: int = 10):
+    return [{"ts": start_ts + i * step, "open": price, "high": price,
+             "low": price, "close": price, "volume": 500.0, "is_extended": False}
+            for i in range(count)]
+
+
+def test_build_state_ema_and_relative_volume_ignore_backfilled_bars():
+    backfill = _flat_backfill_bars(100.0)  # would badly skew EMA/relvol if counted
+    live = _flat_live_bars(10.0, backfill[-1]["ts"] + 300)
+    bars = backfill + live
+
+    st = build_state(bars, symbol="X")
+    live_bars = live_cadence_tail(bars)
+    assert live_bars == live  # sanity: the split landed where expected
+
+    live_closes = [b["close"] for b in live_bars]
+    assert st["session"]["ema9"] == round(ema(live_closes, 9)[-1], 4)
+    assert st["session"]["relative_volume"] == round(
+        relative_volume(live_bars, lookback=RELVOL_LOOKBACK)[-1], 4)
+    # A 100.0-heavy EMA would round to 100.0-ish; confirm it doesn't.
+    assert st["session"]["ema9"] < 50.0
+
+
+def test_build_state_vwap_still_spans_the_full_backfilled_and_live_session():
+    backfill = _flat_backfill_bars(100.0)
+    live = _flat_live_bars(10.0, backfill[-1]["ts"] + 300)
+    bars = backfill + live
+
+    st = build_state(bars, symbol="X")
+    live_only_vwap = session_vwap(live_cadence_tail(bars))[-1]
+    # If VWAP only saw the live tail it would sit right at 10.0; seeing the
+    # full session (10x more backfilled volume at 100.0) pulls it way up.
+    assert st["session"]["vwap"] > live_only_vwap + 10.0
+
+
+def test_build_state_hold_confirmation_uses_only_live_cadence_bars():
+    # A dip mid-backfill gives detect_levels an obvious support candidate
+    # whose backfilled closes alone would look "held" below it if counted;
+    # the short live tail alone is too short to confirm anything.
+    ts = 0
+    prices = [10, 10, 9, 8, 6, 4, 6, 8, 9, 10]
+    backfill = []
+    for p in prices:
+        backfill.append({"ts": ts, "open": p, "high": p + 0.2, "low": p - 0.2,
+                         "close": p, "volume": 50_000.0, "is_extended": False})
+        ts += 60
+    live = _flat_live_bars(9.5, backfill[-1]["ts"] + 300, count=2)
+    bars = backfill + live
+
+    st = build_state(bars, symbol="X")
+    live_bars = live_cadence_tail(bars)
+    picked = select_levels(detect_levels(bars), bars[-1]["close"])
+
+    for side, direction in (("resistance", "above"), ("support", "below")):
+        level = picked[side]
+        block = st["levels"][side]
+        if level is None:
+            assert block is None
+            continue
+        expected = evaluate_hold(live_bars, level.price, direction=direction,
+                                 required_bars=REQUIRED_HOLD_BARS)
+        assert block["hold"]["consecutive_bars"] == expected.consecutive_bars
+        assert block["hold"]["confirmed"] == expected.confirmed
 
 
 def test_session_bars_for_vwap_slices_to_latest_ny_date():

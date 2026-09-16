@@ -51,6 +51,53 @@ Two non-negotiable principles:
 Covered by unit tests in `momentum_monitor/core/tests/` — see that
 directory for the current, authoritative test suite.
 
+**Backfill vs. live bar width (known, intentional, temporary tradeoff):**
+Every function in this module except `session_vwap` implicitly assumes
+uniform bar width — `ema`/`macd`'s decay factor is applied per bar, not
+per elapsed second; `relative_volume` compares one bar's volume to a
+rolling average of others'; `detect_levels`'s swing-point window and
+`evaluate_hold`'s `required_bars` both count bars, not time. That
+assumption held by construction through the first backfill implementation
+(section 5), the whole live bar series came from one 10s aggregator.
+Backfill breaks it: `schwab-connector/price_history.py` prepends Schwab
+price-history candles, no finer than 1 minute and with zero-volume
+minutes skipped entirely (gaps observed live, backfilling QCLS on
+2026-09-16, ranging from 60s to over 900s) — genuinely irregular, not
+just "coarser than 10s." A "9-period EMA" or "3-bar hold" computed across
+that boundary means a different amount of real time depending on which
+bars happen to be in the window, which is a real correctness bug, not
+cosmetic.
+
+The fix adopted for now, confined to `monitor-app/state.py`
+(`live_cadence_tail`): `ema`, `macd`, `relative_volume`, and
+hold-confirmation only ever see the contiguous LIVE tail of the bar
+list — found by walking backward from the most recent bar and stopping at
+the first gap wider than 15s (comfortably between live's 10s cadence and
+backfill's 60s floor) — never the backfilled bars ahead of it.
+`session_vwap` (genuinely granularity-agnostic — a cumulative sum, not a
+window) and `detect_levels` (a whole-session swing scan, not a
+decay-weighted average — the softer, more forgivable case of this same
+assumption) deliberately keep seeing the full backfilled+live series.
+Practical effect: EMA/MACD/relative_volume/hold-confirmation warm up from
+scratch on live data alone after every fresh watch, same as the
+already-accepted EMA "first value seeds on itself" warm-up transient —
+not a new limitation, just the existing one now correctly scoped away
+from misleading coarse data instead of contaminated by it.
+
+This is explicitly a stopgap, not the intended end state. The correct,
+durable fix is to make these functions genuinely time-aware — decay by
+elapsed seconds rather than by bar count, compare volume *rates*
+(volume/duration) rather than raw per-bar volume, and require a minimum
+elapsed *time* on the correct side of a level rather than a bar count.
+That also fixes the irregular gaps *within* the backfilled portion itself
+(this stopgap doesn't touch those, since detect_levels still sees them
+as-is), not just the live-transition boundary. It was deferred rather
+than built immediately because it means reworking `core/`'s public
+function signatures (`ema`/`macd` currently take plain `values:
+list[float]`, with no timestamps) and its authoritative test suite — a
+real redesign, not a quick patch. Candidate for a future phase, alongside
+3.5 below, not assumed by the current one.
+
 ### 4. Data source
 
 Charles Schwab's API — streaming quotes, aggregated into 10s bars, via the
@@ -220,6 +267,17 @@ principle, with no code living loose at repo root:
    established for the LLM Coach: show the factors that make it the
    best candidate (proximity, level strength, volume confirmation) —
    don't reduce the comparison to an opaque score.
+3.6. **Time-aware core indicators.** Rework `ema`/`macd`/`relative_volume`/
+   `evaluate_hold`/`detect_levels`'s swing-point window (section 3) to
+   decay/compare/require by elapsed real time rather than by bar count,
+   replacing the `live_cadence_tail` stopgap (section 3, "Backfill vs.
+   live bar width") that currently just excludes backfilled bars from the
+   window-based functions instead of correctly weighting them. Also fixes
+   the irregular gaps *within* the backfilled portion itself (Schwab
+   skips zero-volume minutes), which the stopgap doesn't address. Touches
+   `core/`'s public function signatures and its authoritative test suite
+   — a real redesign, not a quick patch, which is why it's a separate
+   phase rather than bundled into the backfill work that motivated it.
 4. Virtual trade journal — logs what the system would have done
    (entry/stop/target) without placing anything, for end-of-day review
    against the user's own judgment.
