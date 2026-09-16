@@ -317,7 +317,84 @@ principle, with no code living loose at repo root:
   (see roadmap phase 2, which this feature is explicitly NOT).
 - **`momentum_monitor/docker-compose.yml`** — orchestrates all three.
 
-### 6. Roadmap / phases
+### 6. Virtual trade journal — momentum_monitor phase 4
+
+Logs what the system would have done (entry, trailing stop) without
+placing anything, for later review against the user's own judgment.
+Lives in `momentum_monitor/monitor-app/` (`journal_logic.py` for the pure
+decision functions, `journal_store.py` for SQLite persistence, wired into
+`Poller` in `app.py`) — not `core/`, because it depends on Poller-level
+state (which symbol is watched, the accumulated bar list), not pure
+market analysis, even though `journal_logic.py` keeps the same "no I/O"
+discipline `core/` uses for the same reason `core/` does (see section 3).
+
+**Entry.** Fires exactly once per `hold.confirmed` False→True transition
+on the nearest-above resistance level already computed and displayed on
+the page (`state["levels"]["resistance"]["hold"]["confirmed"]`, from
+`core/levels.py`'s `evaluate_hold`) — no new entry-signal logic invented.
+`entry_price` is the close of the bar the transition is observed at (in
+practice: the latest bar in the poll cycle where the transition is first
+seen — the finest granularity available without re-running
+`evaluate_hold` per-bar inside a single poll, which would itself be
+inventing new entry logic). Only one open virtual position at a time,
+tied to whichever symbol is currently watched; if a position is already
+open, a continued or repeated `True` reading does not fire a duplicate.
+
+**Exit — trailing stop only, no fixed target, by design.** A fixed R:R
+target was explicitly rejected for this project: it capped winners in the
+EOD swing bot and contributed to that strategy's edge not holding up
+under proper testing. There is no target anywhere in `journal_logic.py`,
+by design, not by omission.
+- `TRAIL_PCT` (env var, default `0.05` / 5%, see `main.py`) — a starting
+  point to tune against real logged data, not a validated number.
+- `high_water_mark` starts at `entry_price` and ratchets up from each new
+  bar's HIGH (never its close) — it never moves down.
+- `stop_level = high_water_mark * (1 - TRAIL_PCT)`, recomputed every
+  ratchet.
+- A bar's LOW crossing below the (freshly-ratcheted) `stop_level` exits
+  immediately — no confirmation delay. This mirrors the SAME asymmetry
+  section 3 already establishes as non-negotiable for hold-confirmation
+  generally (entries need sustained confirmation, stops fire fast, no
+  exceptions) — not a new rule invented for this journal specifically.
+  When a single bar's high raises the stop AND its low would breach that
+  new, higher stop, the exit still fires: OHLC bars don't record whether
+  the high or low happened first, so the worse-case-for-the-position
+  ordering is assumed. `exit_price` on a stop is the `stop_level` itself
+  (a virtual/simulated-fill modeling choice — assume the stop fills at
+  the stop price — not a claim about real fill behavior).
+
+**Symbol switching (an edge case that didn't exist when phase 4 was first
+scoped, added once the watch/unwatch text box did — section 5).** When
+`Poller.switch_symbol` moves off a symbol with an open virtual position,
+it force-closes that position at the symbol's last known close,
+`exit_reason="symbol_switched"` — distinct from `"trailing_stop"` so
+later review doesn't conflate "the trade stopped out" with "the user just
+moved on." A position is never left open with no further price updates,
+which could never resolve. Switching back to (or restarting into) a
+symbol with an already-open position resumes tracking it from
+`journal_store` rather than losing or duplicating it — proven by test
+(two `JournalStore` instances over the same SQLite file), the same rigor
+already applied to bars/tokens surviving a restart.
+
+**Storage: SQLite, not JSONL.** A different access pattern from
+schwab-connector's bars (append-only, replayed sequentially start to
+finish, one file per symbol) — trade records need to be QUERIED and
+reviewed (find the open one for a symbol, list recent closed ones,
+eventually compute win rate/expectancy), which SQLite fits better. Don't
+default to JSONL just because that's what bars used — different access
+pattern, different storage choice, on purpose.
+
+Schema (`trades` table): `id`, `symbol`, `entry_ts`, `entry_price`,
+`high_water_mark` (updated live while open), `stop_level` (updated live
+while open), `exit_ts`, `exit_price`, `exit_reason` (nullable while
+open), `realized_pnl_pct` (nullable while open).
+
+**Page/API.** `GET /api/state`'s JSON gains a `"journal"` key (open
+position + live unrealized P&L%, plus up to 10 recent closed trades, all
+symbols, most recent first); the HTML page gets a matching plain-table
+section, same style as the existing levels tables — no new framework.
+
+### 7. Roadmap / phases
 
 1. **(current)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,
@@ -362,9 +439,11 @@ principle, with no code living loose at repo root:
    `core/`'s public function signatures and its authoritative test suite
    — a real redesign, not a quick patch, which is why it's a separate
    phase rather than bundled into the backfill work that motivated it.
-4. Virtual trade journal — logs what the system would have done
-   (entry/stop/target) without placing anything, for end-of-day review
-   against the user's own judgment.
+4. **(built)** Virtual trade journal — logs what the system would have
+   done (entry, trailing stop) without placing anything, for end-of-day
+   review against the user's own judgment. See section 6 for the full
+   design — notably, no fixed target: a trailing stop only, by deliberate
+   choice, not the "entry/stop/target" originally sketched here.
 5. Anything beyond this point (more autonomy, live execution) requires
    its own explicit design discussion and is not assumed by this roadmap.
 
