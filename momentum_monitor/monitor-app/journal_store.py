@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import replace
+from pathlib import Path
 
 from journal_logic import ExitEvent, OpenPosition
 
@@ -57,6 +58,7 @@ class JournalStore:
         # single thread is driving that event loop at a time, never
         # concurrently, so relaxing sqlite3's same-thread check is safe
         # here rather than a real concurrency risk.
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(_SCHEMA)

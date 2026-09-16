@@ -20,6 +20,16 @@ def test_open_position_for_returns_none_when_nothing_open(tmp_path):
     assert store.open_position_for("AEHL") is None
 
 
+def test_creates_parent_directory_if_missing(tmp_path):
+    # Matches BarStore's (schwab-connector/store.py) pattern -- the docker
+    # volume mount point exists by the time the container runs, but a
+    # fresh checkout / local run shouldn't need to pre-create it by hand.
+    db_path = tmp_path / "nested" / "dir" / "journal.db"
+    store = JournalStore(db_path)
+    store.create(_position())
+    assert db_path.exists()
+
+
 def test_create_then_open_position_for_returns_it(tmp_path):
     store = JournalStore(tmp_path / "journal.db")
     created = store.create(_position())

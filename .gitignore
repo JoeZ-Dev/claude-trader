@@ -8,3 +8,4 @@ equity_curve.csv
 *.zip
 data/_cache/
 momentum_monitor/schwab-connector/data/
+momentum_monitor/monitor-app/data/
