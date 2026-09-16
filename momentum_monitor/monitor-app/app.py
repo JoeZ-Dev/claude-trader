@@ -88,10 +88,25 @@ class Poller:
         self._poll_ok = False
         self._journal_position = None   # journal_logic.OpenPosition | None
         self._journal_was_confirmed = False
+        self._poll_enabled = True
 
     @property
     def state(self) -> dict:
         return self._state
+
+    @property
+    def poll_enabled(self) -> bool:
+        return self._poll_enabled
+
+    def set_poll_enabled(self, enabled: bool) -> None:
+        """Pause/resume the background poll loop itself (not just what the
+        browser displays) -- schwab-connector's live stream and stored bars
+        are unaffected either way, this only stops monitor-app from pulling
+        new ones in while nobody's watching. Distinct from (and the thing
+        that actually matters, unlike) the client-side setInterval the page
+        also has -- that only stops browser<->monitor-app traffic, which
+        never left localhost/the LAN in the first place."""
+        self._poll_enabled = enabled
 
     def journal_snapshot(self) -> dict:
         """Everything the page/API need to show the journal: the open
@@ -122,7 +137,7 @@ class Poller:
         if self._initial_symbol is not None:
             await self.switch_symbol(self._initial_symbol)
         while True:
-            if self._symbol is not None:
+            if self._symbol is not None and self._poll_enabled:
                 await self._poll_once()
             await asyncio.sleep(self._interval)
 
@@ -363,7 +378,7 @@ def _journal_closed_rows_html(closed: list[dict]) -> str:
     return "".join(rows)
 
 
-def _page(state: dict, journal: dict) -> str:
+def _page(state: dict, journal: dict, poll_enabled: bool) -> str:
     sym = html.escape(str(state.get("symbol") or "—"))
     is_ok = state.get("status") == "ok"
 
@@ -438,7 +453,7 @@ def _page(state: dict, journal: dict) -> str:
   </section>
 </div>
 """
-    return _wrap(sym, body)
+    return _wrap(sym, body, poll_enabled)
 
 
 _SYMBOL_FORM = (
@@ -450,13 +465,20 @@ _SYMBOL_FORM = (
 
 # Live-polling toggle -- separate from the ticker form above (a page
 # nobody's watching still burns a schwab-connector/API request every poll
-# interval; this lets that stop without navigating away).
-_POLL_TOGGLE = (
-    "<div class='poll-controls'>"
-    "<span id=\"poll-status\" class='muted'>live</span>"
-    "<button type='button' id=\"poll-toggle\">Pause updates</button>"
-    "</div>"
-)
+# interval; this lets that stop without navigating away). poll_enabled
+# reflects server-side truth (Poller.poll_enabled) at request time, same
+# "real data on first paint" approach as the rest of _page -- the button
+# doesn't just start on a guessed default and get corrected a moment later
+# by JS.
+def _poll_toggle_html(poll_enabled: bool) -> str:
+    label = "Pause updates" if poll_enabled else "Resume updates"
+    status = "live" if poll_enabled else "paused"
+    return (
+        "<div class='poll-controls'>"
+        f"<span id=\"poll-status\" class='muted'>{status}</span>"
+        f"<button type='button' id=\"poll-toggle\">{label}</button>"
+        "</div>"
+    )
 
 # Mirrors, in JS, the same helpers/templates as the Python side above --
 # see the module-level comment on _fmt for why this duplication exists.
@@ -529,6 +551,7 @@ async function refresh() {
   } catch (e) {
     return;  // keep showing the last-good render, same philosophy as the server's own _poll_ok
   }
+  applyPollUiState(data.poll_enabled);  // stay in sync even if another tab paused/resumed it
   const banner = document.getElementById('banner');
   const main = document.getElementById('main');
   if (data.status !== 'ok') {
@@ -569,42 +592,47 @@ async function refresh() {
   document.getElementById('journal-closed-tbody').innerHTML = journalClosedRows(data.journal.recent_closed);
 }
 
-// Pause/resume the polling loop itself -- a page left open but not being
-// watched otherwise keeps hitting /api/state every POLL_MS forever for no
-// reason. Preference persists in localStorage (best-effort: private
-// browsing / blocked storage just falls back to "live" every load, never
-// breaks the toggle itself).
+// Pause/resume BOTH the client-side display loop AND (via POST
+// /api/polling) monitor-app's own server-side poller -- the client loop
+// alone only stops browser<->monitor-app traffic, which never left
+// localhost/the LAN; the server-side one is what actually stops hitting
+// schwab-connector. Server truth (poll_enabled, from /api/state) is
+// authoritative, not a client-only preference -- correct across multiple
+// tabs/devices and across a fresh page load, with no localStorage needed.
 const POLL_MS = 4000;
 let pollTimer = null;
+let pollEnabled = true;
 
-function setPolling(enabled) {
-  const toggle = document.getElementById('poll-toggle');
-  const status = document.getElementById('poll-status');
+function applyPollUiState(enabled) {
+  pollEnabled = enabled;
+  document.getElementById('poll-toggle').textContent = enabled ? 'Pause updates' : 'Resume updates';
+  document.getElementById('poll-status').textContent = enabled ? 'live' : 'paused';
   if (enabled) {
-    if (!pollTimer) {
-      refresh();
-      pollTimer = setInterval(refresh, POLL_MS);
-    }
-    toggle.textContent = 'Pause updates';
-    status.textContent = 'live';
-  } else {
-    if (pollTimer) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-    }
-    toggle.textContent = 'Resume updates';
-    status.textContent = 'paused';
+    if (!pollTimer) pollTimer = setInterval(refresh, POLL_MS);
+  } else if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
   }
-  try { localStorage.setItem('pollingPaused', enabled ? '0' : '1'); } catch (e) {}
 }
 
-let startEnabled = true;
-try { startEnabled = localStorage.getItem('pollingPaused') !== '1'; } catch (e) {}
-
-document.getElementById('poll-toggle').addEventListener('click', function () {
-  setPolling(pollTimer === null);
+document.getElementById('poll-toggle').addEventListener('click', async function () {
+  const wantEnabled = !pollEnabled;
+  let body;
+  try {
+    const r = await fetch('/api/polling', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: wantEnabled }),
+    });
+    body = await r.json();
+  } catch (e) {
+    return;  // request failed -- leave the UI showing the last known real state
+  }
+  applyPollUiState(body.poll_enabled);
+  if (body.poll_enabled) refresh();  // immediate refresh on resume, not a wait for the next tick
 });
-setPolling(startEnabled);
+
+refresh();
 """
 
 _STYLE = """
@@ -653,13 +681,13 @@ table.detail th{color:var(--muted);font-weight:500;width:45%}
 """
 
 
-def _wrap(sym: str, body: str) -> str:
+def _wrap(sym: str, body: str, poll_enabled: bool) -> str:
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         f"<title>momentum monitor — {sym}</title>"
         f"<style>{_STYLE}</style></head><body>"
-        f"<div class='topbar'><h1>{sym}</h1>{_SYMBOL_FORM}{_POLL_TOGGLE}</div>"
+        f"<div class='topbar'><h1>{sym}</h1>{_SYMBOL_FORM}{_poll_toggle_html(poll_enabled)}</div>"
         f"{body}"
         "<p class='footer'>Read-only technical read. Not advice, not an order.</p>"
         f"<script>{_SCRIPT}</script>"
@@ -695,11 +723,12 @@ def create_app(*, fetch_bars, watch_symbol, poll_interval: float = 5.0,
     async def api_state():
         payload = dict(poller.state)
         payload["journal"] = poller.journal_snapshot()
+        payload["poll_enabled"] = poller.poll_enabled
         return JSONResponse(payload)
 
     @app.get("/", response_class=HTMLResponse)
     async def root():
-        return _page(poller.state, poller.journal_snapshot())
+        return _page(poller.state, poller.journal_snapshot(), poller.poll_enabled)
 
     @app.post("/api/watch")
     async def api_watch(request: Request):
@@ -711,5 +740,17 @@ def create_app(*, fetch_bars, watch_symbol, poll_interval: float = 5.0,
         symbol = (parse_qs(body).get("symbol") or [""])[0]
         await poller.switch_symbol(symbol)
         return RedirectResponse("/", status_code=303)
+
+    @app.post("/api/polling")
+    async def api_polling(request: Request):
+        # Pauses/resumes monitor-app's own background poll loop (the thing
+        # that actually hits schwab-connector) -- distinct from, and more
+        # important than, the client-side setInterval toggle, which only
+        # stops browser<->monitor-app traffic. JSON body, not a form: this
+        # is only ever called from the page's own JS, never submitted as an
+        # HTML form.
+        body = await request.json()
+        poller.set_poll_enabled(bool(body.get("enabled", True)))
+        return JSONResponse({"poll_enabled": poller.poll_enabled})
 
     return app

@@ -138,12 +138,15 @@ def test_root_page_has_stable_ids_for_js_to_update():
 def test_root_page_has_a_pause_polling_toggle():
     # The whole point of switching off meta-refresh was to stop wasting
     # requests when nobody's watching -- a manual pause/resume toggle for
-    # the JS polling itself, not just "no full-page reload".
+    # the JS polling itself, not just "no full-page reload". State is
+    # server-truth (poll_enabled via /api/state and POST /api/polling),
+    # not a client-only localStorage preference -- correct across multiple
+    # tabs/devices, not just this one browser.
     with _client(FakeFetch([_bars(5)])) as c:
         page = c.get("/").text
         assert "clearInterval" in page
         assert "poll-toggle" in page
-        assert "localStorage" in page  # preference persists across reloads
+        assert "poll_enabled" in page
 
 
 def test_announce_watch_called_on_startup():
@@ -356,6 +359,54 @@ def test_switch_symbol_during_inflight_poll_discards_stale_result():
         assert _wait_until(lambda: c.get("/api/state").json().get("symbol") == "MSFT")
         assert _wait_until(lambda: c.get("/api/state").json().get("status") == "ok")
         assert c.get("/api/state").json()["bar_count"] == 3
+
+
+# -- server-side polling pause (POST /api/polling) -----------------------
+#
+# The client-side pause/resume button (setInterval on /api/state) doesn't
+# touch what actually costs anything: monitor-app's own background poller
+# hitting schwab-connector's /bars on its own loop, independent of any
+# browser activity. This is the piece that actually needs to stop.
+
+def test_api_state_exposes_poll_enabled_default_true():
+    with _client(FakeFetch([_bars(5)])) as c:
+        assert c.get("/api/state").json()["poll_enabled"] is True
+
+
+def test_poll_control_pauses_the_background_poller():
+    # FakeFetch just returns [] once its one queued batch is exhausted --
+    # empty results still count as a poll attempt (fetch.calls still
+    # grows), which is exactly what this test needs to observe.
+    fetch = FakeFetch([_bars(3)])
+    with _client(fetch) as c:
+        assert _wait_until(lambda: c.get("/api/state").json().get("status") == "ok")
+        r = c.post("/api/polling", json={"enabled": False})
+        assert r.status_code == 200
+        assert r.json()["poll_enabled"] is False
+        assert _wait_until(lambda: c.get("/api/state").json().get("poll_enabled") is False)
+
+        calls_at_pause = len(fetch.calls)
+        time.sleep(0.3)  # several poll_interval windows (0.05s each in _client)
+        assert len(fetch.calls) == calls_at_pause, \
+            "fetch_bars was called again after pausing -- server-side poll didn't stop"
+
+
+def test_poll_control_resumes_the_background_poller():
+    fetch = FakeFetch([_bars(3)])
+    with _client(fetch) as c:
+        assert _wait_until(lambda: c.get("/api/state").json().get("status") == "ok")
+        c.post("/api/polling", json={"enabled": False})
+        assert _wait_until(lambda: c.get("/api/state").json().get("poll_enabled") is False)
+        calls_while_paused = len(fetch.calls)
+
+        r = c.post("/api/polling", json={"enabled": True})
+        assert r.json()["poll_enabled"] is True
+        assert _wait_until(lambda: len(fetch.calls) > calls_while_paused)
+
+
+def test_root_page_js_calls_poll_control_endpoint():
+    with _client(FakeFetch([_bars(5)])) as c:
+        assert "/api/polling" in c.get("/").text
 
 
 def test_api_state_survives_fetch_error():
