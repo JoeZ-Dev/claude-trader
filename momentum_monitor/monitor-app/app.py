@@ -517,20 +517,28 @@ def _closest_setup_html(setup: dict | None) -> str:
     )
 
 
-def _setup_chips_html(others: list[dict]) -> str:
+def _setup_chips_html(symbol: str, others: list[dict]) -> str:
     """The remaining (non-closest) setup candidates as compact chips --
     type name + dollar distance only -- each immediately followed by its
     own initially-hidden detail table, toggled by a click handler
     delegated on #symbols (see _SCRIPT). Hidden markup ships in the same
     render rather than being fetched on click, since all the data is
-    already in `state` -- no round trip needed to expand one."""
+    already in `state` -- no round trip needed to expand one.
+
+    `data-key` uniquely identifies this chip across a full #symbols
+    innerHTML rebuild (symbol + setup type) so refresh()'s JS can restore
+    "was this expanded before this poll" -- fixed 2026-09-17: without it,
+    an expanded section silently re-collapsed on the very next ~4s poll,
+    since a freshly-rebuilt chip always starts hidden and nothing
+    remembered which ones the user had open."""
     if not others:
         return ""
     parts = ["<div class='setup-chips'>"]
     for setup in others:
         label = _SETUP_TYPE_LABELS.get(setup["setup_type"], setup["setup_type"])
+        key = html.escape(f"{symbol}:setup:{setup['setup_type']}")
         parts.append(
-            "<button type='button' class='setup-chip'>"
+            f"<button type='button' class='setup-chip' data-key='{key}'>"
             f"{html.escape(label)} &middot; ${_fmt(setup['distance'], 2)}</button>"
             "<div class='setup-detail' hidden><table class='detail'>"
             f"{_setup_hold_and_factor_rows_html(setup)}"
@@ -558,21 +566,25 @@ def _level_rows_html(block: dict) -> str:
     )
 
 
-def _level_block_html(title: str, block: dict | None) -> str:
+def _level_block_html(symbol: str, kind: str, title: str, block: dict | None) -> str:
     """Collapsed by default behind the same click-to-expand chip pattern
     as the other three setup-type candidates (phase 3.5's setup-chip /
     setup-detail, reusing the exact same generic click handler -- no new
     JS wiring needed). The closest-setup callout already shows resistance
     breakout in full when that's the closest type, so an always-open raw
     table here duplicated the same information by default; now one click
-    away instead of always taking the vertical space."""
+    away instead of always taking the vertical space.
+
+    `data-key` (symbol + "level" + kind) lets refresh()'s JS restore
+    expanded state across a poll rebuild -- see _setup_chips_html."""
     if block is None:
         return (
             "<button type='button' class='setup-chip' disabled>"
             f"{html.escape(title)}: none on this side of price</button>"
         )
+    key = html.escape(f"{symbol}:level:{kind}")
     return (
-        f"<button type='button' class='setup-chip'>{html.escape(title)} "
+        f"<button type='button' class='setup-chip' data-key='{key}'>{html.escape(title)} "
         f"@ {_fmt(block['price'], 2)}</button>"
         "<div class='setup-detail' hidden><table class='detail'>"
         f"{_level_rows_html(block)}"
@@ -580,11 +592,11 @@ def _level_block_html(title: str, block: dict | None) -> str:
     )
 
 
-def _level_chips_html(resistance: dict | None, support: dict | None) -> str:
+def _level_chips_html(symbol: str, resistance: dict | None, support: dict | None) -> str:
     return (
         "<div class='setup-chips'>"
-        f"{_level_block_html('Resistance (nearest above)', resistance)}"
-        f"{_level_block_html('Support (nearest below)', support)}"
+        f"{_level_block_html(symbol, 'resistance', 'Resistance (nearest above)', resistance)}"
+        f"{_level_block_html(symbol, 'support', 'Support (nearest below)', support)}"
         "</div>"
     )
 
@@ -675,10 +687,10 @@ def _symbol_card_html(symbol: str, state: dict) -> str:
     <tr><th>Relative volume</th><td>{_fmt(s['relative_volume'], 2)}</td></tr>
   </table>
   {_closest_setup_html(closest)}
-  {_setup_chips_html(others)}
+  {_setup_chips_html(symbol, others)}
   <h3>Virtual position</h3>
   {_journal_open_html(state["journal"]["open"])}
-  {_level_chips_html(state["levels"]["resistance"], state["levels"]["support"])}
+  {_level_chips_html(symbol, state["levels"]["resistance"], state["levels"]["support"])}
 </section>
 """
 
@@ -709,6 +721,7 @@ def _page(full_states: dict[str, dict], recent_closed: list[dict], poll_enabled:
   <div class="hero">
     <h2>Recent closed trades</h2>
     <button type="button" id="clear-symbol-switched-btn" class="remove-btn">clear symbol_switched rows</button>
+    <span id="clear-status" class="muted"></span>
   </div>
   <table class="detail">
     <tr><th>symbol</th><th>entry</th><th>exit</th><th>reason</th><th>P&amp;L %</th><th></th></tr>
@@ -775,20 +788,22 @@ function levelRows(block) {
 }
 // Collapsed by default behind the same setup-chip/setup-detail toggle
 // pattern as the other three setup-type candidates -- see the Python
-// side's _level_block_html for why.
-function levelBlockHtml(title, block) {
+// side's _level_block_html for why. data-key (symbol + level kind) lets
+// refresh() restore expanded state across a poll rebuild.
+function levelBlockHtml(symbol, kind, title, block) {
   if (!block) {
     return '<button type="button" class="setup-chip" disabled>' + esc(title) +
       ': none on this side of price</button>';
   }
-  return '<button type="button" class="setup-chip">' + esc(title) + ' @ ' +
+  const key = esc(symbol + ':level:' + kind);
+  return '<button type="button" class="setup-chip" data-key="' + key + '">' + esc(title) + ' @ ' +
     fmt(block.price, 2) + '</button>' +
     '<div class="setup-detail" hidden><table class="detail">' + levelRows(block) + '</table></div>';
 }
-function levelChipsHtml(resistance, support) {
+function levelChipsHtml(symbol, resistance, support) {
   return '<div class="setup-chips">' +
-    levelBlockHtml('Resistance (nearest above)', resistance) +
-    levelBlockHtml('Support (nearest below)', support) +
+    levelBlockHtml(symbol, 'resistance', 'Resistance (nearest above)', resistance) +
+    levelBlockHtml(symbol, 'support', 'Support (nearest below)', support) +
     '</div>';
 }
 function journalOpenHtml(open) {
@@ -856,12 +871,13 @@ function closestSetupHtml(setup) {
     ' ($' + fmt(setup.distance, 2) + ' away)</h3>' +
     '<table class="detail">' + setupHoldAndFactorRows(setup) + '</table>';
 }
-function setupChipsHtml(others) {
+function setupChipsHtml(symbol, others) {
   if (!others || !others.length) return '';
   let out = '<div class="setup-chips">';
   others.forEach(function (setup) {
     const label = SETUP_TYPE_LABELS[setup.setup_type] || setup.setup_type;
-    out += '<button type="button" class="setup-chip">' + esc(label) + ' &middot; $' +
+    const key = esc(symbol + ':setup:' + setup.setup_type);
+    out += '<button type="button" class="setup-chip" data-key="' + key + '">' + esc(label) + ' &middot; $' +
       fmt(setup.distance, 2) + '</button>' +
       '<div class="setup-detail" hidden><table class="detail">' +
       setupHoldAndFactorRows(setup) + '</table></div>';
@@ -899,9 +915,9 @@ function symbolCardHtml(symbol, state) {
     '<tr><th>Relative volume</th><td>' + fmt(s.relative_volume, 2) + '</td></tr>' +
     '</table>' +
     closestSetupHtml(closest) +
-    setupChipsHtml(others) +
+    setupChipsHtml(symbol, others) +
     '<h3>Virtual position</h3>' + journalOpenHtml(state.journal.open) +
-    levelChipsHtml(state.levels.resistance, state.levels.support) +
+    levelChipsHtml(symbol, state.levels.resistance, state.levels.support) +
     '</section>';
 }
 async function refresh() {
@@ -914,11 +930,31 @@ async function refresh() {
   }
   applyPollUiState(data.poll_enabled);  // stay in sync even if another tab paused/resumed it
   const symbolsEl = document.getElementById('symbols');
+
+  // Preserve which setup-chip/level-chip detail sections are currently
+  // expanded across this poll's full innerHTML rebuild -- fixed
+  // 2026-09-17: without this, an expanded section silently re-collapsed
+  // on the very next ~4s poll, since #symbols' whole subtree gets
+  // rebuilt from scratch every refresh() and a freshly-built chip always
+  // starts hidden, with nothing remembering which ones were open.
+  const expandedKeys = new Set();
+  symbolsEl.querySelectorAll('.setup-chip[data-key]').forEach(function (chip) {
+    const detail = chip.nextElementSibling;
+    if (detail && !detail.hidden) expandedKeys.add(chip.getAttribute('data-key'));
+  });
+
   const syms = Object.keys(data.symbols || {});
   const maxSymbols = data.max_symbols || 4;
   symbolsEl.innerHTML = syms.length
     ? syms.map(function(sym) { return symbolCardHtml(sym, data.symbols[sym]); }).join('')
     : '<p class="muted">No symbols watched yet \\u2014 add one below (up to ' + maxSymbols + ').</p>';
+
+  symbolsEl.querySelectorAll('.setup-chip[data-key]').forEach(function (chip) {
+    if (!expandedKeys.has(chip.getAttribute('data-key'))) return;
+    const detail = chip.nextElementSibling;
+    if (detail) detail.hidden = false;
+  });
+
   document.getElementById('journal-closed-tbody').innerHTML = journalClosedRows(data.recent_closed);
   document.getElementById('slot-count').textContent = syms.length + ' / ' + maxSymbols + ' symbols watched';
 }
@@ -1024,14 +1060,28 @@ document.getElementById('journal-closed-tbody').addEventListener('click', async 
 // #journal-closed-tbody, in the part of the page refresh() never
 // replaces, so a direct one-time binding is enough (same as the poll
 // toggle button below). Also a permanent SQLite delete -- confirm() first.
+//
+// The status span exists because a 0-row delete is a real, correct
+// success (nothing to clear) -- found live 2026-09-17: with no visible
+// feedback at all, that boring-but-correct success looked identical to
+// the button silently failing, since the table (already empty) doesn't
+// visibly change either way.
 document.getElementById('clear-symbol-switched-btn').addEventListener('click', async function () {
   if (!confirm('Permanently delete ALL symbol_switched closed-trade rows?')) return;
   const btn = this;
+  const statusEl = document.getElementById('clear-status');
   btn.disabled = true;
+  statusEl.textContent = '';
+  statusEl.className = 'muted';
   try {
-    await fetch('/api/journal/clear_symbol_switched', { method: 'POST' });
+    const r = await fetch('/api/journal/clear_symbol_switched', { method: 'POST' });
+    const body = await r.json();
+    statusEl.textContent = body.deleted > 0
+      ? 'cleared ' + body.deleted + ' row' + (body.deleted === 1 ? '' : 's')
+      : 'nothing to clear';
   } catch (err) {
-    // leave the table as-is; the next poll reflects actual state either way
+    statusEl.textContent = 'request failed';
+    statusEl.className = 'neg';
   } finally {
     btn.disabled = false;
   }

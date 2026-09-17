@@ -607,6 +607,29 @@ def test_root_page_collapses_resistance_and_support_behind_chips():
             "class='setup-chip' disabled>Support (nearest below)" in page
 
 
+def test_setup_and_level_chips_carry_a_data_key_for_expand_state_restore():
+    # refresh()'s JS restores which chips were expanded across a poll's
+    # full #symbols rebuild by matching this data-key -- without it a
+    # freshly-rebuilt chip always starts hidden and expanded state is
+    # silently lost every ~4s poll (found live 2026-09-17). Needs enough
+    # bars for real resistance/support levels to actually be detected
+    # (_bars(5) produces neither -- both render as the disabled,
+    # keyless chip variant, which isn't what this test is checking).
+    fetch = FakeFetch({"AEHL": [_bars(60)]})
+    with _client(fetch, symbol="AEHL") as c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        state = _sym_state(c, "AEHL")
+        assert state["levels"]["resistance"] is not None
+        assert state["levels"]["support"] is not None
+        assert len(state["setups"]) > 1
+
+        page = c.get("/").text
+        assert "data-key='AEHL:level:resistance'" in page
+        assert "data-key='AEHL:level:support'" in page
+        for setup in state["setups"][1:]:
+            assert f"data-key='AEHL:setup:{setup['setup_type']}'" in page
+
+
 # -- closed-trades table: symbol_switched rows visually muted ------------
 
 def _closed_row(symbol, exit_reason, pnl=1.0, trade_id=1):
@@ -643,3 +666,9 @@ def test_root_page_has_a_bulk_clear_symbol_switched_button():
     with _client(FakeFetch({"AEHL": [_bars(3)]})) as c:
         page = c.get("/").text
         assert "id=\"clear-symbol-switched-btn\"" in page
+        # A 0-row delete is a real, correct success (nothing to clear) --
+        # found live 2026-09-17: with no visible feedback at all, that
+        # boring-but-correct success looked identical to the button
+        # silently failing. This status span is what the click handler
+        # reports "cleared N rows" / "nothing to clear" into.
+        assert "id=\"clear-status\"" in page

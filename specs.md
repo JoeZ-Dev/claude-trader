@@ -702,14 +702,31 @@ principle, with no code living loose at repo root:
   distance) that expand in place on click to reveal that type's own
   factors — a local DOM toggle (`chip.nextElementSibling.hidden`), no
   fetch, delegated on `#symbols` the same way the remove control is.
-  Expanded state does NOT survive the next poll (the whole card's
-  `innerHTML` gets rebuilt every 4s, same as everything else on this
-  page) — an accepted tradeoff, not an oversight. One generic row
-  renderer (`_setup_hold_and_factor_rows_html` / `setupHoldAndFactorRows`
-  in the JS mirror) handles all four types' `factors` dicts rather than
-  four hand-written table layouts, since the "don't collapse into a
-  score" principle only requires each factor to stay visible, not a
-  bespoke layout per type.
+  Expanded state SURVIVES the next poll (fixed 2026-09-17 — originally
+  documented here as "an accepted tradeoff, not an oversight," which
+  turned out to be wrong in practice: found live, a real user watching
+  the page had an expanded section silently collapse on them every
+  ~4s, which reads as broken, not as an acceptable tradeoff). Every
+  `.setup-chip` (both the three other setup-type chips and the
+  resistance/support chips) carries a `data-key` — `{symbol}:setup:
+  {setup_type}` or `{symbol}:level:{resistance|support}` — unique
+  across a full `#symbols` rebuild. `refresh()` now records which
+  `data-key`s are currently expanded (their sibling `.setup-detail` not
+  `hidden`) BEFORE replacing `#symbols.innerHTML`, then re-applies
+  `hidden = false` to the matching fresh elements AFTER — values still
+  come from the live poll (correct, current data), only the open/
+  closed state is preserved across the rebuild, not the stale content.
+  Proved with a real headless-browser test (Playwright, installed
+  2026-09-17 specifically to close this verification gap — see below):
+  open a section, wait past a real ~4s poll interval, assert it's still
+  open; this is a materially different test than "does a click toggle
+  work" and is the one that would have caught the original bug before
+  it shipped. One generic row renderer
+  (`_setup_hold_and_factor_rows_html` / `setupHoldAndFactorRows` in the
+  JS mirror) handles all four types' `factors` dicts rather than four
+  hand-written table layouts, since the "don't collapse into a score"
+  principle only requires each factor to stay visible, not a bespoke
+  layout per type.
 
   **Resistance/support collapsed behind the same chip pattern (fixed
   2026-09-17).** The raw resistance/support tables used to render always-
@@ -913,6 +930,35 @@ everywhere else — see the momentum_monitor phase-2 eviction work):
 Both routes are pure HTTP-wiring around already-unit-tested SQLite
 methods (`test_journal_store.py`) — no new deletion logic invented at
 the app layer.
+
+**Bulk-clear had no visible feedback (found live, fixed 2026-09-17).**
+Reported as "the bulk clear button failed" — root-caused with a real
+headless-browser click (Playwright), not by guessing: the endpoint
+itself was and is correct (confirmed directly, both via `curl` and via
+Playwright's own network capture of the real click: `POST
+/api/journal/clear_symbol_switched` → `200 {"ok": true, "deleted": 0}`).
+The actual gap was that a 0-row delete — a real, correct outcome
+whenever there's simply nothing currently matching `symbol_switched`
+left to clear — produced NO visible change on the page at all, which
+reads identically to the button silently failing. Fixed by adding a
+`#clear-status` span next to the button that the click handler now
+populates with "cleared N row(s)" or "nothing to clear" from the
+response body, mirroring the existing add-symbol form's status-message
+pattern.
+
+**Headless browser (Playwright + Chromium) installed 2026-09-17, into
+this project's own `.venv`.** Every UI bug up to this point had to be
+verified by manual click-and-report, or by extracting the deployed
+page's actual JS and executing it against a hand-built DOM shim in
+Node — workable but never a test of the REAL rendered page, and unable
+to catch a bug like the toggle-state one above, which only manifests
+across a real poll cycle a script can't fake. `playwright install
+chromium` downloads and runs cleanly in this environment with no
+system-level dependencies needed (confirmed — no `sudo`/`apt` required,
+launches and renders correctly). This is a one-time environment fix,
+not a per-bug workaround: real interaction tests (click, wait through a
+real timer, assert on the resulting DOM) are now something this project
+can actually run, not just reason about.
 
 ### 7. Roadmap / phases
 
