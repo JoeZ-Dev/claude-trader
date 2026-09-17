@@ -495,6 +495,22 @@ each keeping a clear contract with the one above/below it:
 this was entirely about how ticks get DELIVERED to each symbol's
 aggregator, never about how they're aggregated once delivered.
 
+**Confirmed live (2026-09-17), after deploy:** exactly one `access_token`
+fetch and one connection attempt for all 4 watched symbols (not four,
+confirmed via logs), zero collision errors since. Deploy hit an unrelated
+recurrence of the `companion-auth` stale-token issue (a second restart of
+that separate service was needed; see its own incident note above) —
+once past that, two consecutive 60-second `tick_heartbeat` windows showed
+comparable, non-rotating, non-zero real tick counts on every symbol
+simultaneously:
+```
+window 1: WETO=4  AEMD=30  RETO=35  DAIC=36
+window 2: WETO=5  AEMD=25  RETO=35  DAIC=25
+```
+Directly contrast with the baseline that motivated this fix (reproduced
+above): one symbol getting the bulk of ticks while the other three got
+0, rotating minute to minute. That rotation is gone.
+
 **Price-history date-range quirk (platform-enforced, confirmed live):**
 `GET /marketdata/v1/pricehistory` (wrapped by schwab-py's
 `get_price_history`), when called with `periodType=day&period=1` and no
