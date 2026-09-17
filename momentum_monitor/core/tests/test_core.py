@@ -84,6 +84,33 @@ def test_detect_levels_finds_double_top_with_higher_strength_than_single_touch()
     assert top.strength_score > top.touch_count  # touches alone already exceed 1x weight, confirming they dominate the score
 
 
+def test_detect_levels_ignores_zero_volume_forward_filled_bars_as_touches():
+    # Real gap found live (QCLS): a resistance level showed touch_count=20
+    # with total_touch_volume exactly 0 -- real trades essentially never
+    # print zero shares, so that pattern specifically means synthetic
+    # forward-filled bars (aggregator.py's _fill_gap_until: a quiet 10s
+    # bucket emits a flat open==high==low==close==prior-close bar with
+    # volume=0.0) got counted as repeated swing-point touches, not that
+    # the level was genuinely tested 20 times.
+    bars = []
+    ts = 0
+    for p in [9.0, 9.4, 9.8, 10.0, 9.6, 9.2]:  # one genuine touch at 10.0
+        bars.append(bar(ts, p, p + 0.05, p - 0.05, p, 50_000)); ts += 10
+    for _ in range(20):  # long quiet stretch forward-filled flat at 9.2, real
+        bars.append(bar(ts, 9.2, 9.2, 9.2, 9.2, 0.0)); ts += 10  # aggregator would emit
+    for p in [9.0, 8.8, 8.6]:  # real bars afterward, for window padding
+        bars.append(bar(ts, p, p + 0.05, p - 0.05, p, 40_000)); ts += 10
+
+    levels = detect_levels(bars, swing_window=3, cluster_tolerance_pct=0.006)
+
+    # The genuine touch must still be found...
+    assert any(abs(l.price - 10.0) < 0.1 for l in levels)
+    # ...but no level may show touches with zero total volume behind them --
+    # a real touch always has some real volume; this combination is
+    # definitionally the synthetic-bar bug, not a legitimately quiet level.
+    assert not any(l.touch_count > 0 and l.total_touch_volume == 0 for l in levels)
+
+
 def test_evaluate_hold_single_bar_break_is_not_confirmed():
     # Matches the real AEHL read: price closes above 8.69 for exactly one
     # bar, then reverses hard. Should NOT be confirmed with required_bars=3.

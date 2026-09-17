@@ -48,6 +48,23 @@ Two non-negotiable principles:
   concentration, round-number proximity) rather than collapsing them into
   one opaque number. Any change to scoring must preserve this visibility.
 
+**Swing-point touches require real volume (found live, fixed):**
+`detect_levels`'s swing-high/swing-low detection (`levels.py`,
+`_swing_points`) excludes any bar with `volume == 0` from being the
+CENTER of a touch, even if its high/low ties the local window's extreme.
+Confirmed live against real QCLS data: a resistance level showed
+`touch_count=20` with `total_touch_volume` exactly `0` — real trades
+essentially never print zero shares, so that signature specifically means
+a long quiet stretch's synthetic, forward-filled bars
+(`schwab-connector/aggregator.py`'s `_fill_gap_until`: a quiet 10s bucket
+emits a flat `open==high==low==close==prior-close` bar with
+`volume=0.0`) were being counted as repeated real price tests, not that
+the level was genuinely tested 20 times. Do not remove the `volume == 0`
+guard as a "simplification" — it looks redundant on a casual read (the
+window comparison still works without it) and silently reintroduces this
+exact bug. Neighboring zero-volume bars still count toward a REAL bar's
+own window comparison; only candidacy as the touch itself is restricted.
+
 Covered by unit tests in `momentum_monitor/core/tests/` — see that
 directory for the current, authoritative test suite.
 

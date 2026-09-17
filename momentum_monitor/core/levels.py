@@ -32,9 +32,22 @@ class Level:
 
 
 def _swing_points(bars: list[dict], window: int, kind: str) -> list[int]:
-    """Indices of local swing highs (kind='high') or lows (kind='low')."""
+    """Indices of local swing highs (kind='high') or lows (kind='low').
+
+    A bar with volume == 0 is never eligible as the CENTER of a swing
+    point, even if its high/low ties the window's extreme. Real trades
+    essentially never print zero shares, so a run of identical zero-volume
+    bars is schwab-connector's own forward-fill for a quiet 10s bucket
+    (aggregator.py's _fill_gap_until: open==high==low==close==prior close,
+    volume=0.0), not repeated real price tests -- confirmed live (a
+    resistance level showing touch_count=20 with total_touch_volume
+    exactly 0). Neighboring zero-volume bars still count toward a REAL
+    bar's own window comparison (seg_vals below) -- only candidacy as the
+    touch itself is restricted, not the context used to judge one."""
     idxs = []
     for i in range(window, len(bars) - window):
+        if bars[i]["volume"] == 0:
+            continue
         seg = bars[i - window: i + window + 1]
         val = bars[i]["high"] if kind == "high" else bars[i]["low"]
         seg_vals = [b["high"] if kind == "high" else b["low"] for b in seg]
