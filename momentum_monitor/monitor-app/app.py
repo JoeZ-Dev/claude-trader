@@ -31,9 +31,15 @@ math N times, not different math) after every poll. Serves:
                         whatever was watched. JSON response now, not a
                         redirect: {"ok": bool, "reason": str, "symbols":
                         [...]}, 200 on success / 409 on rejection (already
-                        watching it, invalid symbol, or the set is full --
-                        never a silent failure or a silent replacement of
-                        an existing slot).
+                        watching it, or an invalid symbol -- never a
+                        silent failure). Adding while already at
+                        max_symbols is NOT a rejection: it evicts the
+                        oldest-added symbol (FIFO, via remove_symbol --
+                        same force-close-journal/announce_unwatch
+                        treatment as an explicit unwatch) to make room,
+                        200 with "reason" carrying a human-readable note
+                        of what got dropped -- never a SILENT eviction,
+                        just not a REJECTED add.
   POST /api/unwatch  -> {"symbol": "..."} removes one specific symbol,
                         force-closing any open virtual-journal position
                         for it (see Poller.remove_symbol).
@@ -232,20 +238,31 @@ class Poller:
             await asyncio.sleep(self._interval)
 
     async def add_symbol(self, symbol: str) -> tuple[bool, str]:
-        """Add a symbol to the watched set, up to max_symbols. Returns
-        (True, "") on success, or (False, reason) on rejection -- an
-        invalid symbol, one already watched, or the set already being full
-        each get their own clear reason back. Never a silent failure and
-        never a silent replacement of an existing slot (phase 1's
-        switch_symbol did that on purpose; phase 2 explicitly does not)."""
+        """Add a symbol to the watched set. Returns (True, note) on
+        success -- `note` is "" normally, or a human-readable line saying
+        what got evicted when the set was already full. Returns (False,
+        reason) on rejection -- an invalid symbol or one already watched,
+        each with its own clear reason. Never a silent failure (phase 1's
+        switch_symbol silently replaced whatever was watched; phase 2
+        never does that for an UNRELATED slot).
+
+        Adding at capacity does NOT reject anymore: it evicts the
+        oldest-added symbol (FIFO -- self._slots is insertion-ordered,
+        same fact `symbols` relies on) via remove_symbol(), so the evicted
+        symbol gets the exact same treatment as an explicit unwatch (its
+        open journal position force-closed, schwab-connector told to stop
+        streaming it) rather than a silent leak."""
         symbol = symbol.strip().upper()
         if not symbol or not _VALID_SYMBOL.match(symbol):
             return False, f"{symbol!r} is not a valid ticker symbol"
         if symbol in self._slots:
             return False, f"{symbol} is already being watched"
+
+        note = ""
         if len(self._slots) >= self._max_symbols:
-            return False, (f"already watching {self._max_symbols} symbols "
-                           f"(the maximum) -- remove one first")
+            oldest = next(iter(self._slots))
+            await self.remove_symbol(oldest)
+            note = f"dropped {oldest} (oldest) to make room for {symbol}"
 
         self._slots[symbol] = _SymbolSlot(symbol=symbol, state=build_state([], symbol))
         if self._journal_store is not None:
@@ -259,7 +276,7 @@ class Poller:
             self._slots[symbol].journal_was_confirmed = resumed is not None
         if self._announce_watch is not None:
             await self._announce_watch_with_retry(symbol)
-        return True, ""
+        return True, note
 
     async def remove_symbol(self, symbol: str) -> bool:
         """Stop watching a symbol. Force-closes any open virtual-journal
@@ -686,8 +703,12 @@ async function refresh() {
 
 // Add-symbol form: POSTs /api/watch, which ADDS to the watched set (fills
 // the next empty slot) rather than replacing whatever's already watched --
-// a rejected 5th add (or a duplicate, or an invalid ticker) shows the
-// server's own reason text right in the form, not a silent failure.
+// a rejected add (a duplicate, or an invalid ticker) shows the server's
+// own reason text right in the form, not a silent failure. Adding while
+// already at max_symbols is NOT a rejection -- the server evicts the
+// oldest-added symbol to make room and reports that in "reason" even
+// though "ok" is true, so that path is shown too (muted, not the "neg"
+// error styling a real rejection gets).
 document.getElementById('watch-form').addEventListener('submit', async function (e) {
   e.preventDefault();
   const input = document.getElementById('watch-input');
@@ -711,6 +732,8 @@ document.getElementById('watch-form').addEventListener('submit', async function 
   }
   if (body.ok) {
     input.value = '';
+    statusEl.textContent = body.reason || '';
+    statusEl.className = 'muted';
   } else {
     statusEl.textContent = body.reason;
     statusEl.className = 'neg';

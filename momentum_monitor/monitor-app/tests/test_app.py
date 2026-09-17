@@ -218,22 +218,68 @@ def test_post_watch_rejects_blank_symbol():
         assert r.json()["ok"] is False
 
 
-def test_post_watch_rejects_a_5th_symbol_with_clear_reason_not_silent_failure():
+def test_post_watch_at_capacity_evicts_the_oldest_symbol_not_a_rejection():
+    unwatched = []
+
+    async def unwatch(sym):
+        unwatched.append(sym)
+
     fetch = FakeFetch({s: [_bars(2, base=float(i))] for i, s in
                        enumerate(["AEHL", "S2", "S3", "S4", "S5"])})
-    with _client(fetch, symbol="AEHL") as c:
+    with _client(fetch, symbol="AEHL", unwatch=unwatch) as c:
         for sym in ("S2", "S3", "S4"):
             assert c.post("/api/watch", data={"symbol": sym}).json()["ok"] is True
         assert set(c.get("/api/state").json()["symbols"]) == {"AEHL", "S2", "S3", "S4"}
 
+        # AEHL was added first, so it's the one that gets dropped to make
+        # room for S5 -- a 200, not a 409, with the eviction reported back
+        # in "reason" rather than silently.
         r = c.post("/api/watch", data={"symbol": "S5"})
-        assert r.status_code == 409
+        assert r.status_code == 200
         body = r.json()
-        assert body["ok"] is False
-        assert "4" in body["reason"] or "maximum" in body["reason"].lower()
-        # the 4 existing slots must be completely unchanged -- no silent replacement
-        assert set(body["symbols"]) == {"AEHL", "S2", "S3", "S4"}
-        assert "S5" not in body["symbols"]
+        assert body["ok"] is True
+        assert "AEHL" in body["reason"]
+        assert set(body["symbols"]) == {"S2", "S3", "S4", "S5"}
+        assert _wait_until(lambda: unwatched == ["AEHL"])
+        assert "AEHL" not in c.get("/api/state").json()["symbols"]
+
+
+def test_post_watch_eviction_force_closes_the_evicted_symbols_open_position():
+    class FakeJournalStore:
+        def __init__(self):
+            self.closed = []
+
+        def open_position_for(self, symbol):
+            return None
+
+        def close_position(self, position, exit_event):
+            self.closed.append((position.symbol, exit_event.exit_reason))
+
+        def recent_closed(self, limit=10):
+            return []
+
+    from journal_logic import OpenPosition
+
+    fetch = FakeFetch({s: [_bars(2, base=float(i))] for i, s in
+                       enumerate(["AEHL", "S2", "S3", "S4", "S5"])})
+    store = FakeJournalStore()
+    with _client(fetch, symbol="AEHL", journal_store=store) as c:
+        for sym in ("S2", "S3", "S4"):
+            assert c.post("/api/watch", data={"symbol": sym}).json()["ok"] is True
+        assert _wait_until(lambda: "AEHL" in c.get("/api/state").json()["symbols"])
+
+        # Simulate AEHL having an open virtual position at eviction time --
+        # eviction must force-close it exactly like an explicit unwatch does.
+        app_obj = c.app
+        poller = app_obj.state.poller
+        poller._slots["AEHL"].journal_position = OpenPosition(
+            id=1, symbol="AEHL", entry_ts=0, entry_price=10.0,
+            high_water_mark=10.0, stop_level=9.0,
+        )
+
+        r = c.post("/api/watch", data={"symbol": "S5"})
+        assert r.json()["ok"] is True
+        assert store.closed == [("AEHL", "symbol_switched")]
 
 
 def test_post_unwatch_removes_a_symbol():
@@ -261,17 +307,19 @@ def test_post_unwatch_unknown_symbol_is_a_noop_not_an_error():
         assert r.json()["removed"] is False
 
 
-def test_removing_a_symbol_frees_a_slot_for_a_new_add():
+def test_removing_a_symbol_frees_a_slot_without_triggering_eviction():
     fetch = FakeFetch({s: [_bars(2, base=float(i))] for i, s in
                        enumerate(["AEHL", "S2", "S3", "S4", "S5"])})
     with _client(fetch, symbol="AEHL") as c:
         for sym in ("S2", "S3", "S4"):
             c.post("/api/watch", data={"symbol": sym})
-        assert c.post("/api/watch", data={"symbol": "S5"}).json()["ok"] is False
 
+        # S2 (not the oldest) is explicitly unwatched first, freeing a slot
+        # -- the next add should just fill it, not evict anything else.
         c.post("/api/unwatch", data={"symbol": "S2"})
         r = c.post("/api/watch", data={"symbol": "S5"})
         assert r.json()["ok"] is True
+        assert r.json()["reason"] == ""  # a free slot was already there, no eviction
         assert set(r.json()["symbols"]) == {"AEHL", "S3", "S4", "S5"}
 
 

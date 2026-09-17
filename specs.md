@@ -351,10 +351,22 @@ principle, with no code living loose at repo root:
   replace whatever else is watched (that was the phase-1 ticker box's
   behavior; phase 2 deliberately changes it, since concurrent multi-symbol
   is now the actual point). Rejections are explicit JSON, never a silent
-  failure or a silent slot replacement: an invalid ticker, a duplicate
-  already being watched, or the set already at 4 (`"already watching 4
-  symbols (the maximum) -- remove one first"`) each get their own reason,
-  HTTP 409. `POST /api/unwatch {"symbol": "..."}` removes one specific
+  failure or a silent slot replacement of an UNRELATED symbol: an invalid
+  ticker or a duplicate already being watched each get their own reason,
+  HTTP 409. Adding a 5th symbol while already at the 4-symbol maximum is
+  **not** one of these rejections (changed 2026-09-17, at the user's
+  request — the original build session had this as a 409 instead, see
+  the git history around `test_post_watch_at_capacity_evicts_the_oldest_
+  symbol_not_a_rejection` for the before/after): it evicts the
+  oldest-added symbol (FIFO — `_slots` is insertion-ordered, the same
+  fact `Poller.symbols` relies on) via the exact same code path as an
+  explicit `/api/unwatch` (`remove_symbol`), so the evicted symbol's open
+  virtual-journal position is force-closed and schwab-connector is told
+  to stop streaming it — no orphaned position, no leaked stream. This is
+  HTTP 200, `"ok": true`, with `"reason"` carrying a human-readable note
+  of what got dropped (e.g. `"dropped AEHL (oldest) to make room for
+  S5"`) — not silent, just not rejected. `POST /api/unwatch {"symbol":
+  "..."}` removes one specific
   symbol, force-closing its own open virtual-journal position (see section
   6) without touching any other slot. A poll already in flight for a
   symbol that gets removed (and possibly re-added) mid-fetch has its
@@ -416,10 +428,11 @@ principle, with no code living loose at repo root:
   button scoped to that panel's own symbol (`data-symbol`, wired via
   event delegation on `#symbols` so it survives the container's innerHTML
   being replaced every poll). An add-symbol form (text input + "Add")
-  above the grid POSTs `/api/watch` and shows the server's own rejection
-  reason inline on a 409 (a full 5th symbol, a duplicate, an invalid
-  ticker) rather than failing silently; a live `N / 4 symbols watched`
-  counter sits next to it.
+  above the grid POSTs `/api/watch` and shows the server's own response
+  reason inline — as an error on a 409 (a duplicate, an invalid ticker)
+  or as a muted note on a 200 that evicted the oldest symbol to make
+  room — rather than failing or evicting silently; a live `N / 4 symbols
+  watched` counter sits next to it.
 
   **Pause/resume polling — two layers, not one.** A "Pause updates"
   button next to the ticker box stops polling entirely, but "polling"
