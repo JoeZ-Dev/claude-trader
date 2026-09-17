@@ -10,20 +10,33 @@ token. So tick production sits behind a small seam with two implementations:
                          through the same interface. Used by tests and by
                          `docker-compose up` in STREAM_SOURCE=replay mode.
 
-Both yield the internal tick shape (never leaves this container):
+Both yield (symbol, tick) pairs -- neither is scoped to a single symbol.
+ONE shared connection now serves every currently-watched symbol (fixed
+2026-09-17: the earlier one-connection-per-symbol design hit Schwab-side
+throttling under real concurrent load -- see specs.md). Both sources
+expose the SAME shape Connector (app.py) consumes directly:
+
+    connected: bool
+    async def ticks(self) -> AsyncIterator[tuple[str, dict]]
+
+Internal tick shape (produced by whichever StreamSource is active, never
+leaves this container):
 
     {"ts": float, "price": float, "size": float}
 
 `message_to_ticks` is the pure Schwab-payload -> ticks mapping, kept
 separate so it can be unit-tested against captured payloads without a live
-stream (per AGENT_PROTOCOL.md: no test touches a live external service).
+stream (per AGENT_PROTOCOL.md: no test touches a live external service). It
+was ALREADY multi-symbol-shaped before this fix (returns one (symbol, tick)
+pair per content entry) -- the single-symbol restriction used to live
+entirely in SchwabStreamSource's own message filter, not here.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable
 
 # Schwab LEVELONE_EQUITIES: field 3 = last price, 9 = last size, 8 = total
 # volume. schwab-py emits either the numeric keys or these names depending on
@@ -62,7 +75,18 @@ def message_to_ticks(msg: dict) -> list[tuple[str, dict]]:
 
 
 class ReplayStreamSource:
-    """Replays a JSONL fixture of ticks or bars.
+    """Replays a JSONL fixture of ticks or bars, broadcasting each replayed
+    tick to every symbol in `watched_symbols()` at the start of playback.
+
+    A single fixture file can't represent several independently-moving real
+    symbols, so this is deliberately a broadcast, not a per-symbol
+    simulation -- good enough for a test/offline aid (not the production
+    path), and it preserves the "watch N symbols, each gets its own
+    independent BarAggregator fed from the same underlying tick sequence"
+    capability the old one-ReplayStreamSource-per-symbol design had.
+    `watched_symbols` is read ONCE at the start of `ticks()` (not on every
+    tick) -- replay runs are short, deterministic test fixtures, not
+    long-lived streams where the watched set changes mid-flight.
 
     Each line is either an internal tick ({"ts","price","size"}) or a bar
     (has "open"/"close"). A bar is exploded into four ticks at +0/+1/+2/+3s
@@ -71,8 +95,10 @@ class ReplayStreamSource:
     output back through BarAggregator reconstructs the identical bar.
     """
 
-    def __init__(self, path, pace: bool = False, speed: float = 60.0) -> None:
+    def __init__(self, path, watched_symbols: Callable[[], set[str]],
+                 pace: bool = False, speed: float = 60.0) -> None:
         self._path = Path(path)
+        self._watched_symbols = watched_symbols
         self._pace = pace
         self._speed = speed
         self._connected = False
@@ -81,8 +107,9 @@ class ReplayStreamSource:
     def connected(self) -> bool:
         return self._connected
 
-    async def ticks(self, symbol: str) -> AsyncIterator[dict]:
+    async def ticks(self) -> AsyncIterator[tuple[str, dict]]:
         self._connected = True
+        symbols = sorted(self._watched_symbols())
         prev_ts: float | None = None
         for row in self._read_rows():
             for tick in self._row_to_ticks(row):
@@ -91,7 +118,8 @@ class ReplayStreamSource:
                     if delay > 0:
                         await asyncio.sleep(delay)
                 prev_ts = tick["ts"]
-                yield tick
+                for symbol in symbols:
+                    yield symbol, tick
 
     def _read_rows(self):
         text = self._path.read_text()
@@ -113,30 +141,31 @@ class ReplayStreamSource:
 
 
 class SchwabStreamSource:
-    """Wraps schwab-py's StreamClient. Not exercised by the test suite (it
-    needs a live token and network); the payload mapping it relies on is
-    covered via message_to_ticks."""
+    """Wraps schwab-py's StreamClient with ONE shared login serving every
+    currently-watched symbol. Not exercised by the test suite (needs a
+    live token and network); the payload mapping it relies on is covered
+    via message_to_ticks."""
 
     def __init__(self, client) -> None:
         self._client = client
         self._stream = None
         self._queue: asyncio.Queue = asyncio.Queue()
         self._connected = False
-        self._symbol: str | None = None
 
     @property
     def connected(self) -> bool:
         return self._connected
 
-    async def ticks(self, symbol: str) -> AsyncIterator[dict]:
+    async def ticks(self, symbols) -> AsyncIterator[tuple[str, dict]]:
         from schwab.streaming import StreamClient
 
-        self._symbol = symbol.upper()
         self._stream = StreamClient(self._client)
         await self._stream.login()
         self._connected = True
         self._stream.add_level_one_equity_handler(self._on_message)
-        await self._stream.level_one_equity_subs([self._symbol])
+        upper_symbols = [s.upper() for s in symbols]
+        if upper_symbols:
+            await self._stream.level_one_equity_subs(upper_symbols)
 
         async def _pump():
             while True:
@@ -150,7 +179,18 @@ class SchwabStreamSource:
             pump_task.cancel()
             self._connected = False
 
+    async def add_symbols(self, symbols) -> None:
+        """Subscribe more symbols on this SAME live connection -- no new
+        login, no disturbing symbols already subscribed."""
+        upper_symbols = [s.upper() for s in symbols]
+        if self._stream is not None and upper_symbols:
+            await self._stream.level_one_equity_add(upper_symbols)
+
+    async def remove_symbols(self, symbols) -> None:
+        upper_symbols = [s.upper() for s in symbols]
+        if self._stream is not None and upper_symbols:
+            await self._stream.level_one_equity_unsubs(upper_symbols)
+
     def _on_message(self, msg: dict) -> None:
         for sym, tick in message_to_ticks(msg):
-            if sym.upper() == self._symbol:
-                self._queue.put_nowait(tick)
+            self._queue.put_nowait((sym.upper(), tick))

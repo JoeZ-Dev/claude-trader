@@ -25,6 +25,14 @@ def write_jsonl(path, rows):
     path.write_text("".join(json.dumps(r) + "\n" for r in rows))
 
 
+def _replay(path, symbols, **kw):
+    """ReplayStreamSource now takes a watched_symbols GETTER (matching
+    ReconnectingStreamSource's shape, see reconnect.py) rather than a
+    fixed symbol -- broadcasts each replayed tick to every symbol
+    currently in that set. Tests pass a fixed set via a trivial lambda."""
+    return ReplayStreamSource(path, watched_symbols=lambda: set(symbols), **kw)
+
+
 def test_replay_from_tick_fixture_yields_in_order(tmp_path):
     fx = tmp_path / "ticks.jsonl"
     rows = [
@@ -33,10 +41,25 @@ def test_replay_from_tick_fixture_yields_in_order(tmp_path):
         {"ts": 1002.5, "price": 9.9, "size": 25},
     ]
     write_jsonl(fx, rows)
-    got = drain(ReplayStreamSource(fx).ticks("AEHL"))
-    assert [(t["ts"], t["price"], t["size"]) for t in got] == [
-        (1000.0, 10.0, 100), (1001.0, 10.2, 50), (1002.5, 9.9, 25),
+    got = drain(_replay(fx, ["AEHL"]).ticks())
+    assert [(sym, t["ts"], t["price"], t["size"]) for sym, t in got] == [
+        ("AEHL", 1000.0, 10.0, 100), ("AEHL", 1001.0, 10.2, 50),
+        ("AEHL", 1002.5, 9.9, 25),
     ]
+
+
+def test_replay_broadcasts_the_same_ticks_to_every_watched_symbol(tmp_path):
+    # A single fixture file can't represent N independently-moving real
+    # symbols, so for test purposes each replayed tick is broadcast to
+    # every symbol currently in the watched set -- this preserves the
+    # "watch two symbols, each gets its own independent BarAggregator
+    # fed from the same underlying tick sequence" test capability the
+    # old one-ReplayStreamSource-per-symbol design had.
+    fx = tmp_path / "ticks.jsonl"
+    write_jsonl(fx, [{"ts": 1000.0, "price": 10.0, "size": 100}])
+    got = drain(_replay(fx, ["AEHL", "SPY"]).ticks())
+    assert {sym for sym, _ in got} == {"AEHL", "SPY"}
+    assert len(got) == 2
 
 
 def test_replay_from_bar_fixture_reconstructs_bars_through_aggregator(tmp_path):
@@ -50,7 +73,7 @@ def test_replay_from_bar_fixture_reconstructs_bars_through_aggregator(tmp_path):
     write_jsonl(fx, bars)
 
     agg = BarAggregator()
-    for tick in drain(ReplayStreamSource(fx).ticks("AEHL")):
+    for _sym, tick in drain(_replay(fx, ["AEHL"]).ticks()):
         agg.feed(tick)
     agg.flush(1020)  # just past the last real bucket: finalize, no gap-fill
     out = agg.drain()
@@ -66,7 +89,8 @@ def test_replay_bar_explosion_stays_within_one_bucket(tmp_path):
     fx = tmp_path / "one.jsonl"
     write_jsonl(fx, [{"ts": 2000, "open": 5.0, "high": 6.0, "low": 4.0,
                       "close": 5.5, "volume": 999.0, "is_extended": True}])
-    ticks = drain(ReplayStreamSource(fx).ticks("X"))
+    got = drain(_replay(fx, ["X"]).ticks())
+    ticks = [t for _sym, t in got]
     assert all(2000 <= t["ts"] < 2010 for t in ticks)
     assert sum(t["size"] for t in ticks) == 999.0
 
@@ -112,7 +136,7 @@ def test_message_to_ticks_skips_entries_without_price():
 def test_replay_source_reports_connected_after_start(tmp_path):
     fx = tmp_path / "t.jsonl"
     write_jsonl(fx, [{"ts": 1.0, "price": 1.0, "size": 1}])
-    src = ReplayStreamSource(fx)
+    src = _replay(fx, ["X"])
     assert src.connected is False
-    drain(src.ticks("X"))
+    drain(src.ticks())
     assert src.connected is True
