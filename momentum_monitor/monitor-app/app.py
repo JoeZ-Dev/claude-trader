@@ -1,29 +1,78 @@
 """
-monitor-app FastAPI web app.
+monitor-app FastAPI web app -- phase 2: up to MAX_SYMBOLS (4) concurrently
+watched symbols, each independently polled, analyzed, and journaled.
 
 Holds no credentials. A background poller pulls new bars from
-schwab-connector, keeps the running bar list, and recomputes the full
-state (state.build_state) after every poll. Serves:
+schwab-connector for every currently-watched symbol, keeps each symbol's
+own running bar list, and recomputes that symbol's full state
+(state.build_state, UNCHANGED -- phase 2 runs the exact same per-symbol
+math N times, not different math) after every poll. Serves:
 
-  GET  /api/state  -> the state dict (JSON), verbatim
-  GET  /           -> a plain auto-refreshing HTML view of the same data,
-                      with a ticker text box for switching symbols
-  POST /api/watch  -> {symbol: "..."} (urlencoded form) switches which
-                      symbol the poller watches, without a restart -- see
-                      Poller.switch_symbol, which also unwatches whatever
-                      symbol was previously watched (via announce_unwatch)
-                      so switching doesn't accumulate watched symbols on
-                      schwab-connector indefinitely, and force-closes any
-                      open virtual-journal position for the symbol being
-                      left (see journal_logic.py / journal_store.py).
-                      Redirects back to / (303).
+  GET  /api/state    -> {"symbols": {SYM: {...same shape as phase 1's
+                        whole response, plus a per-symbol "journal.open"},
+                        ...}, "recent_closed": [...], "poll_enabled": bool,
+                        "max_symbols": int}
+                        Deliberate breaking change from phase 1's single-
+                        object shape -- nothing else depends on the old
+                        form, no back-compat shim.
+  GET  /             -> phase 2 Stage A interim view: a plain, unstyled-
+                        beyond-existing-cards list of whatever's currently
+                        watched, JS-refreshed the same way as before (no
+                        meta-refresh). NOT the Stage B multi-panel grid --
+                        that's explicitly a separate, later piece of work;
+                        this is just enough to not leave the page broken
+                        while Stage A's backend is being proven live.
+                        Adding/removing symbols during Stage A is via the
+                        API directly (curl), not this page.
+  POST /api/watch    -> {"symbol": "..."} (urlencoded form) ADDS a symbol
+                        to the watched set (up to max_symbols) -- this is
+                        a deliberate behavior change from phase 1, where
+                        the same endpoint SWITCHED to a symbol, replacing
+                        whatever was watched. JSON response now, not a
+                        redirect: {"ok": bool, "reason": str, "symbols":
+                        [...]}, 200 on success / 409 on rejection (already
+                        watching it, invalid symbol, or the set is full --
+                        never a silent failure or a silent replacement of
+                        an existing slot).
+  POST /api/unwatch  -> {"symbol": "..."} removes one specific symbol,
+                        force-closing any open virtual-journal position
+                        for it (see Poller.remove_symbol).
+  POST /api/polling  -> {"enabled": bool} pauses/resumes monitor-app's own
+                        background poll loop for ALL watched symbols at
+                        once (one global switch, not per-symbol) -- see
+                        Poller.set_poll_enabled.
 
 create_app() takes fetch_bars / announce_watch / announce_unwatch as
 callables so tests inject fakes; main.py binds them to httpx calls against
 schwab-connector. journal_store (optional -- a journal_store.JournalStore)
 wires in the phase-4 virtual trade journal (specs.md section 6); passing
-None disables it entirely (no entry/exit tracking, no journal section on
-the page).
+None disables it entirely. journal_logic.py and journal_store.py needed NO
+changes for phase 2 -- audited specifically for any single-global-position
+assumption (per the multi-symbol design doc) and found none: journal_store
+already scopes every open-position lookup by symbol (`open_position_for`)
+or by the specific row id (`update_trailing`/`close_position`), never "the
+one open position"; `recent_closed` is intentionally cross-symbol, per
+specs.md, and stays that way. The single-position assumption that DID
+exist lived in this module's own Poller (scalar `self._journal_position`
+etc.), which phase 2 replaces with a `_SymbolSlot` per symbol below.
+
+schwab-connector needed ZERO structural changes either, confirmed by
+reading it (not assumed): Connector._sources/_tasks are already dicts
+keyed by symbol, watch()/unwatch() already operate per-key with no cap,
+and BarStore's cache is already keyed by symbol. The earlier watch/unwatch
+leak (fixed pre-phase-2) was only possible BECAUSE schwab-connector was
+already happily running multiple concurrent per-symbol streams with no
+artificial limit -- that capability existing is exactly why this phase
+needs no schwab-connector changes, per specs.md's own roadmap note. One
+architectural fact worth knowing, not a defect: each watched symbol gets
+its own independent Schwab streaming connection and its own independent
+~30-minute proactive token-refresh cycle (main.py's _source_factory builds
+a fresh ReconnectingStreamSource, with its own AccessTokenSource, per
+symbol) rather than one connection multiplexing many symbols -- 4
+concurrent symbols means 4 independent WebSocket sessions and 4
+independent refresh cycles. This needs to be watched under real load, not
+assumed to be fine because it's not a "single-symbol assumption" bug (see
+the phase 2 live-proof evidence for whether it actually holds up).
 """
 from __future__ import annotations
 
@@ -33,17 +82,19 @@ import logging
 import re
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
-from journal_logic import ExitEvent, advance_journal
+from journal_logic import ExitEvent, OpenPosition, advance_journal
 from state import build_state
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_TRAIL_PCT = 0.05
+MAX_SYMBOLS = 4
 
 # Real ticker symbols are short and plain (letters/digits, occasionally a
 # dot or hyphen for share classes). Rejecting anything else keeps a typo
@@ -63,13 +114,32 @@ ANNOUNCE_RETRY_BASE_DELAY_SECONDS = 1.0
 ANNOUNCE_RETRY_MAX_DELAY_SECONDS = 8.0
 
 
+@dataclass
+class _SymbolSlot:
+    """Everything the Poller tracks for ONE watched symbol. Phase 1 had
+    these as scalar fields directly on Poller (self._bars, self._symbol,
+    self._journal_position, ...) -- phase 2 needs up to MAX_SYMBOLS of
+    these independently and simultaneously, so they move into their own
+    per-symbol object. `journal_position`/`journal_was_confirmed` being
+    per-slot (not per-Poller) is exactly what makes "at most one open
+    position PER symbol" (rather than one globally) correct."""
+    symbol: str
+    bars: list[dict] = field(default_factory=list)
+    last_ts: float = 0.0
+    state: dict = field(default_factory=dict)
+    poll_ok: bool = False
+    journal_position: OpenPosition | None = None
+    journal_was_confirmed: bool = False
+
+
 class Poller:
-    def __init__(self, *, fetch_bars, watch_symbol, poll_interval, announce_watch,
+    def __init__(self, *, fetch_bars, watch_symbol=None, poll_interval, announce_watch,
                  announce_unwatch=None,
                  announce_retry_attempts=ANNOUNCE_RETRY_ATTEMPTS,
                  announce_retry_base_delay=ANNOUNCE_RETRY_BASE_DELAY_SECONDS,
                  announce_retry_max_delay=ANNOUNCE_RETRY_MAX_DELAY_SECONDS,
-                 journal_store=None, trail_pct=DEFAULT_TRAIL_PCT, now_fn=time.time):
+                 journal_store=None, trail_pct=DEFAULT_TRAIL_PCT, now_fn=time.time,
+                 max_symbols=MAX_SYMBOLS):
         self._fetch_bars = fetch_bars
         self._initial_symbol = watch_symbol.upper() if watch_symbol else None
         self._interval = poll_interval
@@ -81,148 +151,164 @@ class Poller:
         self._journal_store = journal_store
         self._trail_pct = trail_pct
         self._now_fn = now_fn
-        self._symbol: str | None = None
-        self._bars: list[dict] = []
-        self._last_ts: float = 0.0
-        self._state: dict = build_state([], None)
-        self._poll_ok = False
-        self._journal_position = None   # journal_logic.OpenPosition | None
-        self._journal_was_confirmed = False
+        self._max_symbols = max_symbols
+        self._slots: dict[str, _SymbolSlot] = {}
         self._poll_enabled = True
 
     @property
-    def state(self) -> dict:
-        return self._state
+    def symbols(self) -> list[str]:
+        """Currently-watched symbols, in the order they were added."""
+        return list(self._slots.keys())
+
+    @property
+    def max_symbols(self) -> int:
+        return self._max_symbols
 
     @property
     def poll_enabled(self) -> bool:
         return self._poll_enabled
 
     def set_poll_enabled(self, enabled: bool) -> None:
-        """Pause/resume the background poll loop itself (not just what the
-        browser displays) -- schwab-connector's live stream and stored bars
-        are unaffected either way, this only stops monitor-app from pulling
-        new ones in while nobody's watching. Distinct from (and the thing
-        that actually matters, unlike) the client-side setInterval the page
-        also has -- that only stops browser<->monitor-app traffic, which
-        never left localhost/the LAN in the first place."""
+        """Pause/resume the background poll loop for ALL watched symbols
+        at once (one global switch, not per-symbol) -- schwab-connector's
+        live stream(s) and stored bars are unaffected either way, this
+        only stops monitor-app from pulling new ones in while nobody's
+        watching. Distinct from (and the thing that actually matters,
+        unlike) the client-side setInterval the page also has -- that only
+        stops browser<->monitor-app traffic, which never left localhost/
+        the LAN in the first place."""
         self._poll_enabled = enabled
 
-    def journal_snapshot(self) -> dict:
-        """Everything the page/API need to show the journal: the open
-        position (if any), with a live unrealized P&L computed against the
-        current last price, plus recent closed trades (all symbols, most
-        recent first -- specs.md: "for end-of-day review", not scoped to
-        just the currently-watched symbol)."""
+    def state_for(self, symbol: str) -> dict | None:
+        slot = self._slots.get(symbol.upper())
+        return slot.state if slot else None
+
+    def full_state_for(self, symbol: str) -> dict | None:
+        """state.build_state's output for `symbol`, plus that symbol's OWN
+        journal open-position block. Does NOT include recent_closed, which
+        is intentionally cross-symbol -- see recent_closed()."""
+        slot = self._slots.get(symbol.upper())
+        if slot is None:
+            return None
+        payload = dict(slot.state)
+        payload["journal"] = {"open": self._journal_open_for(slot)}
+        return payload
+
+    def all_full_states(self) -> dict[str, dict]:
+        return {sym: self.full_state_for(sym) for sym in self._slots}
+
+    def recent_closed(self, limit: int = 10) -> list[dict]:
+        """Closed trades across ALL symbols, most recent first -- specs.md:
+        "for end-of-day review", never scoped to just one symbol, even now
+        that there can be up to `max_symbols` watched at once. Unaudited-
+        assumption risk was here in a DIFFERENT sense than usual: the risk
+        wasn't that this accidentally scopes to one symbol, it's confirming
+        it was ALREADY correctly cross-symbol and should stay that way."""
         if self._journal_store is None:
-            return {"open": None, "recent_closed": []}
-        open_block = None
-        if self._journal_position is not None:
-            last_price = (self._bars[-1]["close"] if self._bars
-                         else self._journal_position.entry_price)
-            unrealized_pct = ((last_price - self._journal_position.entry_price)
-                              / self._journal_position.entry_price * 100.0)
-            open_block = {
-                "symbol": self._journal_position.symbol,
-                "entry_price": round(self._journal_position.entry_price, 4),
-                "stop_level": round(self._journal_position.stop_level, 4),
-                "unrealized_pnl_pct": round(unrealized_pct, 4),
-            }
+            return []
+        return self._journal_store.recent_closed(limit=limit)
+
+    def _journal_open_for(self, slot: _SymbolSlot) -> dict | None:
+        if slot.journal_position is None:
+            return None
+        last_price = (slot.bars[-1]["close"] if slot.bars
+                     else slot.journal_position.entry_price)
+        unrealized_pct = ((last_price - slot.journal_position.entry_price)
+                          / slot.journal_position.entry_price * 100.0)
         return {
-            "open": open_block,
-            "recent_closed": self._journal_store.recent_closed(limit=10),
+            "symbol": slot.journal_position.symbol,
+            "entry_price": round(slot.journal_position.entry_price, 4),
+            "stop_level": round(slot.journal_position.stop_level, 4),
+            "unrealized_pnl_pct": round(unrealized_pct, 4),
         }
 
     async def run(self) -> None:
         if self._initial_symbol is not None:
-            await self.switch_symbol(self._initial_symbol)
+            await self.add_symbol(self._initial_symbol)
         while True:
-            if self._symbol is not None and self._poll_enabled:
-                await self._poll_once()
+            if self._poll_enabled:
+                for symbol in list(self._slots.keys()):
+                    await self._poll_once(symbol)
             await asyncio.sleep(self._interval)
 
-    async def switch_symbol(self, new_symbol: str) -> bool:
-        """Start watching a different symbol, replacing whatever this poller
-        was previously watching -- the runtime equivalent of what WATCH_SYMBOL
-        used to require a container restart for. Resets the accumulated bar
-        history and re-announces the watch to schwab-connector (which itself
-        backfills the new symbol's session -- see price_history.py -- so
-        switching gets the same correct-from-market-open behavior a fresh
-        watch always has, not a second-class cold start). Also unwatches
-        whatever symbol was previously being watched, restoring the
-        one-symbol-at-a-time invariant -- without this, schwab-connector
-        accumulates every symbol ever typed into the ticker box forever
-        (confirmed live: 6 simultaneously-watched symbols from normal use
-        of this box before this was fixed).
+    async def add_symbol(self, symbol: str) -> tuple[bool, str]:
+        """Add a symbol to the watched set, up to max_symbols. Returns
+        (True, "") on success, or (False, reason) on rejection -- an
+        invalid symbol, one already watched, or the set already being full
+        each get their own clear reason back. Never a silent failure and
+        never a silent replacement of an existing slot (phase 1's
+        switch_symbol did that on purpose; phase 2 explicitly does not)."""
+        symbol = symbol.strip().upper()
+        if not symbol or not _VALID_SYMBOL.match(symbol):
+            return False, f"{symbol!r} is not a valid ticker symbol"
+        if symbol in self._slots:
+            return False, f"{symbol} is already being watched"
+        if len(self._slots) >= self._max_symbols:
+            return False, (f"already watching {self._max_symbols} symbols "
+                           f"(the maximum) -- remove one first")
 
-        A blank/invalid symbol, or the symbol already being watched, is a
-        silent no-op -- returns False. Returns True if it actually switched.
+        self._slots[symbol] = _SymbolSlot(symbol=symbol, state=build_state([], symbol))
+        if self._journal_store is not None:
+            # Resume an already-open position for this symbol (a restart,
+            # or re-adding something with a position still open) rather
+            # than losing track of it. Seeding journal_was_confirmed to
+            # True when one exists prevents a spurious duplicate-entry
+            # attempt on the very next poll.
+            resumed = self._journal_store.open_position_for(symbol)
+            self._slots[symbol].journal_position = resumed
+            self._slots[symbol].journal_was_confirmed = resumed is not None
+        if self._announce_watch is not None:
+            await self._announce_watch_with_retry(symbol)
+        return True, ""
 
-        Also force-closes any open virtual-journal position for the OLD
-        symbol at its last known price, exit_reason="symbol_switched" --
-        distinct from "trailing_stop" so later review doesn't conflate "the
-        trade stopped out" with "the user just moved on." A position left
-        open with no further price updates could never resolve otherwise."""
-        new_symbol = new_symbol.strip().upper()
-        if not new_symbol or new_symbol == self._symbol or not _VALID_SYMBOL.match(new_symbol):
+    async def remove_symbol(self, symbol: str) -> bool:
+        """Stop watching a symbol. Force-closes any open virtual-journal
+        position for it at its last known price, exit_reason=
+        "symbol_switched" -- same meaning as phase 1's single-symbol
+        switch: watching stopped, so the position could never resolve if
+        left open. Returns False (a no-op, not an error) if the symbol
+        wasn't being watched."""
+        symbol = symbol.strip().upper()
+        slot = self._slots.pop(symbol, None)
+        if slot is None:
             return False
-        old_symbol = self._symbol
-        if (old_symbol is not None and self._journal_store is not None
-                and self._journal_position is not None):
-            last_bar = self._bars[-1] if self._bars else None
+        if self._journal_store is not None and slot.journal_position is not None:
+            last_bar = slot.bars[-1] if slot.bars else None
             exit_price = (last_bar["close"] if last_bar is not None
-                         else self._journal_position.entry_price)
+                         else slot.journal_position.entry_price)
             exit_ts = last_bar["ts"] if last_bar is not None else int(self._now_fn())
             self._journal_store.close_position(
-                self._journal_position,
+                slot.journal_position,
                 ExitEvent(exit_ts=exit_ts, exit_price=exit_price,
                          exit_reason="symbol_switched"),
             )
-            self._journal_position = None
-        self._symbol = new_symbol
-        self._bars = []
-        self._last_ts = 0.0
-        self._poll_ok = False
-        self._state = build_state([], new_symbol)
-        if self._announce_watch is not None:
-            await self._announce_watch_with_retry()
-        if old_symbol is not None and self._announce_unwatch is not None:
+        if self._announce_unwatch is not None:
             # Best-effort, unlike announce_watch's retries: a failure here
             # just leaves one stale symbol watched on schwab-connector
-            # (annoying, not broken -- the new symbol above is what's
-            # actually displayed and it's already watched), so it isn't
-            # worth delaying the switch the user is actively waiting on.
+            # (untidy, not broken), so it isn't worth delaying the removal
+            # the caller is actively waiting on.
             try:
-                await self._announce_unwatch(old_symbol)
+                await self._announce_unwatch(symbol)
             except Exception as exc:
                 logger.warning(
                     "announce_unwatch(%s) failed; schwab-connector will keep "
                     "watching it until explicitly unwatched again: %s",
-                    old_symbol, exc,
+                    symbol, exc,
                 )
-        if self._journal_store is not None:
-            # Resume an already-open position for the new symbol (a
-            # restart, or switching back to something with a position
-            # still open) rather than losing track of it. Seeding
-            # _journal_was_confirmed to True when one exists prevents a
-            # spurious duplicate-entry attempt on the very next poll.
-            self._journal_position = self._journal_store.open_position_for(new_symbol)
-        self._journal_was_confirmed = self._journal_position is not None
         return True
 
-    async def _announce_watch_with_retry(self) -> None:
+    async def _announce_watch_with_retry(self, symbol: str) -> None:
         delay = self._announce_retry_base_delay
         for attempt in range(1, self._announce_retry_attempts + 1):
             try:
-                await self._announce_watch(self._symbol)
+                await self._announce_watch(symbol)
                 return
             except Exception as exc:
                 if attempt < self._announce_retry_attempts:
                     logger.warning(
                         "announce_watch(%s) failed on attempt %d/%d, "
                         "retrying in %.1fs: %s",
-                        self._symbol, attempt, self._announce_retry_attempts,
-                        delay, exc,
+                        symbol, attempt, self._announce_retry_attempts, delay, exc,
                     )
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, self._announce_retry_max_delay)
@@ -231,64 +317,68 @@ class Poller:
                         "announce_watch(%s) failed on all %d attempts; "
                         "schwab-connector will never register this symbol "
                         "as watched unless something else calls POST /watch: %s",
-                        self._symbol, self._announce_retry_attempts, exc,
+                        symbol, self._announce_retry_attempts, exc,
                     )
 
-    async def _poll_once(self) -> None:
-        symbol = self._symbol
-        try:
-            incoming = await self._fetch_bars(symbol, self._last_ts)
-        except Exception:
-            self._poll_ok = False  # keep serving the last good state
+    async def _poll_once(self, symbol: str) -> None:
+        slot = self._slots.get(symbol)
+        if slot is None:
             return
-        if symbol != self._symbol:
-            # switch_symbol() landed while this fetch was in flight -- these
-            # bars belong to the symbol we just switched AWAY from. Applying
-            # them now would corrupt the new symbol's freshly-reset series.
+        try:
+            incoming = await self._fetch_bars(symbol, slot.last_ts)
+        except Exception:
+            slot.poll_ok = False  # keep serving the last good state
+            return
+        if self._slots.get(symbol) is not slot:
+            # remove_symbol() (possibly followed by a fresh add_symbol())
+            # landed while this fetch was in flight -- identity-checking
+            # the slot object, not just the key, catches BOTH "removed"
+            # (get returns None) and "removed then re-added" (a NEW slot
+            # object) cases. Same class of race phase 1's switch_symbol
+            # guarded against, generalized to per-symbol slots.
             return
         new_bars = []
         for bar in incoming:
-            if not self._bars or bar["ts"] > self._bars[-1]["ts"]:
-                self._bars.append(bar)
+            if not slot.bars or bar["ts"] > slot.bars[-1]["ts"]:
+                slot.bars.append(bar)
                 new_bars.append(bar)
         if new_bars:
-            self._last_ts = self._bars[-1]["ts"]
-        self._state = build_state(self._bars, symbol)
-        self._poll_ok = True
-        self._update_journal(symbol, new_bars)
+            slot.last_ts = slot.bars[-1]["ts"]
+        slot.state = build_state(slot.bars, symbol)
+        slot.poll_ok = True
+        self._update_journal(symbol, slot, new_bars)
 
-    def _update_journal(self, symbol: str, new_bars: list[dict]) -> None:
+    def _update_journal(self, symbol: str, slot: _SymbolSlot, new_bars: list[dict]) -> None:
         if self._journal_store is None:
             return
-        if self._journal_position is not None:
-            # A resumed position (a restart, or switching back to a symbol
-            # with one still open) can have new_bars containing history
-            # from BEFORE its entry -- self._last_ts resets to 0.0 on a
-            # restart/switch, so the full session gets refetched as if it
+        if slot.journal_position is not None:
+            # A resumed position (a restart, or re-adding a symbol with
+            # one still open) can have new_bars containing history from
+            # BEFORE its entry -- last_ts resets to 0.0 when a slot is
+            # freshly created, so the full session gets refetched as if it
             # were all new. Exit-checking must never see pre-entry bars as
-            # if they happened after entry (confirmed by a real bug this
-            # caught: a resumed position was being phantom-stopped-out
-            # against its own pre-entry price history on the very next
-            # poll after a restart).
-            new_bars = [b for b in new_bars if b["ts"] > self._journal_position.entry_ts]
-        resistance = self._state.get("levels", {}).get("resistance")
+            # if they happened after entry (a real bug this caught in
+            # phase 1: a resumed position was being phantom-stopped-out
+            # against its own pre-entry price history on the next poll).
+            new_bars = [b for b in new_bars if b["ts"] > slot.journal_position.entry_ts]
+        resistance = slot.state.get("levels", {}).get("resistance")
         is_confirmed_now = bool(resistance and resistance["hold"]["confirmed"])
         tick = advance_journal(
-            position=self._journal_position, new_bars=new_bars,
+            position=slot.journal_position, new_bars=new_bars,
             is_confirmed_now=is_confirmed_now,
-            was_confirmed_before=self._journal_was_confirmed,
+            was_confirmed_before=slot.journal_was_confirmed,
             trail_pct=self._trail_pct, symbol=symbol,
         )
         if tick.opened is not None:
-            self._journal_position = self._journal_store.create(tick.opened)
+            slot.journal_position = self._journal_store.create(tick.opened)
         elif tick.updated is not None:
             self._journal_store.update_trailing(tick.updated)
-            self._journal_position = tick.updated
+            slot.journal_position = tick.updated
         elif tick.closed is not None:
             position, exit_event = tick.closed
             self._journal_store.close_position(position, exit_event)
-            self._journal_position = None
-        self._journal_was_confirmed = tick.was_confirmed_after
+            slot.journal_position = None
+        slot.journal_was_confirmed = tick.was_confirmed_after
 
 
 # -- rendering helpers shared in spirit (deliberately, minimally
@@ -378,98 +468,70 @@ def _journal_closed_rows_html(closed: list[dict]) -> str:
     return "".join(rows)
 
 
-def _page(state: dict, journal: dict, poll_enabled: bool) -> str:
-    sym = html.escape(str(state.get("symbol") or "—"))
-    is_ok = state.get("status") == "ok"
+def _symbol_card_html(symbol: str, state: dict) -> str:
+    """Stage A interim only -- NOT the Stage B multi-panel grid. One card
+    per watched symbol, reusing the same per-block renderers phase 1's
+    single-symbol page used, just called once per symbol instead of once
+    total."""
+    sym = html.escape(symbol)
+    if state.get("status") != "ok":
+        msg = (f"Warming up — waiting for bars for {sym}." if state.get("symbol")
+              else "No data yet.")
+        return f"<section class='card'><h2>{sym}</h2><p class='muted'>{html.escape(msg)}</p></section>"
 
-    if is_ok:
-        s = state["session"]
-        price_cls = _cmp_class(state["last_price"], s["vwap"])
-        ema9_cls = _cmp_class(state["last_price"], s["ema9"])
-        hist_cls = _sign_class(s["macd"]["histogram"])
-        price_val, bars_val = _fmt(state["last_price"], 2), str(state["bar_count"])
-        extended_val = "yes" if state["last_bar_is_extended"] else "no"
-        vwap_val, ema9_val, ema20_val = _fmt(s["vwap"]), _fmt(s["ema9"]), _fmt(s["ema20"])
-        macd_val = _fmt(s["macd"]["macd"], 6)
-        macd_sig_val = _fmt(s["macd"]["signal"], 6)
-        macd_hist_val = _fmt(s["macd"]["histogram"], 6)
-        relvol_val = _fmt(s["relative_volume"], 2)
-        resistance_html = _level_block_html("Resistance (nearest above)", state["levels"]["resistance"])
-        support_html = _level_block_html("Support (nearest below)", state["levels"]["support"])
-        banner_text, banner_display = "", "display:none"
-        main_display = ""
+    s = state["session"]
+    price_cls = _cmp_class(state["last_price"], s["vwap"])
+    ema9_cls = _cmp_class(state["last_price"], s["ema9"])
+    hist_cls = _sign_class(s["macd"]["histogram"])
+    return f"""
+<section class="card">
+  <div class="hero">
+    <div class="hero-symbol">{sym}</div>
+    <div class="hero-price {price_cls}">{_fmt(state['last_price'], 2)}</div>
+  </div>
+  <table class="detail">
+    <tr><th>Bars</th><td>{state['bar_count']}</td></tr>
+    <tr><th>Last bar extended-hours</th><td>{"yes" if state["last_bar_is_extended"] else "no"}</td></tr>
+    <tr><th>VWAP (session)</th><td>{_fmt(s['vwap'])}</td></tr>
+    <tr><th>EMA 9</th><td class="{ema9_cls}">{_fmt(s['ema9'])}</td></tr>
+    <tr><th>EMA 20</th><td>{_fmt(s['ema20'])}</td></tr>
+    <tr><th>MACD</th><td>{_fmt(s['macd']['macd'], 6)}</td></tr>
+    <tr><th>MACD signal</th><td>{_fmt(s['macd']['signal'], 6)}</td></tr>
+    <tr><th>MACD histogram</th><td class="{hist_cls}">{_fmt(s['macd']['histogram'], 6)}</td></tr>
+    <tr><th>Relative volume</th><td>{_fmt(s['relative_volume'], 2)}</td></tr>
+  </table>
+  <h3>Virtual position</h3>
+  {_journal_open_html(state["journal"]["open"])}
+  {_level_block_html("Resistance (nearest above)", state["levels"]["resistance"])}
+  {_level_block_html("Support (nearest below)", state["levels"]["support"])}
+</section>
+"""
+
+
+def _page(full_states: dict[str, dict], recent_closed: list[dict], poll_enabled: bool) -> str:
+    if full_states:
+        cards_html = "".join(_symbol_card_html(sym, st) for sym, st in full_states.items())
     else:
-        price_cls = ema9_cls = hist_cls = ""
-        price_val = bars_val = extended_val = "—"
-        vwap_val = ema9_val = ema20_val = macd_val = macd_sig_val = macd_hist_val = relvol_val = "—"
-        resistance_html = support_html = ""
-        banner_text = (f"Warming up — waiting for bars for {sym}." if state.get("symbol")
-                      else "No symbol selected yet — enter a ticker below.")
-        banner_display, main_display = "", "display:none"
-
-    journal_open_html = _journal_open_html(journal.get("open"))
-    journal_closed_rows = _journal_closed_rows_html(journal.get("recent_closed") or [])
+        cards_html = ("<p class='muted'>No symbols watched yet — add one via "
+                      "<code>POST /api/watch</code> (up to 4).</p>")
 
     body = f"""
-<div id="banner" class="banner" style="{banner_display}">{html.escape(banner_text)}</div>
-<div id="main" style="{main_display}">
-  <section class="hero card">
-    <div class="hero-symbol">{sym}</div>
-    <div id="price-value" class="hero-price {price_cls}">{price_val}</div>
-  </section>
-
-  <section class="card">
-    <h2>Virtual position</h2>
-    <div id="journal-open">{journal_open_html}</div>
-  </section>
-
-  <section class="card">
-    <h2>Indicators</h2>
-    <table class="detail">
-      <tr><th>Bars</th><td id="ind-bars">{bars_val}</td></tr>
-      <tr><th>Last bar extended-hours</th><td id="ind-extended">{extended_val}</td></tr>
-      <tr><th>VWAP (session)</th><td id="ind-vwap">{vwap_val}</td></tr>
-      <tr><th>EMA 9</th><td id="ind-ema9" class="{ema9_cls}">{ema9_val}</td></tr>
-      <tr><th>EMA 20</th><td id="ind-ema20">{ema20_val}</td></tr>
-      <tr><th>MACD</th><td id="ind-macd">{macd_val}</td></tr>
-      <tr><th>MACD signal</th><td id="ind-macd-signal">{macd_sig_val}</td></tr>
-      <tr><th>MACD histogram</th><td id="ind-macd-hist" class="{hist_cls}">{macd_hist_val}</td></tr>
-      <tr><th>Relative volume</th><td id="ind-relvol">{relvol_val}</td></tr>
-    </table>
-  </section>
-
-  <section class="card">
-    <h2>Levels</h2>
-    <div id="resistance-block">{resistance_html}</div>
-    <div id="support-block">{support_html}</div>
-  </section>
-
-  <section class="card">
-    <h2>Recent closed trades</h2>
-    <table class="detail">
-      <tr><th>symbol</th><th>entry</th><th>exit</th><th>reason</th><th>P&amp;L %</th></tr>
-      <tbody id="journal-closed-tbody">{journal_closed_rows}</tbody>
-    </table>
-  </section>
-</div>
+<div id="symbols">{cards_html}</div>
+<section class="card">
+  <h2>Recent closed trades</h2>
+  <table class="detail">
+    <tr><th>symbol</th><th>entry</th><th>exit</th><th>reason</th><th>P&amp;L %</th></tr>
+    <tbody id="journal-closed-tbody">{_journal_closed_rows_html(recent_closed)}</tbody>
+  </table>
+</section>
 """
-    return _wrap(sym, body, poll_enabled)
+    return _wrap(body, poll_enabled)
 
 
-_SYMBOL_FORM = (
-    "<form method='post' action='/api/watch' class='ticker-form'>"
-    "<input name='symbol' placeholder='Ticker' maxlength='10' autocomplete='off'>"
-    "<button type='submit'>Watch</button>"
-    "</form>"
-)
-
-# Live-polling toggle -- separate from the ticker form above (a page
-# nobody's watching still burns a schwab-connector/API request every poll
-# interval; this lets that stop without navigating away). poll_enabled
-# reflects server-side truth (Poller.poll_enabled) at request time, same
-# "real data on first paint" approach as the rest of _page -- the button
-# doesn't just start on a guessed default and get corrected a moment later
-# by JS.
+# Live-polling toggle -- one global switch for the whole poller (all
+# watched symbols), not per-symbol. poll_enabled reflects server-side
+# truth (Poller.poll_enabled) at request time, same "real data on first
+# paint" approach as the rest of this page.
 def _poll_toggle_html(poll_enabled: bool) -> str:
     label = "Pause updates" if poll_enabled else "Resume updates"
     status = "live" if poll_enabled else "paused"
@@ -482,6 +544,11 @@ def _poll_toggle_html(poll_enabled: bool) -> str:
 
 # Mirrors, in JS, the same helpers/templates as the Python side above --
 # see the module-level comment on _fmt for why this duplication exists.
+# Stage A interim: rebuilds the whole #symbols container's innerHTML each
+# poll (not per-element targeted updates the way phase 1's single-symbol
+# page did) -- a coarser-grained update, still no meta-refresh/page
+# reload, appropriate for a set of symbols that can change size between
+# polls. Stage B's real multi-panel grid replaces this.
 _SCRIPT = """
 function fmt(v, d) {
   if (v === null || v === undefined) return '\\u2014';
@@ -543,53 +610,50 @@ function journalClosedRows(closed) {
       '<td class="' + cls + '">' + pnl + '</td></tr>';
   }).join('');
 }
+function symbolCardHtml(symbol, state) {
+  const sym = esc(symbol);
+  if (state.status !== 'ok') {
+    return '<section class="card"><h2>' + sym + '</h2>' +
+      '<p class="muted">Warming up \\u2014 waiting for bars.</p></section>';
+  }
+  const s = state.session;
+  const priceCls = cmpClass(state.last_price, s.vwap);
+  const ema9Cls = cmpClass(state.last_price, s.ema9);
+  const histCls = signClass(s.macd.histogram);
+  return '<section class="card">' +
+    '<div class="hero"><div class="hero-symbol">' + sym + '</div>' +
+    '<div class="hero-price ' + priceCls + '">' + fmt(state.last_price, 2) + '</div></div>' +
+    '<table class="detail">' +
+    '<tr><th>Bars</th><td>' + state.bar_count + '</td></tr>' +
+    '<tr><th>Last bar extended-hours</th><td>' + (state.last_bar_is_extended ? 'yes' : 'no') + '</td></tr>' +
+    '<tr><th>VWAP (session)</th><td>' + fmt(s.vwap, 4) + '</td></tr>' +
+    '<tr><th>EMA 9</th><td class="' + ema9Cls + '">' + fmt(s.ema9, 4) + '</td></tr>' +
+    '<tr><th>EMA 20</th><td>' + fmt(s.ema20, 4) + '</td></tr>' +
+    '<tr><th>MACD</th><td>' + fmt(s.macd.macd, 6) + '</td></tr>' +
+    '<tr><th>MACD signal</th><td>' + fmt(s.macd.signal, 6) + '</td></tr>' +
+    '<tr><th>MACD histogram</th><td class="' + histCls + '">' + fmt(s.macd.histogram, 6) + '</td></tr>' +
+    '<tr><th>Relative volume</th><td>' + fmt(s.relative_volume, 2) + '</td></tr>' +
+    '</table>' +
+    '<h3>Virtual position</h3>' + journalOpenHtml(state.journal.open) +
+    levelBlockHtml('Resistance (nearest above)', state.levels.resistance) +
+    levelBlockHtml('Support (nearest below)', state.levels.support) +
+    '</section>';
+}
 async function refresh() {
   let data;
   try {
     const r = await fetch('/api/state');
     data = await r.json();
   } catch (e) {
-    return;  // keep showing the last-good render, same philosophy as the server's own _poll_ok
+    return;  // keep showing the last-good render, same philosophy as the server's own poll_ok
   }
   applyPollUiState(data.poll_enabled);  // stay in sync even if another tab paused/resumed it
-  const banner = document.getElementById('banner');
-  const main = document.getElementById('main');
-  if (data.status !== 'ok') {
-    banner.textContent = data.symbol
-      ? ('Warming up \\u2014 waiting for bars for ' + data.symbol + '.')
-      : 'No symbol selected yet \\u2014 enter a ticker below.';
-    banner.style.display = '';
-    main.style.display = 'none';
-    return;
-  }
-  banner.style.display = 'none';
-  main.style.display = '';
-
-  const s = data.session;
-  const priceEl = document.getElementById('price-value');
-  priceEl.textContent = fmt(data.last_price, 2);
-  priceEl.className = 'hero-price ' + cmpClass(data.last_price, s.vwap);
-  document.getElementById('ind-bars').textContent = data.bar_count;
-  document.getElementById('ind-extended').textContent = data.last_bar_is_extended ? 'yes' : 'no';
-  document.getElementById('ind-vwap').textContent = fmt(s.vwap, 4);
-  const ema9El = document.getElementById('ind-ema9');
-  ema9El.textContent = fmt(s.ema9, 4);
-  ema9El.className = cmpClass(data.last_price, s.ema9);
-  document.getElementById('ind-ema20').textContent = fmt(s.ema20, 4);
-  document.getElementById('ind-macd').textContent = fmt(s.macd.macd, 6);
-  document.getElementById('ind-macd-signal').textContent = fmt(s.macd.signal, 6);
-  const histEl = document.getElementById('ind-macd-hist');
-  histEl.textContent = fmt(s.macd.histogram, 6);
-  histEl.className = signClass(s.macd.histogram);
-  document.getElementById('ind-relvol').textContent = fmt(s.relative_volume, 2);
-
-  document.getElementById('resistance-block').innerHTML =
-    levelBlockHtml('Resistance (nearest above)', data.levels.resistance);
-  document.getElementById('support-block').innerHTML =
-    levelBlockHtml('Support (nearest below)', data.levels.support);
-
-  document.getElementById('journal-open').innerHTML = journalOpenHtml(data.journal.open);
-  document.getElementById('journal-closed-tbody').innerHTML = journalClosedRows(data.journal.recent_closed);
+  const symbolsEl = document.getElementById('symbols');
+  const syms = Object.keys(data.symbols || {});
+  symbolsEl.innerHTML = syms.length
+    ? syms.map(function(sym) { return symbolCardHtml(sym, data.symbols[sym]); }).join('')
+    : '<p class="muted">No symbols watched yet \\u2014 add one via POST /api/watch (up to 4).</p>';
+  document.getElementById('journal-closed-tbody').innerHTML = journalClosedRows(data.recent_closed);
 }
 
 // Pause/resume BOTH the client-side display loop AND (via POST
@@ -649,12 +713,6 @@ h2{font-size:.95rem;text-transform:uppercase;letter-spacing:.04em;color:var(--mu
 h3{font-size:.9rem;color:var(--text)}
 .topbar{display:flex;align-items:center;justify-content:space-between;
   flex-wrap:wrap;gap:1rem;margin-bottom:1rem}
-.ticker-form{display:flex;gap:.4rem}
-.ticker-form input{text-transform:uppercase;background:var(--card);
-  border:1px solid var(--border);color:var(--text);border-radius:.4rem;
-  padding:.4rem .6rem;width:7rem}
-.ticker-form button{background:var(--accent);color:#fff;border:none;
-  border-radius:.4rem;padding:.4rem .8rem;cursor:pointer}
 .poll-controls{display:flex;align-items:center;gap:.5rem;font-size:.85rem}
 .poll-controls button{background:var(--card);color:var(--text);
   border:1px solid var(--border);border-radius:.4rem;padding:.4rem .8rem;
@@ -681,27 +739,29 @@ table.detail th{color:var(--muted);font-weight:500;width:45%}
 """
 
 
-def _wrap(sym: str, body: str, poll_enabled: bool) -> str:
+def _wrap(body: str, poll_enabled: bool) -> str:
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        f"<title>momentum monitor — {sym}</title>"
+        "<title>momentum monitor</title>"
         f"<style>{_STYLE}</style></head><body>"
-        f"<div class='topbar'><h1>{sym}</h1>{_SYMBOL_FORM}{_poll_toggle_html(poll_enabled)}</div>"
+        f"<div class='topbar'><h1>momentum monitor</h1>{_poll_toggle_html(poll_enabled)}</div>"
         f"{body}"
-        "<p class='footer'>Read-only technical read. Not advice, not an order.</p>"
+        "<p class='footer'>Read-only technical read. Not advice, not an order. "
+        "Phase 2 Stage A: no add/remove UI yet -- use POST /api/watch / "
+        "POST /api/unwatch directly.</p>"
         f"<script>{_SCRIPT}</script>"
         "</body></html>"
     )
 
 
-def create_app(*, fetch_bars, watch_symbol, poll_interval: float = 5.0,
+def create_app(*, fetch_bars, watch_symbol=None, poll_interval: float = 5.0,
                announce_watch=None, announce_unwatch=None,
                announce_retry_attempts=ANNOUNCE_RETRY_ATTEMPTS,
                announce_retry_base_delay=ANNOUNCE_RETRY_BASE_DELAY_SECONDS,
                announce_retry_max_delay=ANNOUNCE_RETRY_MAX_DELAY_SECONDS,
                journal_store=None, trail_pct=DEFAULT_TRAIL_PCT,
-               now_fn=time.time) -> FastAPI:
+               now_fn=time.time, max_symbols=MAX_SYMBOLS) -> FastAPI:
     poller = Poller(fetch_bars=fetch_bars, watch_symbol=watch_symbol,
                     poll_interval=poll_interval, announce_watch=announce_watch,
                     announce_unwatch=announce_unwatch,
@@ -709,7 +769,7 @@ def create_app(*, fetch_bars, watch_symbol, poll_interval: float = 5.0,
                     announce_retry_base_delay=announce_retry_base_delay,
                     announce_retry_max_delay=announce_retry_max_delay,
                     journal_store=journal_store, trail_pct=trail_pct,
-                    now_fn=now_fn)
+                    now_fn=now_fn, max_symbols=max_symbols)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -718,17 +778,21 @@ def create_app(*, fetch_bars, watch_symbol, poll_interval: float = 5.0,
         task.cancel()
 
     app = FastAPI(title="monitor-app", lifespan=lifespan)
+    app.state.poller = poller
 
     @app.get("/api/state")
     async def api_state():
-        payload = dict(poller.state)
-        payload["journal"] = poller.journal_snapshot()
-        payload["poll_enabled"] = poller.poll_enabled
-        return JSONResponse(payload)
+        return JSONResponse({
+            "symbols": poller.all_full_states(),
+            "recent_closed": poller.recent_closed(limit=10),
+            "poll_enabled": poller.poll_enabled,
+            "max_symbols": poller.max_symbols,
+        })
 
     @app.get("/", response_class=HTMLResponse)
     async def root():
-        return _page(poller.state, poller.journal_snapshot(), poller.poll_enabled)
+        return _page(poller.all_full_states(), poller.recent_closed(limit=10),
+                    poller.poll_enabled)
 
     @app.post("/api/watch")
     async def api_watch(request: Request):
@@ -738,8 +802,16 @@ def create_app(*, fetch_bars, watch_symbol, poll_interval: float = 5.0,
         # Starlette/urllib can already parse without it.
         body = (await request.body()).decode()
         symbol = (parse_qs(body).get("symbol") or [""])[0]
-        await poller.switch_symbol(symbol)
-        return RedirectResponse("/", status_code=303)
+        ok, reason = await poller.add_symbol(symbol)
+        return JSONResponse({"ok": ok, "reason": reason, "symbols": poller.symbols},
+                            status_code=200 if ok else 409)
+
+    @app.post("/api/unwatch")
+    async def api_unwatch(request: Request):
+        body = (await request.body()).decode()
+        symbol = (parse_qs(body).get("symbol") or [""])[0]
+        removed = await poller.remove_symbol(symbol)
+        return JSONResponse({"removed": removed, "symbols": poller.symbols})
 
     @app.post("/api/polling")
     async def api_polling(request: Request):

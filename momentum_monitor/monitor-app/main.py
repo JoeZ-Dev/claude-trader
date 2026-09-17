@@ -5,8 +5,11 @@ and journal_store to a real SQLite file (journal_store.py).
 
 Environment:
   SCHWAB_CONNECTOR_URL  base URL of schwab-connector   (default http://schwab-connector:7878)
-  WATCH_SYMBOL          the one symbol to watch this phase (default: unset -> idle)
-  POLL_INTERVAL         seconds between bar polls       (default 5)
+  WATCH_SYMBOL          the STARTING symbol only (phase 2: up to app.py's
+                        MAX_SYMBOLS=4 can be watched concurrently; more are
+                        added at runtime via POST /api/watch, not this env
+                        var)                            (default: unset -> idle)
+  POLL_INTERVAL         seconds between bar polls, per watched symbol (default 5)
   JOURNAL_DB_PATH       SQLite file for the virtual trade journal
                         (specs.md section 6)              (default /data/journal.db)
   TRAIL_PCT             trailing-stop percent below the running high-water
