@@ -31,12 +31,19 @@ def _fixture(tmp_path):
     return p
 
 
+def _replay_factory(fx):
+    """One shared ReplayStreamSource now serves every currently-watched
+    symbol (fixed 2026-09-17 -- see specs.md), so source_factory takes a
+    watched_symbols GETTER, not zero args."""
+    return lambda watched_symbols: ReplayStreamSource(fx, watched_symbols=watched_symbols)
+
+
 def _app(tmp_path, *, history_fetcher=None):
     fx = _fixture(tmp_path)
     store = BarStore(tmp_path / "bars")
     return create_app(
         store=store,
-        source_factory=lambda: ReplayStreamSource(fx),
+        source_factory=_replay_factory(fx),
         replay=True,
         now_fn=lambda: RTH_1030 + 30,
         history_fetcher=history_fetcher,
@@ -116,7 +123,7 @@ def test_watch_requires_symbol(tmp_path):
 
 
 def test_boots_without_working_source(tmp_path):
-    def broken_factory():
+    def broken_factory(watched_symbols):
         raise RuntimeError("no schwab token on disk")
 
     app = create_app(
@@ -135,24 +142,106 @@ def test_boots_without_working_source(tmp_path):
         assert c.get("/bars/AEHL").json() == []
 
 
+# -- one shared connection, not one per symbol ----------------------------
+
+def test_watching_a_second_symbol_does_not_open_a_second_connection(tmp_path):
+    fx = _fixture(tmp_path)
+    factory_calls = []
+
+    def factory(watched_symbols):
+        factory_calls.append(1)
+        return ReplayStreamSource(fx, watched_symbols=watched_symbols)
+
+    app = create_app(
+        store=BarStore(tmp_path / "bars"),
+        source_factory=factory,
+        replay=True,
+        now_fn=lambda: RTH_1030 + 30,
+    )
+    with TestClient(app) as c:
+        c.post("/watch", json={"symbol": "AEHL"})
+        _wait_for_bars(c, "AEHL", want=1)
+        c.post("/watch", json={"symbol": "SPY"})
+        _wait_for_bars(c, "SPY", want=1)
+    # Exactly ONE shared connection ever built, regardless of how many
+    # symbols got watched -- the real point of this whole redesign
+    # (specs.md: the old design built one independent connection PER
+    # symbol, which throttled badly under real concurrent load).
+    assert factory_calls == [1]
+
+
+class _TrackingSharedSource:
+    """A fake shared source that just hangs (never yields) but records
+    add_symbol/remove_symbol calls -- for testing Connector's live-update
+    passthrough in isolation from any real reconnect/replay machinery."""
+    connected = True
+
+    def __init__(self):
+        self.add_calls = []
+        self.remove_calls = []
+
+    async def ticks(self):
+        await asyncio.Event().wait()
+        yield "", {}  # pragma: no cover -- never reached, just makes this a generator
+
+    async def add_symbol(self, symbol):
+        self.add_calls.append(symbol)
+
+    async def remove_symbol(self, symbol):
+        self.remove_calls.append(symbol)
+
+
+def test_watching_a_second_symbol_after_connect_calls_add_symbol_live(tmp_path):
+    shared = _TrackingSharedSource()
+    app = create_app(
+        store=BarStore(tmp_path / "bars"),
+        source_factory=lambda watched_symbols: shared,
+        replay=False,
+        now_fn=lambda: RTH_1030,
+    )
+    with TestClient(app) as c:
+        c.post("/watch", json={"symbol": "AEHL"})
+        time.sleep(0.05)  # let _consume_shared start and set _shared_source
+        c.post("/watch", json={"symbol": "SPY"})
+        time.sleep(0.05)
+    assert shared.add_calls == ["SPY"]
+
+
+def test_unwatch_calls_remove_symbol_on_the_live_shared_source(tmp_path):
+    shared = _TrackingSharedSource()
+    app = create_app(
+        store=BarStore(tmp_path / "bars"),
+        source_factory=lambda watched_symbols: shared,
+        replay=False,
+        now_fn=lambda: RTH_1030,
+    )
+    with TestClient(app) as c:
+        c.post("/watch", json={"symbol": "AEHL"})
+        time.sleep(0.05)
+        c.post("/unwatch", json={"symbol": "AEHL"})
+    assert shared.remove_calls == ["AEHL"]
+
+
 # -- tick heartbeat: confirms real ticks are (or aren't) actually flowing --
 
 class _FakeLiveSource:
-    """Minimal non-replay source: yields a fixed batch of ticks immediately,
-    then hangs forever -- simulates a live connection that's genuinely
-    healthy (never errors, never disconnects) but has simply stopped
-    receiving anything further, the exact scenario the heartbeat log
-    exists to make visible (found live 2026-09-17: aggregator and
-    reconnect layers both reported healthy while real ticks had silently
-    stopped arriving for a symbol Schwab was actively trading)."""
+    """Minimal non-replay shared source: yields a fixed batch of (symbol,
+    tick) pairs immediately, then hangs forever -- simulates a live
+    connection that's genuinely healthy (never errors, never disconnects)
+    but has simply stopped receiving anything further, the exact scenario
+    the heartbeat log exists to make visible (found live 2026-09-17:
+    aggregator and reconnect layers both reported healthy while real
+    ticks had silently stopped arriving for a symbol Schwab was actively
+    trading)."""
     connected = True
 
-    def __init__(self, ticks):
+    def __init__(self, symbol, ticks):
+        self._symbol = symbol
         self._ticks = ticks
 
-    async def ticks(self, symbol):
+    async def ticks(self):
         for t in self._ticks:
-            yield t
+            yield self._symbol, t
         await asyncio.Event().wait()
 
 
@@ -160,7 +249,7 @@ def test_tick_heartbeat_reports_real_count_then_zero_when_stream_goes_quiet(tmp_
     ticks = [{"ts": RTH_1030 + i, "price": 10.0 + i * 0.01, "size": 5} for i in range(4)]
     app = create_app(
         store=BarStore(tmp_path / "bars"),
-        source_factory=lambda: _FakeLiveSource(ticks),
+        source_factory=lambda watched_symbols: _FakeLiveSource("AEHL", ticks),
         replay=False,
         now_fn=lambda: RTH_1030 + 40,
         flush_interval=0.02,
@@ -279,7 +368,7 @@ def test_watch_skips_backfill_when_symbol_already_has_bars(tmp_path):
     fx = _fixture(tmp_path)
     app = create_app(
         store=store,
-        source_factory=lambda: ReplayStreamSource(fx),
+        source_factory=_replay_factory(fx),
         replay=True,
         now_fn=lambda: RTH_1030 + 30,
         history_fetcher=history_fetcher,
@@ -311,7 +400,7 @@ def test_bars_survive_new_app_on_same_store_dir(tmp_path):
     fx = _fixture(tmp_path)
     app2 = create_app(
         store=BarStore(tmp_path / "bars"),
-        source_factory=lambda: ReplayStreamSource(fx),
+        source_factory=_replay_factory(fx),
         replay=True,
         now_fn=lambda: RTH_1030 + 30,
     )

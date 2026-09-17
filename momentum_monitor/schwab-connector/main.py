@@ -47,8 +47,8 @@ REPLAY_PATH = os.environ.get("REPLAY_PATH", "/data/replay.jsonl")
 _store = BarStore(BAR_DB_DIR)
 
 if STREAM_SOURCE == "replay":
-    def _source_factory():
-        return ReplayStreamSource(REPLAY_PATH, pace=True)
+    def _source_factory(watched_symbols):
+        return ReplayStreamSource(REPLAY_PATH, watched_symbols=watched_symbols, pace=True)
     _replay = True
     _history_fetcher = None  # replay fixtures are hand-crafted; no session to backfill
 else:
@@ -65,7 +65,7 @@ else:
             asyncio=True,
         )
 
-    def _source_factory():
+    def _source_factory(watched_symbols):
         if not AUTH_HELPER_URL:
             raise RuntimeError(
                 "AUTH_HELPER_URL is not set; cannot reach companion-auth for a token")
@@ -73,6 +73,7 @@ else:
             token_source=AccessTokenSource(AUTH_HELPER_URL, shared_secret=INTERNAL_AUTH_SECRET),
             build_client=_build_client,
             make_source=lambda client: SchwabStreamSource(client),
+            watched_symbols=watched_symbols,
             on_event=log_event,
         )
     _replay = False

@@ -365,7 +365,12 @@ asserts every event kind this module emits carries it). `events.py`
 needed no change — `format_event` was already generic over kwargs, so
 `event=stream_error symbol='DAIC' error=...` just falls out of it.
 
-This fix is what made the NEXT bug findable at all — see below.
+This fix is what made the NEXT bug findable at all — see below. (Superseded
+2026-09-17: once `schwab-connector` moved to ONE shared connection for all
+symbols — see below — per-event symbol-tagging stopped being the right
+model, since there's only one connection to log about now, and was
+reverted along with that change. It served its purpose: without it, the
+next two bugs below would have been much slower to find.)
 
 **`BarAggregator.flush()` only forward-filled a quiet stream ONCE, ever
 (found live 2026-09-17, fixed) — the real root cause of the stale-feeds
@@ -405,6 +410,90 @@ depends on one existing. This is a genuine correctness bug that
 predates today, present since aggregator.py was first written in phase
 1 — it just took multi-symbol concurrent live load (phase 2) with
 symbol-tagged logging to actually catch it happening and prove why.
+
+**Per-symbol tick heartbeat (added 2026-09-17) — `Connector` logs one
+`event=tick_heartbeat symbol=... ticks_in_last_60s=N` line per symbol
+roughly every 60s.** Exists because `connected: true` and no stream
+errors logged are NOT proof real ticks are actually flowing — this was
+the next diagnostic needed after the aggregator fix above still left
+several symbols showing forward-filled flat bars that directly
+contradicted real, independently-observed market volume. `Connector`
+counts real ticks fed to each symbol's `BarAggregator` and reports the
+count (then resets to 0) on the same flush-loop cadence as everything
+else. Genuinely useful, permanent observability, not a one-off debug
+hack — it's what surfaced the real root cause immediately below.
+
+**ONE shared stream connection for all watched symbols (found + fixed
+2026-09-17) — the real, final root cause of tonight's stale-feeds
+incident, superseding the phase-2 "4 independent WebSocket sessions"
+architecture note.** The tick heartbeat above showed real ticks arriving
+at a small fraction of what actively-trading stocks should produce, and
+— the key signal — which ONE of the 4 watched symbols got the (still
+modest) bulk of ticks ROTATED minute to minute:
+```
+60s window 1: WETO=6   AEMD=0   RETO=1   DAIC=0
+60s window 2: WETO=0   AEMD=0   RETO=0   DAIC=22
+60s window 3: WETO=0   AEMD=43  RETO=0   DAIC=1
+```
+Root cause: each watched symbol had its OWN independent
+`ReconnectingStreamSource` → own `StreamClient` → own WebSocket login,
+all four against the SAME Schwab account/token concurrently — exactly
+the risk phase 2's own docs already flagged ("4 concurrent symbols means
+4 independent WebSocket sessions... needs to be watched under real
+load, not assumed") and which this incident confirmed actually
+materializing: Schwab's streaming service appears to only fully service
+one (or very few) of several concurrent sessions on the same account at
+a time.
+
+Fix: ONE shared `StreamClient` (one login, one ~30-minute reconnect
+cycle) subscribed to the union of all currently-watched symbols, ticks
+demuxed by symbol after arrival. Confirmed via direct `schwab-py`
+inspection (`docker exec` into the running container) that this is
+well-supported without needing a reconnect to change the subscribed set:
+`level_one_equity_subs` (initial), `level_one_equity_add` (add more,
+live), `level_one_equity_unsubs` (remove one, live) all operate on the
+same connection. `stream.py`'s `message_to_ticks()` (the pure,
+already-tested Schwab-payload → ticks mapping) turned out to already be
+multi-symbol-shaped — it always returned one `(symbol, tick)` pair per
+message content entry; the single-symbol restriction lived entirely in
+`SchwabStreamSource`'s own message filter, which needed to go, not in
+the parsing logic, which needed zero changes.
+
+Three layers changed together (`stream.py`, `reconnect.py`, `app.py`),
+each keeping a clear contract with the one above/below it:
+- `stream.py`: `SchwabStreamSource.ticks(symbols)` takes the symbol SET
+  to subscribe, yields `(symbol, tick)` pairs for ALL of them (no more
+  per-instance `self._symbol` filter). New `add_symbols`/`remove_symbols`
+  for live updates. `ReplayStreamSource` (test/offline fixture player)
+  takes a `watched_symbols` GETTER too and broadcasts each replayed tick
+  to every symbol currently in that set — a single fixture can't
+  represent several independently-moving real symbols, so broadcasting
+  is the deliberate test-tool choice, not a limitation that matters in
+  production.
+- `reconnect.py`: `ReconnectingStreamSource.ticks()` drops the `symbol`
+  parameter entirely and reads `watched_symbols()` FRESH at the top of
+  every (re)connect — a getter, not a frozen list, so a symbol added or
+  removed between reconnects "just works" on the next connect with no
+  separate pending-changes bookkeeping. New `add_symbol`/`remove_symbol`
+  forward to the currently-live inner source for an immediate,
+  no-reconnect-needed change; a no-op (not an error) when nothing is
+  connected right now, since the next connect picks it up anyway.
+- `app.py`: `Connector` replaces its old `_sources`/`_tasks` dicts (one
+  task per symbol) with `_aggs: dict[str, BarAggregator]` (per-symbol bar
+  state, unchanged concept) plus ONE `_shared_source` and ONE
+  `_consume_task` for the whole app's lifetime, started lazily on the
+  first `watch()` call and never torn down again (even at zero watched
+  symbols) to avoid relogin churn from watch/unwatch cycling. `watch()`
+  backfills that symbol's history first (same guarantee as before), then
+  either starts the shared consumer (first-ever symbol) or calls
+  `add_symbol` on the already-live one. `unwatch()` calls `remove_symbol`.
+  ONE `_flush_loop` now iterates every symbol's aggregator each cycle
+  (naturally simpler than the old one-loop-per-symbol design, and the
+  tick-heartbeat bookkeeping above moved here unchanged in spirit).
+
+`BarAggregator` itself (10s bar accumulation) is completely unaffected —
+this was entirely about how ticks get DELIVERED to each symbol's
+aggregator, never about how they're aggregated once delivered.
 
 **Price-history date-range quirk (platform-enforced, confirmed live):**
 `GET /marketdata/v1/pricehistory` (wrapped by schwab-py's
@@ -527,17 +616,14 @@ principle, with no code living loose at repo root:
   result discarded — `_poll_once` re-checks the slot's object identity,
   not just its key, after the fetch's `await` returns, so "removed" and
   "removed then re-added" are both caught. `schwab-connector` itself
-  needed zero structural changes for this — `Connector._sources`/`_tasks`
-  were already dicts keyed by symbol with no built-in cap (this is what
-  made the phase-1 watch/unwatch leak possible in the first place before
-  its fix); confirmed by reading it, not assumed. One architectural fact
-  worth knowing, not a defect: each watched symbol gets its own
-  independent Schwab streaming connection and its own independent
-  ~30-minute token-refresh cycle — 4 concurrent symbols means 4
-  independent WebSocket sessions, not one connection multiplexing many.
+  needed zero structural changes for this at the `monitor-app` boundary
+  — `POST /watch`/`POST /unwatch` per symbol was already the right shape.
   Verified live (2026-09-16) under real 4-symbol concurrent load: a
-  natural reconnect on one symbol's stream did not disturb the other
-  three's bars or journal state.
+  natural reconnect did not disturb the other three symbols' bars or
+  journal state. (What DID need to change, on `schwab-connector`'s own
+  internal side, was how those 4 concurrent symbols share the underlying
+  Schwab connection — see section 5's `schwab-connector` entry, "ONE
+  shared stream connection.")
 
   **`GET /api/state` shape change (breaking, deliberate, no back-compat
   shim — nothing else in this repo depended on the old single-object
