@@ -76,6 +76,13 @@ class ReconnectingStreamSource:
         return self._reconnect_count
 
     async def ticks(self, symbol: str):
+        # symbol is threaded into every on_event() call below -- with up to
+        # MAX_SYMBOLS independent ReconnectingStreamSource instances sharing
+        # one process-wide `log_event` callback (main.py), a log line with
+        # no symbol on it is ambiguous about which of the concurrent streams
+        # it's even about. Found live (2026-09-17): a stream_error for one
+        # of 3 newly-(re)watched symbols couldn't be pinned to a specific
+        # symbol from the logs alone, slowing down a real diagnosis.
         first = True
         try:
             while True:
@@ -84,7 +91,7 @@ class ReconnectingStreamSource:
                     await self._token_source.refresh_async()
                 except (AuthRequired, AuthHelperError) as exc:
                     self._connected = False
-                    self._on_event("auth_error", error=exc)
+                    self._on_event("auth_error", symbol=symbol, error=exc)
                     await self._sleep(self._auth_retry_seconds)
                     continue
 
@@ -94,13 +101,13 @@ class ReconnectingStreamSource:
                     inner = self._make_source(client)
                 except Exception as exc:  # defensive: a bad client build
                     self._connected = False
-                    self._on_event("build_error", error=exc)
+                    self._on_event("build_error", symbol=symbol, error=exc)
                     await self._sleep(self._auth_retry_seconds)
                     continue
 
                 if not first:
                     self._reconnect_count += 1
-                    self._on_event("reconnect", count=self._reconnect_count)
+                    self._on_event("reconnect", symbol=symbol, count=self._reconnect_count)
                 first = False
 
                 # 3. consume until token near-expiry, or inner ends/errors
@@ -114,7 +121,7 @@ class ReconnectingStreamSource:
                     # already-stale budget -- see module docstring. Back
                     # off instead of looping straight back into another
                     # refresh with no delay.
-                    self._on_event("stale_immediately_after_refresh")
+                    self._on_event("stale_immediately_after_refresh", symbol=symbol)
                     await self._sleep(self._auth_retry_seconds)
                 # loop -> refresh + rebuild + reconnect
         finally:
@@ -126,20 +133,20 @@ class ReconnectingStreamSource:
             while True:
                 budget = self._token_source.seconds_until_stale()
                 if budget <= 0:
-                    self._on_event("proactive_refresh")
+                    self._on_event("proactive_refresh", symbol=symbol)
                     return
                 try:
                     tick = await asyncio.wait_for(gen.__anext__(), timeout=budget)
                 except asyncio.TimeoutError:
                     # Hit the proactive-refresh deadline while waiting for the
                     # next tick (quiet market or slow stream).
-                    self._on_event("proactive_refresh")
+                    self._on_event("proactive_refresh", symbol=symbol)
                     return
                 except StopAsyncIteration:
-                    self._on_event("stream_ended")
+                    self._on_event("stream_ended", symbol=symbol)
                     return
                 except Exception as exc:
-                    self._on_event("stream_error", error=exc)
+                    self._on_event("stream_error", symbol=symbol, error=exc)
                     return
                 self._connected = getattr(inner, "connected", True)
                 yield tick

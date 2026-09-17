@@ -22,6 +22,16 @@ def test_format_event_renders_error_kwarg():
     assert format_event("auth_error", error=exc) == f"event=auth_error error={exc!r}"
 
 
+def test_format_event_renders_symbol_first_when_present():
+    # reconnect.py threads symbol=... into every on_event call (fixed
+    # 2026-09-17: with several concurrent independent streams sharing this
+    # one logger, an event with no symbol on it was ambiguous about which
+    # stream it belonged to). No special-casing needed here -- format_event
+    # is already generic over kwargs -- but this documents the contract.
+    assert (format_event("stream_error", symbol="DAIC", error=RuntimeError("boom"))
+            == "event=stream_error symbol='DAIC' error=RuntimeError('boom')")
+
+
 def test_log_event_emits_reconnect_at_info_level(caplog):
     with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
         log_event("reconnect", count=1)

@@ -161,6 +161,26 @@ def test_reconnects_when_inner_stream_errors():
     assert len(h.make_calls) == 2
 
 
+def test_every_event_carries_its_own_symbol():
+    # Found live (2026-09-17): with up to MAX_SYMBOLS independent
+    # ReconnectingStreamSource instances sharing one process-wide
+    # log_event callback, a log line with no symbol on it is ambiguous
+    # about which of the concurrent streams it's even about -- this
+    # directly slowed down a real incident diagnosis. Every event kind
+    # this module emits must carry symbol=<the symbol ticks() was
+    # called with>.
+    h = Harness(
+        inners=[FakeInner([("tick", {"ts": 1}), ("raise", RuntimeError("boom"))]),
+                FakeInner([("tick", {"ts": 2}), ("end",)]),
+                FakeInner([("tick", {"ts": 3}), ("hang", 5)])],
+    )
+    src = h.source()
+    run(collect(src.ticks("DAIC"), 3))
+    assert h.events  # sanity: something actually fired
+    for name, kw in h.events:
+        assert kw.get("symbol") == "DAIC", f"event {name!r} missing/wrong symbol: {kw}"
+
+
 def test_proactive_refresh_fires_before_token_expiry():
     # First token is ~0.05s from its leeway window (expires_at = NOW + 300 + 0.05,
     # leeway 300). The first inner never yields, so the consume loop hits the

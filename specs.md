@@ -346,6 +346,25 @@ process for the call's duration, not just during a storm. Added
 synchronous `refresh()`. `refresh()` itself is unchanged and still used
 directly by anything that isn't running on this process's event loop.
 
+**Stream events weren't tagged by symbol (found live 2026-09-17, fixed):**
+each watched symbol gets its own independent `ReconnectingStreamSource`
+instance (up to `MAX_SYMBOLS`, section 5), but all of them share one
+process-wide `on_event=log_event` callback (`main.py`), and none of
+`reconnect.py`'s `self._on_event(...)` calls passed which symbol the
+event was about — `ticks(self, symbol)` had `symbol` in scope the whole
+time, it just never got threaded through. Found while diagnosing a real
+incident: 3 of 4 watched symbols went stale (no new bars for several
+minutes) after a burst of container restarts; the logs showed exactly
+one `stream_error` ("STREAM CONNECTION NOT FOUND — Please login again")
+followed by a `stale_immediately_after_refresh` backoff, but there was
+no way to tell WHICH of the 3 affected symbols it belonged to from the
+log line alone, slowing down the diagnosis. Fixed by adding
+`symbol=symbol` to every `on_event` call in `ticks()` and
+`_consume_until_stale()` (`test_every_event_carries_its_own_symbol`
+asserts every event kind this module emits carries it). `events.py`
+needed no change — `format_event` was already generic over kwargs, so
+`event=stream_error symbol='DAIC' error=...` just falls out of it.
+
 **Price-history date-range quirk (platform-enforced, confirmed live):**
 `GET /marketdata/v1/pricehistory` (wrapped by schwab-py's
 `get_price_history`), when called with `periodType=day&period=1` and no
