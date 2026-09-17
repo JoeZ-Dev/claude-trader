@@ -511,6 +511,73 @@ Directly contrast with the baseline that motivated this fix (reproduced
 above): one symbol getting the bulk of ticks while the other three got
 0, rotating minute to minute. That rotation is gone.
 
+**Poll replaced with push, both legs (fixed 2026-09-17) — the
+self-inflicted latency stacked on top of the (now-fixed) throttling
+ceiling above.** Once the shared-connection fix above proved Schwab's
+own stream was healthy, a second, separate latency source remained,
+architectural rather than a bug: `monitor-app` polled `schwab-connector`
+(`GET /bars/{symbol}`) every `POLL_INTERVAL` (5s), and the browser polled
+`monitor-app` (`GET /api/state`) every `POLL_MS` (4s) — two independent
+timers stacked on top of each other, ~9s of combined latency on a good
+day, unrelated to anything Schwab-side. Both legs are now genuine push,
+Server-Sent Events specifically (not full websockets — both legs only
+ever flow one direction, narrowly reversing the "no websockets" call
+from phase 1, which was reasonable before there was evidence of a real
+latency problem):
+
+- **`schwab-connector` → `monitor-app`:** new `GET /events` route.
+  `Connector` gets a best-effort pub/sub layer (`subscribe()`/`_notify()`,
+  bounded per-subscriber queue, drop-oldest on overflow) fired from
+  `_drain()` the instant a bar is stored — defensively, so a broken or
+  slow subscriber can never crash or block bar storage (same standard as
+  the tick-diagnostic crash lesson above: instrumentation/notification
+  code must never be able to take down the production message-delivery
+  path it observes). `monitor-app`'s `main.py` gets a matching
+  `stream_events()` — one long-lived task holding the shared SSE
+  connection, with its own purpose-built reconnect/backoff (not
+  `ReconnectingStreamSource`, which is coupled to Schwab-token semantics
+  this internal leg doesn't have).
+- **`monitor-app` → browser:** new `GET /api/state/stream` route,
+  same payload shape as `GET /api/state`, pushed on every state change
+  instead of polled. The browser's `setInterval(refresh, 4000)` is gone,
+  replaced with a native `EventSource('/api/state/stream')` — no manual
+  reconnect logic needed, `EventSource` retries per spec, including
+  across a `monitor-app` restart, and each reconnect's first message is
+  always a fresh full snapshot, not a delta.
+
+`GET /api/state` and the REST `GET /bars/{symbol}` fetch are both kept,
+not removed — a one-shot catch-up (`Poller.catch_up`, still using the
+same REST fetch) still runs once when a symbol is first watched, and
+again for every watched symbol on every stream (re)connect and on poll
+resume (`Poller.resync_all`), closing any gap between "what monitor-app
+has" and "what schwab-connector has stored" the same ts-dedup guard
+(`if not slot.bars or bar["ts"] > slot.bars[-1]["ts"]`) always protected,
+regardless of which path (push or catch-up) a given bar arrives through
+first. `poll_enabled`/`POST /api/polling` keeps its exact original
+meaning — paused means monitor-app stops applying incoming updates,
+`schwab-connector` keeps streaming and storing regardless either way —
+just re-triggered by push instead of a timer tick; resuming calls
+`resync_all()` so nothing pushed during a pause is silently lost. The
+DOM-patch rendering (expand/collapse-state save/restore across a full
+`#symbols` rebuild, from the phase-3.5 fix above) is unchanged in spirit
+either way — a push-triggered render calls the exact same `render(data)`
+a poll-triggered one always called, split out of the old `refresh()`
+verbatim.
+
+Tested at the unit level as a structural, sleep-free proof (per
+AGENT_PROTOCOL.md's no-live-network/no-wall-clock-dependence rule): both
+`Connector._notify` and `Poller.apply_bar_push`/`_broadcast_state` land
+in a subscriber's queue the instant the triggering call returns, no
+`asyncio.sleep` needed to observe it — the actual thing being fixed
+(no timer in the path) is the thing the test proves. `fastapi.
+testclient`'s `httpx` `ASGITransport` fully buffers a response (runs the
+whole ASGI app call to completion) before returning anything, so it can
+never observe partial output from a route that streams until client
+disconnect — both new SSE routes' end-to-end tests drive the ASGI app
+manually (a small `_drive_streaming_route` test helper, in both
+`schwab-connector/tests/test_app.py` and `monitor-app/tests/test_app.py`)
+instead of going through `TestClient.stream()`.
+
 **Price-history date-range quirk (platform-enforced, confirmed live):**
 `GET /marketdata/v1/pricehistory` (wrapped by schwab-py's
 `get_price_history`), when called with `periodType=day&period=1` and no
@@ -591,12 +658,19 @@ principle, with no code living loose at repo root:
   - `GET /bars/{symbol}?since_ts={unix_seconds}` → array of bar objects
     per the shape in section 4.
   - `GET /health` → `{"status": "ok", "watching": [...], "connected": bool}`
+  - `GET /events` → Server-Sent Events, one `event: bar\ndata: {"symbol":
+    ..., "bar": {...}}` per bar stored, for every currently-watched
+    symbol over one shared connection (added 2026-09-17, poll -> push —
+    see section 4). `GET /bars/{symbol}` stays as the one-shot catch-up
+    fetch a fresh subscriber uses to backfill before/around its first
+    push, not removed.
 - **`momentum_monitor/claude-connector/`** — the only container with the
   `claude` CLI's auth mounted in. Shells out to `claude -p` for
   event-triggered narration. Not built until phase 3 (see roadmap below)
   — currently a placeholder directory with a README only.
 - **`momentum_monitor/monitor-app/`** — the FastAPI web app. Holds no
-  credentials. Polls `schwab-connector` for bars, runs them through
+  credentials. Consumes `schwab-connector`'s pushed bars (`GET /events`,
+  poll -> push fixed 2026-09-17 — see section 4), runs them through
   `momentum_monitor/core/`, serves a web view. The only container with a
   port published to the host (`8012`).
 
@@ -651,17 +725,23 @@ principle, with no code living loose at repo root:
   phase 1) — audited specifically to confirm it should stay that way, not
   get scoped per-symbol.
 
-  **Page refresh mechanism (redesigned from a bug, not a style choice):**
+  **Page refresh mechanism (redesigned from a bug, not a style choice;
+  superseded again 2026-09-17 — see section 4's poll -> push entry):**
   the page originally used `<meta http-equiv="refresh" content="5">` — a
   full page reload every 5 seconds. That was never the design (the
   original intent was always in-place JS updates); the full reload was
   the actual cause of visible flicker/redraw, not a matter of taste. It's
   gone, replaced with an inline `<script>`: `setInterval(refresh, 4000)`
-  calls `GET /api/state` and rebuilds the `#symbols` container's innerHTML
+  called `GET /api/state` and rebuilt the `#symbols` container's innerHTML
   in place from the current set of watched symbols (still no meta-refresh,
   no full-page reload — a coarser-grained in-place update than phase 1's
   per-element patching, chosen because the set of symbols itself can
-  change size between polls). The Python side (`app.py`'s `_page`) still
+  change size between polls). That `setInterval` timer is itself gone now
+  too, replaced with a native `EventSource('/api/state/stream')` — the
+  DOM-patch logic it drove (the innerHTML rebuild, described below) is
+  unchanged, only pulled out into its own `render(data)` function so it
+  can be called from either the push path or the still-present explicit
+  post-action `fetch('/api/state')`. The Python side (`app.py`'s `_page`) still
   computes the same real first-paint HTML from current `state`/`journal`
   on every server request — a fresh load shows real data immediately, and
   it keeps server-side rendering meaningfully testable without a browser
@@ -773,26 +853,31 @@ principle, with no code living loose at repo root:
   vertical content, these values remove the padding/font overhead
   multiplied by 4 panels' worth of it.
 
-  **Pause/resume polling — two layers, not one.** A "Pause updates"
-  button next to the ticker box stops polling entirely, but "polling"
-  here means two independent things and the button controls both: (1)
-  the client-side `setInterval` above (browser → `monitor-app`, traffic
-  that never left localhost/the LAN, so pausing it alone saves nothing
-  real), and (2), the one that actually matters, `monitor-app`'s own
-  background `Poller.run()` loop hitting `schwab-connector`'s
-  `GET /bars/{symbol}` on its own `POLL_INTERVAL` (default 5s) —
-  completely independent of any browser activity, and still running even
-  with every browser tab closed until this second layer is paused too.
-  `POST /api/polling {"enabled": bool}` controls the server-side loop;
-  `GET /api/state`'s `poll_enabled` field is the resulting server truth,
-  which the page's JS treats as authoritative (re-syncing its own
-  button/interval to it on every poll) rather than keeping a client-only
+  **Pause/resume — one flag, unchanged meaning, now gating push instead
+  of a timer (originally "two layers", see below).** A "Pause updates"
+  button next to the ticker box calls `POST /api/polling {"enabled":
+  bool}`, which pauses `monitor-app`'s own applying of incoming updates
+  from `schwab-connector` — the flag and route name are unchanged since
+  phase 2, only what they gate changed with the poll -> push fix (section
+  4): originally `Poller.run()`'s background poll loop hitting `GET
+  /bars/{symbol}` on a timer, now `Poller.apply_bar_push()`'s handling of
+  each bar arriving over `GET /events`. `GET /api/state`(`/stream`)'s
+  `poll_enabled` field is still the resulting server truth, still
+  treated as authoritative by the page's JS (re-syncing the toggle
+  button's label on every state update) rather than a client-only
   preference — correct across multiple tabs/devices, not just the one
   that clicked the button. Pausing never touches `schwab-connector`'s own
-  live Schwab stream or its stored bars either way; resuming needs no
-  backfill, just picks polling back up. Verified live (2026-09-16):
-  paused, `bar_count` genuinely stopped advancing for 12 real seconds
-  against the running stack; resumed, it advanced again immediately.
+  live Schwab stream or its stored bars either way; resuming calls
+  `resync_all()`, so anything pushed (and dropped) while paused is caught
+  up via one REST fetch per watched symbol, not lost. (Historical: this
+  used to be described as "two layers" because the browser's own
+  `setInterval` was a second, independent thing the same button also
+  stopped — that layer doesn't exist anymore now that the browser side is
+  push-based too; an `EventSource` connection has nothing to start/stop
+  client-side, it just goes quiet because the server stops broadcasting
+  while paused.) Verified live (2026-09-16, pre-push-fix): paused,
+  `bar_count` genuinely stopped advancing for 12 real seconds against the
+  running stack; resumed, it advanced again immediately.
 - **`momentum_monitor/docker-compose.yml`** — orchestrates all three.
 
 ### 6. Virtual trade journal — momentum_monitor phase 4
