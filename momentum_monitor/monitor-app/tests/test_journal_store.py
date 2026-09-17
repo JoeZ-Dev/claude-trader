@@ -143,3 +143,56 @@ def test_closed_trades_survive_reopening_the_store_over_the_same_file(tmp_path):
     closed = store2.recent_closed()
     assert len(closed) == 1
     assert closed[0]["exit_reason"] == "trailing_stop"
+
+
+# -- deleting closed trades ----------------------------------------------
+
+def test_delete_closed_removes_the_row_and_returns_true(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    pos = store.create(_position(symbol="AEHL"))
+    store.close_position(pos, ExitEvent(exit_ts=200, exit_price=11.0,
+                                        exit_reason="trailing_stop"))
+    (closed,) = store.recent_closed()
+
+    assert store.delete_closed(closed["id"]) is True
+    assert store.recent_closed() == []
+
+
+def test_delete_closed_unknown_id_is_a_noop_returns_false(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    assert store.delete_closed(999) is False
+
+
+def test_delete_closed_never_removes_an_open_position(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    open_pos = store.create(_position(symbol="AEHL"))
+    assert store.delete_closed(open_pos.id) is False
+    assert store.open_position_for("AEHL") is not None
+
+
+def test_delete_symbol_switched_removes_only_those_rows_and_returns_count(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    p1 = store.create(_position(symbol="AEHL"))
+    store.close_position(p1, ExitEvent(exit_ts=100, exit_price=11.0,
+                                       exit_reason="symbol_switched"))
+    p2 = store.create(_position(symbol="MSFT"))
+    store.close_position(p2, ExitEvent(exit_ts=200, exit_price=9.0,
+                                       exit_reason="trailing_stop"))
+    p3 = store.create(_position(symbol="NVDA"))
+    store.close_position(p3, ExitEvent(exit_ts=300, exit_price=12.0,
+                                       exit_reason="symbol_switched"))
+
+    deleted_count = store.delete_symbol_switched()
+
+    assert deleted_count == 2
+    remaining = store.recent_closed()
+    assert [c["symbol"] for c in remaining] == ["MSFT"]
+
+
+def test_delete_symbol_switched_returns_zero_when_none_exist(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    pos = store.create(_position(symbol="AEHL"))
+    store.close_position(pos, ExitEvent(exit_ts=100, exit_price=11.0,
+                                        exit_reason="trailing_stop"))
+    assert store.delete_symbol_switched() == 0
+    assert len(store.recent_closed()) == 1

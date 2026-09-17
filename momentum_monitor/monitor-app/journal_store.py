@@ -112,6 +112,33 @@ class JournalStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def delete_closed(self, trade_id: int) -> bool:
+        """Permanently deletes one CLOSED trade row by id. Returns True if
+        a row was actually removed, False if no closed row with that id
+        existed (a no-op, not an error -- same convention as
+        Poller.remove_symbol's False-on-unknown-symbol). Restricted to
+        closed rows (exit_ts IS NOT NULL) on purpose: deleting an OPEN
+        position's row here would silently desync it from Poller's own
+        in-memory _SymbolSlot.journal_position, which has no way to learn
+        the row vanished underneath it -- this only ever removes history,
+        never an active position."""
+        cur = self._conn.execute(
+            "DELETE FROM trades WHERE id = ? AND exit_ts IS NOT NULL", (trade_id,),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def delete_symbol_switched(self) -> int:
+        """Permanently deletes every CLOSED trade row whose exit_reason is
+        'symbol_switched' -- the bulk "clear housekeeping noise" action
+        (specs.md section 6). Returns the number of rows removed."""
+        cur = self._conn.execute(
+            "DELETE FROM trades WHERE exit_reason = 'symbol_switched' "
+            "AND exit_ts IS NOT NULL",
+        )
+        self._conn.commit()
+        return cur.rowcount
+
 
 def _row_to_position(row: sqlite3.Row) -> OpenPosition:
     return OpenPosition(

@@ -282,6 +282,81 @@ def test_post_watch_eviction_force_closes_the_evicted_symbols_open_position():
         assert store.closed == [("AEHL", "symbol_switched")]
 
 
+# -- deleting journal rows: /api/journal/delete, /api/journal/clear_symbol_switched --
+
+def _seed_closed_trades(store):
+    """Real JournalStore (SQLite over tmp_path), not a fake -- the delete
+    endpoints' own SQL is already unit-tested in test_journal_store.py;
+    these tests only need to prove the HTTP wiring on top of it."""
+    from journal_logic import ExitEvent
+
+    p1 = store.create(_position(symbol="AEHL"))
+    store.close_position(p1, ExitEvent(exit_ts=100, exit_price=11.0,
+                                       exit_reason="trailing_stop"))
+    p2 = store.create(_position(symbol="MSFT"))
+    store.close_position(p2, ExitEvent(exit_ts=200, exit_price=9.0,
+                                       exit_reason="symbol_switched"))
+    p3 = store.create(_position(symbol="NVDA"))
+    store.close_position(p3, ExitEvent(exit_ts=300, exit_price=12.0,
+                                       exit_reason="symbol_switched"))
+    return store.recent_closed()
+
+
+def _position(symbol, entry_ts=0, entry_price=10.0, high_water_mark=10.0, stop_level=9.5):
+    from journal_logic import OpenPosition
+    return OpenPosition(id=None, symbol=symbol, entry_ts=entry_ts,
+                        entry_price=entry_price, high_water_mark=high_water_mark,
+                        stop_level=stop_level)
+
+
+def test_post_journal_delete_removes_one_closed_row(tmp_path):
+    from journal_store import JournalStore
+    store = JournalStore(tmp_path / "journal.db")
+    closed = _seed_closed_trades(store)
+    target_id = next(c["id"] for c in closed if c["symbol"] == "AEHL")
+
+    with _client(FakeFetch({}), symbol=None, journal_store=store) as c:
+        r = c.post("/api/journal/delete", data={"id": str(target_id)})
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+
+    remaining = {c["symbol"] for c in store.recent_closed()}
+    assert remaining == {"MSFT", "NVDA"}
+
+
+def test_post_journal_delete_unknown_id_returns_404(tmp_path):
+    from journal_store import JournalStore
+    store = JournalStore(tmp_path / "journal.db")
+    with _client(FakeFetch({}), symbol=None, journal_store=store) as c:
+        r = c.post("/api/journal/delete", data={"id": "999999"})
+        assert r.status_code == 404
+        assert r.json()["ok"] is False
+
+
+def test_post_journal_delete_non_numeric_id_returns_409():
+    with _client(FakeFetch({}), symbol=None) as c:
+        r = c.post("/api/journal/delete", data={"id": "not-a-number"})
+        assert r.status_code == 409
+        assert r.json()["ok"] is False
+
+
+def test_post_journal_clear_symbol_switched_removes_only_those_rows(tmp_path):
+    from journal_store import JournalStore
+    store = JournalStore(tmp_path / "journal.db")
+    _seed_closed_trades(store)
+
+    with _client(FakeFetch({}), symbol=None, journal_store=store) as c:
+        r = c.post("/api/journal/clear_symbol_switched")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is True
+        assert body["deleted"] == 2
+
+    remaining = store.recent_closed()
+    assert [c["symbol"] for c in remaining] == ["AEHL"]
+    assert remaining[0]["exit_reason"] == "trailing_stop"
+
+
 def test_post_unwatch_removes_a_symbol():
     unwatched = []
 
@@ -513,10 +588,29 @@ def test_root_page_renders_closest_setup_and_chips_for_other_candidates():
             assert "setup-chip" in page
 
 
+def test_root_page_collapses_resistance_and_support_behind_chips():
+    # The raw resistance/support tables must not render always-open --
+    # they're collapsed behind the same setup-chip/setup-detail pattern
+    # as the other setup types, cut down from phase 3.5's always-open
+    # design. No "<h3>Resistance (nearest above) @ ..." heading form
+    # should appear at all; a "Resistance (nearest above) @ ..." CHIP
+    # button, immediately followed by a hidden detail div, should.
+    fetch = FakeFetch({"AEHL": [_bars(5)]})
+    with _client(fetch, symbol="AEHL") as c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        page = c.get("/").text
+        assert "<h3>Resistance (nearest above)" not in page
+        assert "<h3>Support (nearest below)" not in page
+        assert "class='setup-chip'>Resistance (nearest above)" in page or \
+            "class='setup-chip' disabled>Resistance (nearest above)" in page
+        assert "class='setup-chip'>Support (nearest below)" in page or \
+            "class='setup-chip' disabled>Support (nearest below)" in page
+
+
 # -- closed-trades table: symbol_switched rows visually muted ------------
 
-def _closed_row(symbol, exit_reason, pnl=1.0):
-    return {"symbol": symbol, "entry_price": 10.0, "exit_price": 10.1,
+def _closed_row(symbol, exit_reason, pnl=1.0, trade_id=1):
+    return {"id": trade_id, "symbol": symbol, "entry_price": 10.0, "exit_price": 10.1,
             "exit_reason": exit_reason, "realized_pnl_pct": pnl}
 
 
@@ -538,3 +632,14 @@ def test_trailing_stop_rows_are_not_muted_and_keep_pos_neg_coloring():
     assert "row-housekeeping" not in rows
     assert "<td class='pos'>2.50%</td>" in rows
     assert "<td class='neg'>-1.00%</td>" in rows
+
+
+def test_closed_row_has_a_delete_button_scoped_to_its_own_trade_id():
+    rows = _journal_closed_rows_html([_closed_row("AEHL", "trailing_stop", trade_id=42)])
+    assert "class='remove-btn journal-delete-btn' data-trade-id='42'" in rows
+
+
+def test_root_page_has_a_bulk_clear_symbol_switched_button():
+    with _client(FakeFetch({"AEHL": [_bars(3)]})) as c:
+        page = c.get("/").text
+        assert "id=\"clear-symbol-switched-btn\"" in page

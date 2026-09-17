@@ -47,6 +47,20 @@ math N times, not different math) after every poll. Serves:
                         background poll loop for ALL watched symbols at
                         once (one global switch, not per-symbol) -- see
                         Poller.set_poll_enabled.
+  POST /api/journal/delete -> {"id": "..."} (urlencoded form) permanently
+                        deletes ONE closed trade row from the SQLite
+                        journal (never an open position -- see
+                        JournalStore.delete_closed). 200 {"ok": true} on
+                        success, 404 {"ok": false} for an unknown id, 409
+                        for a non-numeric one. The page's own JS gates the
+                        call behind a confirm() dialog; this endpoint
+                        trusts the caller already got that confirmation.
+  POST /api/journal/clear_symbol_switched -> permanently deletes EVERY
+                        symbol_switched closed row in one call (the bulk
+                        "clear housekeeping noise" action, specs.md
+                        section 6) -> {"ok": true, "deleted": <count>}.
+                        Same confirm()-before-calling convention as the
+                        per-row delete above.
 
 create_app() takes fetch_bars / announce_watch / announce_unwatch as
 callables so tests inject fakes; main.py binds them to httpx calls against
@@ -213,6 +227,23 @@ class Poller:
         if self._journal_store is None:
             return []
         return self._journal_store.recent_closed(limit=limit)
+
+    def delete_closed_trade(self, trade_id: int) -> bool:
+        """Permanently deletes one closed trade row. False (a no-op) if
+        journaling is disabled or no closed row with that id exists --
+        see JournalStore.delete_closed for why this can never touch an
+        open position."""
+        if self._journal_store is None:
+            return False
+        return self._journal_store.delete_closed(trade_id)
+
+    def clear_symbol_switched(self) -> int:
+        """Permanently deletes every symbol_switched closed row (the bulk
+        housekeeping-cleanup action, specs.md section 6). Returns the
+        number removed."""
+        if self._journal_store is None:
+            return 0
+        return self._journal_store.delete_symbol_switched()
 
     def _journal_open_for(self, slot: _SymbolSlot) -> dict | None:
         if slot.journal_position is None:
@@ -509,17 +540,13 @@ def _setup_chips_html(others: list[dict]) -> str:
     return "".join(parts)
 
 
-def _level_block_html(title: str, block: dict | None) -> str:
-    if block is None:
-        return f"<h3>{html.escape(title)}</h3><p class='muted'>none on this side of price</p>"
+def _level_rows_html(block: dict) -> str:
     c, h = block["components"], block["hold"]
     badge = (
         "<span class='badge badge-confirmed'>confirmed</span>" if h["confirmed"]
         else "<span class='badge badge-pending'>not confirmed</span>"
     )
     return (
-        f"<h3>{html.escape(title)} @ {_fmt(block['price'], 2)}</h3>"
-        "<table class='detail'>"
         f"<tr><th>strength</th><td>{_fmt(block['strength_score'], 2)}</td></tr>"
         f"<tr><th>touch count</th><td>{c['touch_count']}</td></tr>"
         f"<tr><th>touch volume</th><td>{_fmt(c['total_touch_volume'], 0)}</td></tr>"
@@ -528,7 +555,37 @@ def _level_block_html(title: str, block: dict | None) -> str:
         f"<tr><th>consecutive closes</th><td>{h['consecutive_bars']} / {h['required_bars']}</td></tr>"
         f"<tr><th>hold confirmed</th><td>{badge}</td></tr>"
         f"<tr><th>failed attempts</th><td>{h['failed_attempts']}</td></tr>"
-        "</table>"
+    )
+
+
+def _level_block_html(title: str, block: dict | None) -> str:
+    """Collapsed by default behind the same click-to-expand chip pattern
+    as the other three setup-type candidates (phase 3.5's setup-chip /
+    setup-detail, reusing the exact same generic click handler -- no new
+    JS wiring needed). The closest-setup callout already shows resistance
+    breakout in full when that's the closest type, so an always-open raw
+    table here duplicated the same information by default; now one click
+    away instead of always taking the vertical space."""
+    if block is None:
+        return (
+            "<button type='button' class='setup-chip' disabled>"
+            f"{html.escape(title)}: none on this side of price</button>"
+        )
+    return (
+        f"<button type='button' class='setup-chip'>{html.escape(title)} "
+        f"@ {_fmt(block['price'], 2)}</button>"
+        "<div class='setup-detail' hidden><table class='detail'>"
+        f"{_level_rows_html(block)}"
+        "</table></div>"
+    )
+
+
+def _level_chips_html(resistance: dict | None, support: dict | None) -> str:
+    return (
+        "<div class='setup-chips'>"
+        f"{_level_block_html('Resistance (nearest above)', resistance)}"
+        f"{_level_block_html('Support (nearest below)', support)}"
+        "</div>"
     )
 
 
@@ -549,7 +606,7 @@ def _journal_open_html(open_block: dict | None) -> str:
 
 def _journal_closed_rows_html(closed: list[dict]) -> str:
     if not closed:
-        return "<tr><td colspan='5' class='muted'>No closed trades yet.</td></tr>"
+        return "<tr><td colspan='6' class='muted'>No closed trades yet.</td></tr>"
     rows = []
     for t in closed:
         # symbol_switched isn't a trading outcome -- it's watchlist
@@ -568,6 +625,8 @@ def _journal_closed_rows_html(closed: list[dict]) -> str:
             f"<td>{_fmt(t['entry_price'], 2)}</td><td>{_fmt(t['exit_price'], 2)}</td>"
             f"<td>{html.escape(str(t['exit_reason']))}</td>"
             f"<td class='{cls}'>{pnl}</td>"
+            "<td><button type='button' class='remove-btn journal-delete-btn' "
+            f"data-trade-id='{t['id']}'>delete</button></td>"
             "</tr>"
         )
     return "".join(rows)
@@ -619,8 +678,7 @@ def _symbol_card_html(symbol: str, state: dict) -> str:
   {_setup_chips_html(others)}
   <h3>Virtual position</h3>
   {_journal_open_html(state["journal"]["open"])}
-  {_level_block_html("Resistance (nearest above)", state["levels"]["resistance"])}
-  {_level_block_html("Support (nearest below)", state["levels"]["support"])}
+  {_level_chips_html(state["levels"]["resistance"], state["levels"]["support"])}
 </section>
 """
 
@@ -648,9 +706,12 @@ def _page(full_states: dict[str, dict], recent_closed: list[dict], poll_enabled:
 {_watch_form_html(len(full_states), max_symbols)}
 <div id="symbols" class="grid">{cards_html}</div>
 <section class="card">
-  <h2>Recent closed trades</h2>
+  <div class="hero">
+    <h2>Recent closed trades</h2>
+    <button type="button" id="clear-symbol-switched-btn" class="remove-btn">clear symbol_switched rows</button>
+  </div>
   <table class="detail">
-    <tr><th>symbol</th><th>entry</th><th>exit</th><th>reason</th><th>P&amp;L %</th></tr>
+    <tr><th>symbol</th><th>entry</th><th>exit</th><th>reason</th><th>P&amp;L %</th><th></th></tr>
     <tbody id="journal-closed-tbody">{_journal_closed_rows_html(recent_closed)}</tbody>
   </table>
 </section>
@@ -698,25 +759,37 @@ function esc(s) {
   d.textContent = String(s);
   return d.innerHTML;
 }
-function levelBlockHtml(title, block) {
-  if (!block) {
-    return '<h3>' + esc(title) + '</h3><p class="muted">none on this side of price</p>';
-  }
+function levelRows(block) {
   const h = block.hold, c = block.components;
   const badge = h.confirmed
     ? '<span class="badge badge-confirmed">confirmed</span>'
     : '<span class="badge badge-pending">not confirmed</span>';
-  return '<h3>' + esc(title) + ' @ ' + fmt(block.price, 2) + '</h3>' +
-    '<table class="detail">' +
-    '<tr><th>strength</th><td>' + fmt(block.strength_score, 2) + '</td></tr>' +
+  return '<tr><th>strength</th><td>' + fmt(block.strength_score, 2) + '</td></tr>' +
     '<tr><th>touch count</th><td>' + c.touch_count + '</td></tr>' +
     '<tr><th>touch volume</th><td>' + fmt(c.total_touch_volume, 0) + '</td></tr>' +
     '<tr><th>round-number bonus</th><td>' + fmt(c.round_number_bonus, 2) + '</td></tr>' +
     '<tr><th>hold direction</th><td>' + esc(h.direction) + '</td></tr>' +
     '<tr><th>consecutive closes</th><td>' + h.consecutive_bars + ' / ' + h.required_bars + '</td></tr>' +
     '<tr><th>hold confirmed</th><td>' + badge + '</td></tr>' +
-    '<tr><th>failed attempts</th><td>' + h.failed_attempts + '</td></tr>' +
-    '</table>';
+    '<tr><th>failed attempts</th><td>' + h.failed_attempts + '</td></tr>';
+}
+// Collapsed by default behind the same setup-chip/setup-detail toggle
+// pattern as the other three setup-type candidates -- see the Python
+// side's _level_block_html for why.
+function levelBlockHtml(title, block) {
+  if (!block) {
+    return '<button type="button" class="setup-chip" disabled>' + esc(title) +
+      ': none on this side of price</button>';
+  }
+  return '<button type="button" class="setup-chip">' + esc(title) + ' @ ' +
+    fmt(block.price, 2) + '</button>' +
+    '<div class="setup-detail" hidden><table class="detail">' + levelRows(block) + '</table></div>';
+}
+function levelChipsHtml(resistance, support) {
+  return '<div class="setup-chips">' +
+    levelBlockHtml('Resistance (nearest above)', resistance) +
+    levelBlockHtml('Support (nearest below)', support) +
+    '</div>';
 }
 function journalOpenHtml(open) {
   if (!open) return '<p class="muted">No open virtual position.</p>';
@@ -730,7 +803,7 @@ function journalOpenHtml(open) {
 }
 function journalClosedRows(closed) {
   if (!closed || !closed.length) {
-    return '<tr><td colspan="5" class="muted">No closed trades yet.</td></tr>';
+    return '<tr><td colspan="6" class="muted">No closed trades yet.</td></tr>';
   }
   return closed.map(function(t) {
     // symbol_switched = watchlist housekeeping, not a trading outcome --
@@ -742,7 +815,9 @@ function journalClosedRows(closed) {
     const rowOpen = isHousekeeping ? '<tr class="row-housekeeping">' : '<tr>';
     return rowOpen + '<td>' + esc(t.symbol) + '</td><td>' + fmt(t.entry_price, 2) + '</td>' +
       '<td>' + fmt(t.exit_price, 2) + '</td><td>' + esc(t.exit_reason) + '</td>' +
-      '<td class="' + cls + '">' + pnl + '</td></tr>';
+      '<td class="' + cls + '">' + pnl + '</td>' +
+      '<td><button type="button" class="remove-btn journal-delete-btn" data-trade-id="' +
+      esc(t.id) + '">delete</button></td></tr>';
   }).join('');
 }
 function removeButtonHtml(symbol) {
@@ -826,8 +901,7 @@ function symbolCardHtml(symbol, state) {
     closestSetupHtml(closest) +
     setupChipsHtml(others) +
     '<h3>Virtual position</h3>' + journalOpenHtml(state.journal.open) +
-    levelBlockHtml('Resistance (nearest above)', state.levels.resistance) +
-    levelBlockHtml('Support (nearest below)', state.levels.support) +
+    levelChipsHtml(state.levels.resistance, state.levels.support) +
     '</section>';
 }
 async function refresh() {
@@ -923,6 +997,47 @@ document.getElementById('symbols').addEventListener('click', async function (e) 
   refresh();
 });
 
+// Per-row journal delete: delegated on #journal-closed-tbody (the tbody
+// element itself persists across refresh()'s innerHTML rebuild, same
+// reasoning as #symbols above). This is a PERMANENT SQLite delete --
+// confirm() first, same "never silently delete" standard the rest of
+// this project holds to (specs.md).
+document.getElementById('journal-closed-tbody').addEventListener('click', async function (e) {
+  const btn = e.target.closest('.journal-delete-btn');
+  if (!btn) return;
+  if (!confirm('Permanently delete this closed trade row?')) return;
+  const tradeId = btn.getAttribute('data-trade-id');
+  btn.disabled = true;
+  try {
+    await fetch('/api/journal/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'id=' + encodeURIComponent(tradeId),
+    });
+  } catch (err) {
+    // leave the row as-is; the next poll reflects actual state either way
+  }
+  refresh();
+});
+
+// Bulk clear: NOT delegated -- this button lives outside #symbols/
+// #journal-closed-tbody, in the part of the page refresh() never
+// replaces, so a direct one-time binding is enough (same as the poll
+// toggle button below). Also a permanent SQLite delete -- confirm() first.
+document.getElementById('clear-symbol-switched-btn').addEventListener('click', async function () {
+  if (!confirm('Permanently delete ALL symbol_switched closed-trade rows?')) return;
+  const btn = this;
+  btn.disabled = true;
+  try {
+    await fetch('/api/journal/clear_symbol_switched', { method: 'POST' });
+  } catch (err) {
+    // leave the table as-is; the next poll reflects actual state either way
+  } finally {
+    btn.disabled = false;
+  }
+  refresh();
+});
+
 // Pause/resume BOTH the client-side display loop AND (via POST
 // /api/polling) monitor-app's own server-side poller -- the client loop
 // alone only stops browser<->monitor-app traffic, which never left
@@ -974,8 +1089,8 @@ _STYLE = """
 *{box-sizing:border-box}
 body{font:15px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
   margin:0;padding:1.5rem;background:var(--bg);color:var(--text);
-  max-width:76rem;margin-inline:auto}
-h1,h2,h3{margin:0 0 .5rem}
+  max-width:84rem;margin-inline:auto}
+h1,h2,h3{margin:0 0 .35rem}
 h2{font-size:.95rem;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
 h3{font-size:.9rem;color:var(--text)}
 .topbar{display:flex;align-items:center;justify-content:space-between;
@@ -995,35 +1110,54 @@ h3{font-size:.9rem;color:var(--text)}
 #watch-status.neg{color:var(--neg);font-weight:600}
 .banner{background:var(--pending);color:#1a1400;padding:.6rem 1rem;
   border-radius:.4rem;margin-bottom:1rem;font-weight:600}
-.grid{display:grid;grid-template-columns:repeat(auto-fit, minmax(22rem, 1fr));
-  gap:1rem;margin-bottom:1rem}
+/* Genuine 4-column grid at normal desktop widths, not auto-fit/auto-fill
+   wrapping to 3 whenever columns want more room than the viewport has --
+   that mismatch (22rem minimum column vs. the width 4 of them actually
+   had available) was the real bug behind panels appearing to "go
+   missing": the data was always there, a 4th panel was just wrapped
+   below the fold. repeat(4, 1fr) forces the real column count instead of
+   leaving it to chance; the two breakpoints below are where 4 genuinely-
+   narrow columns (~15rem, still legible for this page's dense content)
+   stop fitting, not arbitrary round numbers -- see specs.md section 5
+   for the arithmetic. */
+.grid{display:grid;grid-template-columns:repeat(4, 1fr);
+  gap:.75rem;margin-bottom:1rem}
+@media (max-width: 68rem){
+  .grid{grid-template-columns:repeat(2, 1fr)}
+}
+@media (max-width: 38rem){
+  .grid{grid-template-columns:1fr}
+}
 .card{background:var(--card);border:1px solid var(--border);
-  border-radius:.6rem;padding:1rem 1.2rem}
-.hero{display:flex;align-items:baseline;gap:1rem}
-.hero-symbol{font-size:1.4rem;font-weight:700;letter-spacing:.02em}
-.hero-price{font-size:2.4rem;font-weight:700;font-variant-numeric:tabular-nums;flex:1}
+  border-radius:.6rem;padding:.75rem .9rem}
+.hero{display:flex;align-items:baseline;gap:.6rem}
+.hero-symbol{font-size:1.15rem;font-weight:700;letter-spacing:.02em}
+.hero-price{font-size:1.9rem;font-weight:700;font-variant-numeric:tabular-nums;flex:1}
 .remove-btn{background:transparent;color:var(--muted);
-  border:1px solid var(--border);border-radius:.4rem;padding:.25rem .6rem;
-  font-size:.78rem;cursor:pointer;align-self:center}
+  border:1px solid var(--border);border-radius:.4rem;padding:.2rem .5rem;
+  font-size:.72rem;cursor:pointer;align-self:center}
 .remove-btn:hover{color:var(--neg);border-color:var(--neg)}
 table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
-table.detail th,table.detail td{padding:.3rem .5rem;text-align:left;
-  border-bottom:1px solid var(--border);font-size:.9rem}
+table.detail th,table.detail td{padding:.2rem .4rem;text-align:left;
+  border-bottom:1px solid var(--border);font-size:.82rem;line-height:1.25}
 table.detail th{color:var(--muted);font-weight:500;width:45%}
 .pos{color:var(--pos);font-weight:600}
 .neg{color:var(--neg);font-weight:600}
 .muted{color:var(--muted)}
 .badge{display:inline-block;padding:.1rem .5rem;border-radius:1rem;
-  font-size:.78rem;font-weight:600}
+  font-size:.72rem;font-weight:600}
 .badge-confirmed{background:rgba(62,207,126,.18);color:var(--pos)}
 .badge-pending{background:rgba(201,162,39,.18);color:var(--pending)}
-.setup-chips{display:flex;flex-wrap:wrap;gap:.4rem;margin:.4rem 0 .8rem}
+.setup-chips{display:flex;flex-wrap:wrap;gap:.3rem;margin:.3rem 0 .5rem}
 .setup-chip{background:var(--bg);color:var(--text);border:1px solid var(--border);
-  border-radius:1rem;padding:.25rem .7rem;font-size:.78rem;cursor:pointer}
+  border-radius:1rem;padding:.2rem .6rem;font-size:.72rem;cursor:pointer}
 .setup-chip:hover{border-color:var(--accent)}
-.setup-detail{margin:.3rem 0 .6rem;padding:.5rem .6rem;
+.setup-chip:disabled{opacity:.5;cursor:default}
+.setup-chip:disabled:hover{border-color:var(--border)}
+.setup-detail{margin:.25rem 0 .5rem;padding:.4rem .5rem;
   background:var(--bg);border:1px solid var(--border);border-radius:.4rem}
 .row-housekeeping td{color:var(--muted)}
+.journal-delete-btn{padding:.15rem .45rem;font-size:.68rem}
 .footer{color:var(--muted);font-size:.8rem;margin-top:1rem}
 """
 
@@ -1111,5 +1245,29 @@ def create_app(*, fetch_bars, watch_symbol=None, poll_interval: float = 5.0,
         body = await request.json()
         poller.set_poll_enabled(bool(body.get("enabled", True)))
         return JSONResponse({"poll_enabled": poller.poll_enabled})
+
+    @app.post("/api/journal/delete")
+    async def api_journal_delete(request: Request):
+        # Permanently deletes one CLOSED trade row -- the page's own JS
+        # gates this behind a confirm() dialog before ever calling it
+        # (same "never silently delete" standard as everything else in
+        # this project), but the endpoint itself doesn't re-implement that
+        # UI-level confirmation; it trusts the caller already got it.
+        body = (await request.body()).decode()
+        raw_id = (parse_qs(body).get("id") or [""])[0]
+        try:
+            trade_id = int(raw_id)
+        except ValueError:
+            return JSONResponse(
+                {"ok": False, "reason": f"{raw_id!r} is not a valid trade id"},
+                status_code=409,
+            )
+        deleted = poller.delete_closed_trade(trade_id)
+        return JSONResponse({"ok": deleted}, status_code=200 if deleted else 404)
+
+    @app.post("/api/journal/clear_symbol_switched")
+    async def api_journal_clear_symbol_switched():
+        deleted = poller.clear_symbol_switched()
+        return JSONResponse({"ok": True, "deleted": deleted})
 
     return app

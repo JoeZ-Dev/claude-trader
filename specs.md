@@ -515,8 +515,8 @@ principle, with no code living loose at repo root:
   components and hold-confirmation's consecutive-bars/failed-attempts
   detail are exactly as visible as before, just better laid out.
 
-  **Multi-panel grid (phase 2 Stage B, built).** `#symbols` is a
-  responsive CSS grid (`auto-fit, minmax(22rem, 1fr)`), one card per
+  **Multi-panel grid (phase 2 Stage B, built; grid mechanics fixed
+  2026-09-17 — see below).** `#symbols` is a CSS grid, one card per
   watched symbol, each showing exactly what phase 1's single card showed
   (price, indicators, levels, virtual position) plus its own `remove`
   button scoped to that panel's own symbol (`data-symbol`, wired via
@@ -548,6 +548,51 @@ principle, with no code living loose at repo root:
   four hand-written table layouts, since the "don't collapse into a
   score" principle only requires each factor to stay visible, not a
   bespoke layout per type.
+
+  **Resistance/support collapsed behind the same chip pattern (fixed
+  2026-09-17).** The raw resistance/support tables used to render always-
+  open, directly duplicating whatever the closest-setup callout above
+  them already shows in full whenever that closest type happens to be
+  resistance breakout. They're now collapsed behind the exact same
+  setup-chip/setup-detail toggle the other three setup types use
+  (`_level_block_html`/`levelBlockHtml`, reusing the SAME generic click
+  handler — no new JS wiring needed for this). Meaningfully cuts default
+  panel height without losing anything; still one click away.
+
+  **Genuine 4-column grid + tighter density (fixed 2026-09-17 — found
+  live: a real 4th watched symbol, DAIC, was confirmed present and
+  healthy in `/api/state` but not visible on the page without scrolling
+  past the fold).** Root cause: `.grid` used `grid-template-columns:
+  repeat(auto-fit, minmax(22rem, 1fr))` — at the page's then-`max-width`
+  of 76rem (minus padding, ~73rem of actual content width), four 22rem
+  columns plus three 1rem gaps need 91rem, so auto-fit silently wrapped
+  to 3 columns at completely ordinary desktop widths. Not a data bug —
+  DAIC was always in the response — a layout bug that LOOKED like a
+  missing panel. Fixed by targeting the real column count directly
+  (`repeat(4, 1fr)`) instead of leaving it to auto-fit's own arithmetic,
+  with breakpoints down to fewer columns only when 4 genuinely can't fit
+  at a legible width anymore:
+  - `body` `max-width`: `76rem` → `84rem` (more room to work with on
+    normal desktop monitors, still comfortably narrower than a 1366px-
+    wide laptop's viewport).
+  - `.grid` `gap`: `1rem` → `.75rem`; `.card` `padding`: `1rem 1.2rem` →
+    `.75rem .9rem` — both trimmed to reclaim width/height for content,
+    not decoration.
+  - Below **68rem** viewport width, 4 columns of ~15rem (the minimum
+    this page's dense content stays legible at) no longer fit — drops to
+    2 columns. Below **38rem** (phone width), drops to 1.
+  - Secondary/label text tightened for vertical density: `table.detail`
+    cell padding `.3rem .5rem` → `.2rem .4rem`, font-size `.9rem` →
+    `.82rem`, `line-height: 1.25` added. Heading margins (`h1,h2,h3`)
+    `.5rem` → `.35rem`. `.hero-price` `2.4rem` → `1.9rem`, `.hero-symbol`
+    `1.4rem` → `1.15rem` (still the headline number, just no longer
+    sized for a single-symbol page multiplied by 4). `.setup-chip`/
+    `.badge` font-size `.78rem` → `.72rem`, `.setup-chips` margin
+    `.4rem 0 .8rem` → `.3rem 0 .5rem`.
+  These, combined with the resistance/support collapse above, are what
+  actually fixed the "mostly scrolling" complaint — the collapse removes
+  vertical content, these values remove the padding/font overhead
+  multiplied by 4 panels' worth of it.
 
   **Pause/resume polling — two layers, not one.** A "Pause updates"
   button next to the ticker box stops polling entirely, but "polling"
@@ -681,6 +726,31 @@ open), `realized_pnl_pct` (nullable while open).
 position + live unrealized P&L%, plus up to 10 recent closed trades, all
 symbols, most recent first); the HTML page gets a matching plain-table
 section, same style as the existing levels tables — no new framework.
+
+**Deleting closed-trade rows (added 2026-09-17).** Trade history is
+real, permanent SQLite data — journal noise from testing was piling up
+with no way to clear it. Two endpoints, both irreversible deletes, both
+gated behind a `confirm()` dialog client-side before the page ever calls
+them (never a silent delete, same standard this project holds
+everywhere else — see the momentum_monitor phase-2 eviction work):
+- `POST /api/journal/delete {"id": "..."}` — deletes ONE closed row by
+  id (`JournalStore.delete_closed`). Scoped to closed rows only
+  (`exit_ts IS NOT NULL`) — deliberately CANNOT delete an open position,
+  since that would silently desync it from `Poller`'s own in-memory
+  `_SymbolSlot.journal_position`, which has no way to learn the row
+  vanished underneath it. A small `delete` button, same styling as the
+  existing per-panel `remove` control, sits on each closed-trades row.
+- `POST /api/journal/clear_symbol_switched` — deletes EVERY
+  `symbol_switched` closed row in one call (`JournalStore.
+  delete_symbol_switched`), returning the count removed. The specific,
+  real cleanup this was built for: most of the accumulated history by
+  volume was `symbol_switched` housekeeping noise from testing multi-
+  symbol eviction/removal, not real `trailing_stop` outcomes. A single
+  "clear symbol_switched rows" button sits next to the "Recent closed
+  trades" heading.
+Both routes are pure HTTP-wiring around already-unit-tested SQLite
+methods (`test_journal_store.py`) — no new deletion logic invented at
+the app layer.
 
 ### 7. Roadmap / phases
 
