@@ -237,6 +237,21 @@ def test_build_state_hold_confirmation_uses_only_live_cadence_bars():
         assert block["hold"]["confirmed"] == expected.confirmed
 
 
+# -- setups (phase 3.5) -------------------------------------------------
+
+def test_build_state_includes_setups_sorted_ascending_by_distance():
+    bars = _load_demo_session()
+    setups = build_state(bars, symbol="AEHL")["setups"]
+    assert isinstance(setups, list)
+    distances = [s["distance"] for s in setups]
+    assert distances == sorted(distances)
+    for s in setups:
+        assert set(s) == {"setup_type", "trigger_price", "distance", "hold", "factors"}
+        assert s["setup_type"] in {
+            "resistance_breakout", "micro_breakout", "vwap_reclaim", "round_number_reclaim",
+        }
+
+
 def test_session_bars_for_vwap_slices_to_latest_ny_date():
     day1 = 1756909800            # 2025-09-03 10:30 ET
     day2 = day1 + 24 * 3600      # next day, same clock time

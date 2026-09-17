@@ -488,3 +488,26 @@ def test_root_page_renders_a_card_per_watched_symbol():
         page = c.get("/").text
         assert "AEHL" in page
         assert "S2" in page
+
+
+def test_root_page_renders_closest_setup_and_chips_for_other_candidates():
+    # round_number_reclaim is always computable (no gating condition, per
+    # setup_types.py), so an "ok" symbol always has at least one setup
+    # candidate -- "Closest setup" must never show the empty-state text.
+    fetch = FakeFetch({"AEHL": [_bars(5)]})
+    with _client(fetch, symbol="AEHL") as c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        state = _sym_state(c, "AEHL")
+        assert len(state["setups"]) >= 1
+
+        page = c.get("/").text
+        # "Closest setup: <label> @ ..." is the non-empty-state render;
+        # the bare "Closest setup</h3><p class='muted'>none currently
+        # watchable" empty-state markup is checked separately below.
+        # (The literal empty-state STRING also appears unconditionally
+        # inside the embedded JS mirror's source text -- see closestSetupHtml
+        # in _SCRIPT -- so "not in page" alone would be a false positive.)
+        assert "Closest setup: " in page
+        assert "<p class='muted'>none currently watchable</p>" not in page
+        if len(state["setups"]) > 1:
+            assert "setup-chip" in page

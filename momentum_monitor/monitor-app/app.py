@@ -429,6 +429,86 @@ def _cmp_class(a, b) -> str:
     return "pos" if a >= b else "neg"
 
 
+_SETUP_TYPE_LABELS = {
+    "resistance_breakout": "Resistance breakout",
+    "micro_breakout": "Micro-breakout",
+    "vwap_reclaim": "VWAP pullback-reclaim",
+    "round_number_reclaim": "Round-number reclaim",
+}
+
+
+def _humanize_key(key: str) -> str:
+    return key.replace("_", " ")
+
+
+def _setup_hold_and_factor_rows_html(setup: dict) -> str:
+    """Hold-state rows (same shape/labels as _level_block_html's) followed
+    by that setup type's OWN factors, rendered generically from whatever
+    keys core/setup_types.py put in `factors` -- one renderer shared by
+    all four types rather than four hand-written layouts, since "don't
+    collapse into a score" only requires showing each factor separately,
+    not a bespoke table per type."""
+    h = setup["hold"]
+    badge = (
+        "<span class='badge badge-confirmed'>confirmed</span>" if h["confirmed"]
+        else "<span class='badge badge-pending'>not confirmed</span>"
+    )
+    rows = [
+        f"<tr><th>hold direction</th><td>{html.escape(h['direction'])}</td></tr>",
+        f"<tr><th>consecutive closes</th><td>{h['consecutive_bars']} / {h['required_bars']}</td></tr>",
+        f"<tr><th>hold confirmed</th><td>{badge}</td></tr>",
+        f"<tr><th>failed attempts</th><td>{h['failed_attempts']}</td></tr>",
+    ]
+    for key, value in setup["factors"].items():
+        if isinstance(value, bool):
+            v = "yes" if value else "no"
+        elif isinstance(value, float):
+            v = _fmt(value, 4)
+        else:
+            v = html.escape(str(value))
+        rows.append(f"<tr><th>{html.escape(_humanize_key(key))}</th><td>{v}</td></tr>")
+    return "".join(rows)
+
+
+def _closest_setup_html(setup: dict | None) -> str:
+    """The single closest (smallest dollar-distance-to-trigger) setup
+    candidate, same visual weight as the resistance/support tables below
+    it -- the headline read, not a footnote."""
+    if setup is None:
+        return "<h3>Closest setup</h3><p class='muted'>none currently watchable</p>"
+    label = _SETUP_TYPE_LABELS.get(setup["setup_type"], setup["setup_type"])
+    return (
+        f"<h3>Closest setup: {html.escape(label)} @ {_fmt(setup['trigger_price'], 2)} "
+        f"(${_fmt(setup['distance'], 2)} away)</h3>"
+        "<table class='detail'>"
+        f"{_setup_hold_and_factor_rows_html(setup)}"
+        "</table>"
+    )
+
+
+def _setup_chips_html(others: list[dict]) -> str:
+    """The remaining (non-closest) setup candidates as compact chips --
+    type name + dollar distance only -- each immediately followed by its
+    own initially-hidden detail table, toggled by a click handler
+    delegated on #symbols (see _SCRIPT). Hidden markup ships in the same
+    render rather than being fetched on click, since all the data is
+    already in `state` -- no round trip needed to expand one."""
+    if not others:
+        return ""
+    parts = ["<div class='setup-chips'>"]
+    for setup in others:
+        label = _SETUP_TYPE_LABELS.get(setup["setup_type"], setup["setup_type"])
+        parts.append(
+            "<button type='button' class='setup-chip'>"
+            f"{html.escape(label)} &middot; ${_fmt(setup['distance'], 2)}</button>"
+            "<div class='setup-detail' hidden><table class='detail'>"
+            f"{_setup_hold_and_factor_rows_html(setup)}"
+            "</table></div>"
+        )
+    parts.append("</div>")
+    return "".join(parts)
+
+
 def _level_block_html(title: str, block: dict | None) -> str:
     if block is None:
         return f"<h3>{html.escape(title)}</h3><p class='muted'>none on this side of price</p>"
@@ -507,6 +587,8 @@ def _symbol_card_html(symbol: str, state: dict) -> str:
     price_cls = _cmp_class(state["last_price"], s["vwap"])
     ema9_cls = _cmp_class(state["last_price"], s["ema9"])
     hist_cls = _sign_class(s["macd"]["histogram"])
+    setups = state.get("setups") or []
+    closest, others = (setups[0], setups[1:]) if setups else (None, [])
     return f"""
 <section class="card" data-symbol="{sym}">
   <div class="hero">
@@ -525,6 +607,8 @@ def _symbol_card_html(symbol: str, state: dict) -> str:
     <tr><th>MACD histogram</th><td class="{hist_cls}">{_fmt(s['macd']['histogram'], 6)}</td></tr>
     <tr><th>Relative volume</th><td>{_fmt(s['relative_volume'], 2)}</td></tr>
   </table>
+  {_closest_setup_html(closest)}
+  {_setup_chips_html(others)}
   <h3>Virtual position</h3>
   {_journal_open_html(state["journal"]["open"])}
   {_level_block_html("Resistance (nearest above)", state["levels"]["resistance"])}
@@ -651,6 +735,52 @@ function journalClosedRows(closed) {
 function removeButtonHtml(symbol) {
   return '<button type="button" class="remove-btn" data-symbol="' + esc(symbol) + '">remove</button>';
 }
+var SETUP_TYPE_LABELS = {
+  resistance_breakout: 'Resistance breakout',
+  micro_breakout: 'Micro-breakout',
+  vwap_reclaim: 'VWAP pullback-reclaim',
+  round_number_reclaim: 'Round-number reclaim',
+};
+function humanizeKey(k) {
+  return k.split('_').join(' ');
+}
+function setupHoldAndFactorRows(setup) {
+  const h = setup.hold;
+  const badge = h.confirmed
+    ? '<span class="badge badge-confirmed">confirmed</span>'
+    : '<span class="badge badge-pending">not confirmed</span>';
+  let rows = '<tr><th>hold direction</th><td>' + esc(h.direction) + '</td></tr>' +
+    '<tr><th>consecutive closes</th><td>' + h.consecutive_bars + ' / ' + h.required_bars + '</td></tr>' +
+    '<tr><th>hold confirmed</th><td>' + badge + '</td></tr>' +
+    '<tr><th>failed attempts</th><td>' + h.failed_attempts + '</td></tr>';
+  Object.keys(setup.factors).forEach(function (key) {
+    const raw = setup.factors[key];
+    const v = typeof raw === 'boolean' ? (raw ? 'yes' : 'no')
+      : typeof raw === 'number' ? fmt(raw, 4) : esc(raw);
+    rows += '<tr><th>' + esc(humanizeKey(key)) + '</th><td>' + v + '</td></tr>';
+  });
+  return rows;
+}
+function closestSetupHtml(setup) {
+  if (!setup) return '<h3>Closest setup</h3><p class="muted">none currently watchable</p>';
+  const label = SETUP_TYPE_LABELS[setup.setup_type] || setup.setup_type;
+  return '<h3>Closest setup: ' + esc(label) + ' @ ' + fmt(setup.trigger_price, 2) +
+    ' ($' + fmt(setup.distance, 2) + ' away)</h3>' +
+    '<table class="detail">' + setupHoldAndFactorRows(setup) + '</table>';
+}
+function setupChipsHtml(others) {
+  if (!others || !others.length) return '';
+  let out = '<div class="setup-chips">';
+  others.forEach(function (setup) {
+    const label = SETUP_TYPE_LABELS[setup.setup_type] || setup.setup_type;
+    out += '<button type="button" class="setup-chip">' + esc(label) + ' &middot; $' +
+      fmt(setup.distance, 2) + '</button>' +
+      '<div class="setup-detail" hidden><table class="detail">' +
+      setupHoldAndFactorRows(setup) + '</table></div>';
+  });
+  out += '</div>';
+  return out;
+}
 function symbolCardHtml(symbol, state) {
   const sym = esc(symbol);
   if (state.status !== 'ok') {
@@ -662,6 +792,9 @@ function symbolCardHtml(symbol, state) {
   const priceCls = cmpClass(state.last_price, s.vwap);
   const ema9Cls = cmpClass(state.last_price, s.ema9);
   const histCls = signClass(s.macd.histogram);
+  const setups = state.setups || [];
+  const closest = setups.length ? setups[0] : null;
+  const others = setups.length ? setups.slice(1) : [];
   return '<section class="card" data-symbol="' + sym + '">' +
     '<div class="hero"><div class="hero-symbol">' + sym + '</div>' +
     '<div class="hero-price ' + priceCls + '">' + fmt(state.last_price, 2) + '</div>' +
@@ -677,6 +810,8 @@ function symbolCardHtml(symbol, state) {
     '<tr><th>MACD histogram</th><td class="' + histCls + '">' + fmt(s.macd.histogram, 6) + '</td></tr>' +
     '<tr><th>Relative volume</th><td>' + fmt(s.relative_volume, 2) + '</td></tr>' +
     '</table>' +
+    closestSetupHtml(closest) +
+    setupChipsHtml(others) +
     '<h3>Virtual position</h3>' + journalOpenHtml(state.journal.open) +
     levelBlockHtml('Resistance (nearest above)', state.levels.resistance) +
     levelBlockHtml('Support (nearest below)', state.levels.support) +
@@ -739,6 +874,20 @@ document.getElementById('watch-form').addEventListener('submit', async function 
     statusEl.className = 'neg';
   }
   refresh();
+});
+
+// Setup chip expand/collapse: purely local DOM toggle, no fetch, no
+// refresh() -- delegated on #symbols for the same reason as the remove
+// control below. Expanded state is NOT preserved across the next poll
+// (refresh() rebuilds #symbols' innerHTML from scratch every 4s, same as
+// every other in-place update this page does) -- an accepted tradeoff,
+// not an oversight, consistent with this page's existing "no persistent
+// client state across polls" design.
+document.getElementById('symbols').addEventListener('click', function (e) {
+  const chip = e.target.closest('.setup-chip');
+  if (!chip) return;
+  const detail = chip.nextElementSibling;
+  if (detail) detail.hidden = !detail.hidden;
 });
 
 // Remove control: one per panel, delegated on the #symbols container so it
@@ -855,6 +1004,12 @@ table.detail th{color:var(--muted);font-weight:500;width:45%}
   font-size:.78rem;font-weight:600}
 .badge-confirmed{background:rgba(62,207,126,.18);color:var(--pos)}
 .badge-pending{background:rgba(201,162,39,.18);color:var(--pending)}
+.setup-chips{display:flex;flex-wrap:wrap;gap:.4rem;margin:.4rem 0 .8rem}
+.setup-chip{background:var(--bg);color:var(--text);border:1px solid var(--border);
+  border-radius:1rem;padding:.25rem .7rem;font-size:.78rem;cursor:pointer}
+.setup-chip:hover{border-color:var(--accent)}
+.setup-detail{margin:.3rem 0 .6rem;padding:.5rem .6rem;
+  background:var(--bg);border:1px solid var(--border);border-radius:.4rem}
 .footer{color:var(--muted);font-size:.8rem;margin-top:1rem}
 """
 

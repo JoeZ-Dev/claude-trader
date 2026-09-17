@@ -26,11 +26,18 @@ Three policy choices for phase 1, from the build session:
   not window-based this way and keep seeing the full backfilled+live
   series on purpose -- see live_cadence_tail() below for why and how the
   split is found.
+
+Phase 3.5 addition: `setups` runs core/setup_types.py's evaluate_setups()
+alongside the existing resistance/support block, using the exact same
+`bars`/`live_bars` split (detect_levels sees the full series, every
+evaluate_hold call inside it sees only the live tail) -- one split,
+reused everywhere it applies, not a second one invented for setups.
 """
 from __future__ import annotations
 
 import os
 import sys
+from dataclasses import asdict
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -42,6 +49,7 @@ if _CORE not in sys.path:
 
 from indicators import ema, macd, relative_volume, session_vwap  # noqa: E402
 from levels import detect_levels, evaluate_hold  # noqa: E402
+from setup_types import evaluate_setups  # noqa: E402
 
 _NY = ZoneInfo("America/New_York")
 REQUIRED_HOLD_BARS = 3
@@ -156,6 +164,13 @@ def build_state(bars: list[dict], symbol: str | None = None) -> dict:
 
     picked = select_levels(detect_levels(bars), last_price)
 
+    # Already sorted ascending by dollar distance to trigger (setup_types.
+    # evaluate_setups' own contract) -- setups[0], if present, is
+    # "closest." A type that isn't currently watchable (no level above
+    # price, no real VWAP pullback in progress) is simply absent, not a
+    # null placeholder entry.
+    setups = [asdict(c) for c in evaluate_setups(bars, live_bars, last_price, vwap)]
+
     return {
         "status": "ok",
         "symbol": symbol,
@@ -178,4 +193,5 @@ def build_state(bars: list[dict], symbol: str | None = None) -> dict:
             "resistance": _level_block(live_bars, picked["resistance"], "above"),
             "support": _level_block(live_bars, picked["support"], "below"),
         },
+        "setups": setups,
     }
