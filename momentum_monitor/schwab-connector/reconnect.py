@@ -35,8 +35,21 @@ explicitly:
   the docker-compose healthcheck) since nothing in that path awaited
   anything.
 
+ONE shared connection now serves every currently-watched symbol (fixed
+2026-09-17 -- see specs.md: the earlier one-instance-per-symbol design put
+several independent StreamClient logins on the same Schwab account
+concurrently, which throttled badly under real load). `watched_symbols` is
+a GETTER, not a frozen list, read fresh at the top of every (re)connect --
+this is what makes a symbol added or removed between reconnects "just
+work" on the next connect with no separate pending-changes bookkeeping.
+`add_symbol`/`remove_symbol` give an immediate, no-reconnect-needed path
+for a change to take effect right away when a connection is already live;
+they're a no-op (not an error) when nothing is currently connected, since
+the next connect picks the change up automatically anyway.
+
 Presents the same interface as the other stream sources: an async
-`ticks(symbol)` generator and a `connected` property.
+`ticks()` generator yielding (symbol, tick) pairs, and a `connected`
+property.
 
 The `build_client` / `make_source` seams are injected so tests exercise the
 orchestration without a real schwab-py client or network; main.py wires the
@@ -46,6 +59,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import Callable
 
 from token_source import AuthHelperError, AuthRequired
 
@@ -54,18 +68,21 @@ DEFAULT_AUTH_RETRY_SECONDS = 60.0
 
 class ReconnectingStreamSource:
     def __init__(self, *, token_source, build_client, make_source,
+                 watched_symbols: Callable[[], set[str]],
                  now_fn=time.time, sleep_fn=None,
                  auth_retry_seconds: float = DEFAULT_AUTH_RETRY_SECONDS,
                  on_event=None) -> None:
         self._token_source = token_source
         self._build_client = build_client
         self._make_source = make_source
+        self._watched_symbols = watched_symbols
         self._now = now_fn
         self._sleep = sleep_fn or asyncio.sleep
         self._auth_retry_seconds = auth_retry_seconds
         self._on_event = on_event or (lambda *a, **k: None)
         self._connected = False
         self._reconnect_count = 0
+        self._inner = None  # the currently-live inner source, for add/remove passthrough
 
     @property
     def connected(self) -> bool:
@@ -75,14 +92,24 @@ class ReconnectingStreamSource:
     def reconnect_count(self) -> int:
         return self._reconnect_count
 
-    async def ticks(self, symbol: str):
-        # symbol is threaded into every on_event() call below -- with up to
-        # MAX_SYMBOLS independent ReconnectingStreamSource instances sharing
-        # one process-wide `log_event` callback (main.py), a log line with
-        # no symbol on it is ambiguous about which of the concurrent streams
-        # it's even about. Found live (2026-09-17): a stream_error for one
-        # of 3 newly-(re)watched symbols couldn't be pinned to a specific
-        # symbol from the logs alone, slowing down a real diagnosis.
+    async def add_symbol(self, symbol: str) -> None:
+        """Subscribe `symbol` on the currently-live connection immediately,
+        if one exists. A no-op (not an error) when nothing is connected
+        right now (e.g. mid auth-retry backoff) -- watched_symbols() being
+        read fresh at the next connect means the change is picked up
+        automatically either way."""
+        if self._inner is not None:
+            add = getattr(self._inner, "add_symbols", None)
+            if add is not None:
+                await add([symbol])
+
+    async def remove_symbol(self, symbol: str) -> None:
+        if self._inner is not None:
+            remove = getattr(self._inner, "remove_symbols", None)
+            if remove is not None:
+                await remove([symbol])
+
+    async def ticks(self):
         first = True
         try:
             while True:
@@ -91,7 +118,7 @@ class ReconnectingStreamSource:
                     await self._token_source.refresh_async()
                 except (AuthRequired, AuthHelperError) as exc:
                     self._connected = False
-                    self._on_event("auth_error", symbol=symbol, error=exc)
+                    self._on_event("auth_error", error=exc)
                     await self._sleep(self._auth_retry_seconds)
                     continue
 
@@ -101,56 +128,60 @@ class ReconnectingStreamSource:
                     inner = self._make_source(client)
                 except Exception as exc:  # defensive: a bad client build
                     self._connected = False
-                    self._on_event("build_error", symbol=symbol, error=exc)
+                    self._on_event("build_error", error=exc)
                     await self._sleep(self._auth_retry_seconds)
                     continue
 
                 if not first:
                     self._reconnect_count += 1
-                    self._on_event("reconnect", symbol=symbol, count=self._reconnect_count)
+                    self._on_event("reconnect", count=self._reconnect_count)
                 first = False
 
                 # 3. consume until token near-expiry, or inner ends/errors
                 got_a_tick = False
-                async for tick in self._consume_until_stale(inner, symbol):
+                async for item in self._consume_until_stale(inner):
                     got_a_tick = True
-                    yield tick
+                    yield item
                 self._connected = False
                 if not got_a_tick:
                     # A fresh refresh_async() immediately produced an
                     # already-stale budget -- see module docstring. Back
                     # off instead of looping straight back into another
                     # refresh with no delay.
-                    self._on_event("stale_immediately_after_refresh", symbol=symbol)
+                    self._on_event("stale_immediately_after_refresh")
                     await self._sleep(self._auth_retry_seconds)
                 # loop -> refresh + rebuild + reconnect
         finally:
+            self._inner = None
             self._connected = False
 
-    async def _consume_until_stale(self, inner, symbol: str):
-        gen = inner.ticks(symbol).__aiter__()
+    async def _consume_until_stale(self, inner):
+        symbols = self._watched_symbols()
+        gen = inner.ticks(symbols).__aiter__()
+        self._inner = inner
         try:
             while True:
                 budget = self._token_source.seconds_until_stale()
                 if budget <= 0:
-                    self._on_event("proactive_refresh", symbol=symbol)
+                    self._on_event("proactive_refresh")
                     return
                 try:
-                    tick = await asyncio.wait_for(gen.__anext__(), timeout=budget)
+                    item = await asyncio.wait_for(gen.__anext__(), timeout=budget)
                 except asyncio.TimeoutError:
                     # Hit the proactive-refresh deadline while waiting for the
                     # next tick (quiet market or slow stream).
-                    self._on_event("proactive_refresh", symbol=symbol)
+                    self._on_event("proactive_refresh")
                     return
                 except StopAsyncIteration:
-                    self._on_event("stream_ended", symbol=symbol)
+                    self._on_event("stream_ended")
                     return
                 except Exception as exc:
-                    self._on_event("stream_error", symbol=symbol, error=exc)
+                    self._on_event("stream_error", error=exc)
                     return
                 self._connected = getattr(inner, "connected", True)
-                yield tick
+                yield item
         finally:
+            self._inner = None
             aclose = getattr(gen, "aclose", None)
             if aclose is not None:
                 try:

@@ -30,22 +30,29 @@ class FakeHelper:
 
 
 class FakeInner:
-    """Fake stream source. `script` is a list of:
+    """Fake stream source -- SchwabStreamSource's shape post-2026-09-17
+    (one shared connection serving several symbols, not one per symbol).
+    `script` is a list of:
         ("tick", {...})      -> yield a tick
         ("raise", exc)       -> raise
         ("end",)             -> stop (StopAsyncIteration)
         ("hang", seconds)    -> await sleep(seconds) before continuing
+    ReconnectingStreamSource never interprets the yielded payload shape --
+    it's pure passthrough -- so these stay bare dicts, matching the
+    original tests; only the SUBSCRIBE side (symbols) changed shape.
     """
 
     def __init__(self, script):
         self._script = script
         self.connected = False
         self.ticks_calls = 0
-        self.symbol = None
+        self.symbols = None
+        self.add_calls = []
+        self.remove_calls = []
 
-    async def ticks(self, symbol):
+    async def ticks(self, symbols):
         self.ticks_calls += 1
-        self.symbol = symbol
+        self.symbols = symbols
         self.connected = True
         for item in self._script:
             kind = item[0]
@@ -58,9 +65,16 @@ class FakeInner:
             elif kind == "hang":
                 await asyncio.sleep(item[1])
 
+    async def add_symbols(self, symbols):
+        self.add_calls.append(symbols)
+
+    async def remove_symbols(self, symbols):
+        self.remove_calls.append(symbols)
+
 
 class Harness:
-    def __init__(self, helper_responses=(), inners=None, build_errors=None):
+    def __init__(self, helper_responses=(), inners=None, build_errors=None,
+                watched_symbols=None):
         self.helper = FakeHelper(*helper_responses)
         self.token_source = AccessTokenSource("http://companion-auth:9999",
                                               http_get=self.helper,
@@ -70,7 +84,8 @@ class Harness:
         self.build_calls = []        # token dicts passed to build_client
         self.make_calls = []         # clients passed to make_source
         self.sleeps = []             # auth-retry sleep durations
-        self.events = []             # (name, kwargs, connected-at-time)
+        self.events = []             # (name, kwargs)
+        self._watched_symbols = watched_symbols or (lambda: {"AEHL"})
 
     def build_client(self, token_dict):
         self.build_calls.append(token_dict)
@@ -93,7 +108,8 @@ class Harness:
     def source(self, **overrides):
         kw = dict(token_source=self.token_source, build_client=self.build_client,
                   make_source=self.make_source, sleep_fn=self.sleep,
-                  auth_retry_seconds=60.0, on_event=self.on_event)
+                  auth_retry_seconds=60.0, on_event=self.on_event,
+                  watched_symbols=self._watched_symbols)
         kw.update(overrides)
         return ReconnectingStreamSource(**kw)
 
@@ -127,11 +143,32 @@ def test_first_connect_builds_client_with_fresh_token_and_streams():
                 FakeInner([("hang", 5)])],
     )
     src = h.source()
-    ticks = run(collect(src.ticks("AEHL"), 2))
+    ticks = run(collect(src.ticks(), 2))
     assert [t["ts"] for t in ticks] == [1, 2]
     assert len(h.build_calls) == 1
     assert h.build_calls[0]["token"]["access_token"] == "A"
     assert h.make_calls == ["client1"]  # 2nd inner never built
+
+
+def test_ticks_subscribes_to_the_current_watched_symbols():
+    # The core new behavior this whole module change exists for: the
+    # symbol set is read FRESH from watched_symbols() at connect time,
+    # not frozen at construction -- so a symbol added/removed between
+    # reconnects is picked up automatically on the next connect with no
+    # separate "pending changes" bookkeeping.
+    calls = {"n": 0}
+
+    def watched():
+        calls["n"] += 1
+        return {"AEHL", "DAIC"} if calls["n"] == 1 else {"AEHL", "WETO"}
+
+    inner1 = FakeInner([("tick", {"ts": 1}), ("end",)])
+    inner2 = FakeInner([("tick", {"ts": 2}), ("hang", 5)])
+    h = Harness(watched_symbols=watched, inners=[inner1, inner2])
+    src = h.source()
+    run(collect(src.ticks(), 2))
+    assert inner1.symbols == {"AEHL", "DAIC"}
+    assert inner2.symbols == {"AEHL", "WETO"}
 
 
 def test_reconnects_when_inner_stream_ends():
@@ -140,7 +177,7 @@ def test_reconnects_when_inner_stream_ends():
                 FakeInner([("tick", {"ts": 3}), ("tick", {"ts": 4}), ("hang", 5)])],
     )
     src = h.source()
-    ticks = run(collect(src.ticks("X"), 4))
+    ticks = run(collect(src.ticks(), 4))
     assert [t["ts"] for t in ticks] == [1, 2, 3, 4]
     assert len(h.make_calls) == 2
     assert src.reconnect_count == 1
@@ -155,30 +192,42 @@ def test_reconnects_when_inner_stream_errors():
                 FakeInner([("tick", {"ts": 2}), ("hang", 5)])],
     )
     src = h.source()
-    ticks = run(collect(src.ticks("X"), 2))
+    ticks = run(collect(src.ticks(), 2))
     assert [t["ts"] for t in ticks] == [1, 2]
     assert "stream_error" in h.event_names()
     assert len(h.make_calls) == 2
 
 
-def test_every_event_carries_its_own_symbol():
-    # Found live (2026-09-17): with up to MAX_SYMBOLS independent
-    # ReconnectingStreamSource instances sharing one process-wide
-    # log_event callback, a log line with no symbol on it is ambiguous
-    # about which of the concurrent streams it's even about -- this
-    # directly slowed down a real incident diagnosis. Every event kind
-    # this module emits must carry symbol=<the symbol ticks() was
-    # called with>.
-    h = Harness(
-        inners=[FakeInner([("tick", {"ts": 1}), ("raise", RuntimeError("boom"))]),
-                FakeInner([("tick", {"ts": 2}), ("end",)]),
-                FakeInner([("tick", {"ts": 3}), ("hang", 5)])],
-    )
+def test_add_symbol_forwards_to_the_live_inner_source():
+    inner = FakeInner([("hang", 5)])
+    h = Harness(inners=[inner])
     src = h.source()
-    run(collect(src.ticks("DAIC"), 3))
-    assert h.events  # sanity: something actually fired
-    for name, kw in h.events:
-        assert kw.get("symbol") == "DAIC", f"event {name!r} missing/wrong symbol: {kw}"
+
+    async def drive():
+        agen = src.ticks().__aiter__()
+        # Let the connect sequence run far enough to set up the inner source.
+        task = asyncio.ensure_future(agen.__anext__())
+        await asyncio.sleep(0.01)
+        await src.add_symbol("DAIC")
+        await src.remove_symbol("AEHL")
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await agen.aclose()
+
+    run(drive())
+    assert inner.add_calls == [["DAIC"]]
+    assert inner.remove_calls == [["AEHL"]]
+
+
+def test_add_symbol_is_a_noop_when_nothing_is_currently_connected():
+    # No inner source live yet (e.g. mid auth-retry backoff) -- must not
+    # raise; the change is picked up on the next connect via
+    # watched_symbols() instead.
+    h = Harness(helper_responses=[(409, {"error": "AUTH_REQUIRED", "message": "x"})])
+    src = h.source()
+    run(src.add_symbol("DAIC"))
+    run(src.remove_symbol("AEHL"))
 
 
 def test_proactive_refresh_fires_before_token_expiry():
@@ -194,7 +243,7 @@ def test_proactive_refresh_fires_before_token_expiry():
                 FakeInner([("tick", {"ts": 1}), ("hang", 5)])],
     )
     src = h.source()
-    ticks = run(collect(src.ticks("X"), 1))
+    ticks = run(collect(src.ticks(), 1))
     assert [t["ts"] for t in ticks] == [1]
     assert "proactive_refresh" in h.event_names()
     assert h.helper.calls == 2                       # re-fetched a fresh token
@@ -211,7 +260,7 @@ def test_auth_required_does_not_crash_and_retries_after_sleep():
         inners=[FakeInner([("tick", {"ts": 1}), ("hang", 5)])],
     )
     src = h.source()
-    ticks = run(collect(src.ticks("X"), 1))
+    ticks = run(collect(src.ticks(), 1))
     assert [t["ts"] for t in ticks] == [1]
     assert h.sleeps == [60.0]
     assert "auth_error" in h.event_names()
@@ -226,7 +275,7 @@ def test_auth_helper_error_does_not_crash_and_retries():
         inners=[FakeInner([("tick", {"ts": 1}), ("hang", 5)])],
     )
     src = h.source()
-    ticks = run(collect(src.ticks("X"), 1))
+    ticks = run(collect(src.ticks(), 1))
     assert [t["ts"] for t in ticks] == [1]
     assert h.sleeps == [60.0]
 
@@ -259,13 +308,14 @@ def test_backs_off_when_a_fresh_refresh_is_immediately_stale_again():
         token_source=token_source,
         build_client=lambda token: object(),
         make_source=lambda client: FakeInner([("hang", 10)]),
+        watched_symbols=lambda: {"X"},
         sleep_fn=fake_sleep,
         auth_retry_seconds=60.0,
         on_event=lambda name, **kw: events.append(name),
     )
 
     async def drive():
-        agen = src.ticks("X").__aiter__()
+        agen = src.ticks().__aiter__()
         try:
             await asyncio.wait_for(agen.__anext__(), timeout=0.2)
         except asyncio.TimeoutError:
@@ -287,5 +337,5 @@ def test_connected_is_false_after_generator_closed_mid_gap():
                 FakeInner([("hang", 5)])],
     )
     src = h.source()
-    run(collect(src.ticks("X"), 1))
+    run(collect(src.ticks(), 1))
     assert src.connected is False
