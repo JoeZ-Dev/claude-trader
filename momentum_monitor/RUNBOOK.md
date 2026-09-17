@@ -11,70 +11,110 @@ Everything in steps 1–2 happens **once**. Steps 3–6 are the actual checks.
 
 ---
 
-## 1–2. Provision credentials — **PENDING, section stale**
+## 1–2. Provision credentials
 
-> **TODO:** Steps 1–2 below describe the *original* credential plan (a
-> dedicated Market-Data-only Schwab app, with `schwab-connector` minting
-> and holding its own `token.json` via `client_from_login_flow`). That
-> plan is superseded — see `specs.md` §4 ("Revised credential model") —
-> `schwab-connector` now fetches short-lived access tokens from the
-> joelab `companion-auth` helper over `AUTH_HELPER_URL` and never performs
-> OAuth login itself. **`companion-auth` does not exist on this host
-> yet — it's being built separately.** Do not follow steps 1–2 as written;
-> they need a full rewrite once that service is running and its bootstrap
-> flow is confirmed. DoD check 5 below (credential-scope evidence) is
-> stale for the same reason and needs the same rewrite, against the
-> mitigation model in `specs.md` §4 (dedicated $1 funded account, no
-> margin, zero order-placement code paths, Schwab's Order Limit setting)
-> rather than the old "Market Data Production only" scope check.
+The credential model and why it's shaped this way (one Schwab app
+registration instead of two, the $1-funded/no-margin/zero-order-code
+mitigation, the 7-day refresh-token limit, why `schwab-connector` never
+holds the refresh token) live in `specs.md` §4 — read that first. This
+section is operational steps only; it does not re-derive any of that
+reasoning, and if it ever seems to disagree with specs.md, specs.md wins
+and this section needs fixing, not the reverse.
 
-## 1. Register the Schwab app — "Market Data Production" only
+`companion-auth` — a separate service at `/srv/apps/companion-auth` on
+this host, **not part of this repo** — is the only thing that ever holds
+the Schwab refresh token. `schwab-connector` only ever holds a short-lived
+access token, fetched from `companion-auth` over `AUTH_HELPER_URL`, and
+never performs OAuth login itself. `companion-auth`'s own `README.md` is
+the source of truth for its own endpoints and deployment; what follows is
+just the parts `momentum_monitor` operators actually need to run.
 
-1. Go to <https://developer.schwab.com/> → Dashboard → **Create App**.
-2. Give it its own name (not shared with any other project in this
-   environment — e.g. `momentum-monitor-marketdata`).
-3. Under **API Product**, select **Market Data Production** and nothing
-   else. Do **not** add **Accounts and Trading Production**.
-4. Callback URL: `https://127.0.0.1:8182` (any loopback URL works; it just
-   has to match what you pass to schwab-py).
-5. Submit and wait for the app status to reach **Ready For Use**.
+### One-time OAuth bootstrap
 
-**DoD check 5 (scope):** open the app in the portal and confirm the API
-Products list shows **Market Data Production** and does **not** list
-Accounts and Trading Production. Screenshot it. The credential is then
-structurally incapable of placing orders or reading positions — not merely
-unused for that.
-
----
-
-## 2. Mint the token (once per 7 days)
-
-schwab-py drives the OAuth login in a browser and writes a token file.
+`companion-auth`'s `GET /access_token` returns `409 {"error":
+"AUTH_REQUIRED"}` until a refresh token exists. Create one by running its
+interactive OAuth flow, on the homelab, inside the already-running
+container (its `SCHWAB_CLIENT_ID` / `SCHWAB_CLIENT_SECRET` are already in
+that container's environment via its own `.env` + `env_file:` — no need
+to pass them again):
 
 ```bash
-cd momentum_monitor
-python -m venv .venv && ./.venv/bin/pip install schwab-py
-./.venv/bin/python - <<'PY'
-from schwab.auth import client_from_login_flow
-client_from_login_flow(
-    api_key="YOUR_APP_KEY",
-    app_secret="YOUR_APP_SECRET",
-    callback_url="https://127.0.0.1:8182",
-    token_path="schwab-connector/data/token.json",
-)
-PY
+docker exec -it companion-auth python bootstrap.py
 ```
 
-A browser opens → log in to Schwab → approve → the flow captures the
-redirect and writes `schwab-connector/data/token.json`.
+It prints an authorize URL. Open it, log in to Schwab, approve, then copy
+the **entire** redirect URL from the browser's address bar (it starts with
+`https://companion-auth.p3l.co/callback?code=...`) and paste it back at
+the `Redirect URL>` prompt. The refreshable token is written to
+`companion-auth`'s `data/tokens.json` (outside this repo).
 
-- Keep `schwab-connector/data/` untracked (it already is, via
-  `.gitignore`). Never commit `token.json`.
-- **Token lifetime (platform-enforced):** the Schwab *refresh* token is
-  valid for **7 days**. After that a fresh run of the block above is
-  required — this is a Schwab policy, not something any client can work
-  around. The achievable, testable claim for this tool is *"survives a
-  container restart"*, checked in step 6 — **not** "never re-authenticates".
+**Expect a "state suffix mismatch" message — this is a known Schwab-side
+quirk, not an error, and `bootstrap.py` already handles it.** Schwab's own
+redirect chain intermittently appends extra trailing characters to the
+OAuth `state` parameter it echoes back. `bootstrap.py` detects that the
+received state still starts with the expected one, normalizes it, and
+proceeds with the exchange automatically — confirmed across multiple live
+bootstrap runs, not a one-off. Seeing this message means the flow is
+working correctly; don't restart it or treat it as a bad paste.
+
+This bootstrap is required again roughly every 7 days (Schwab caps
+refresh tokens at that lifetime — platform-enforced, unaffected by which
+app or client is used; see `specs.md` §4). "Survives a container restart"
+is the achievable, testable claim (checked in DoD check 6 below); "never
+needs re-auth" is not achievable by any client and must not be implied.
+
+### The X-Internal-Auth header
+
+Every caller of `companion-auth`'s `GET /access_token` — `schwab-connector`
+included — must send the shared secret as an `X-Internal-Auth` header:
+
+```bash
+curl -s http://companion-auth:8766/access_token \
+  -H "X-Internal-Auth: $INTERNAL_AUTH_SECRET"
+```
+
+This header is the actual security boundary for the endpoint. The
+Cloudflare route (`companion-auth.p3l.co`) exists only so Schwab's own
+servers can reach the OAuth callback during bootstrap above — it is never
+used for service-to-service calls, and is convenience path-scoping on top
+of this header, not a substitute for it. A missing or wrong header fails
+the request closed (`401`), never silently through. `schwab-connector`'s
+own copy of this value is `INTERNAL_AUTH_SECRET` in
+`momentum_monitor/.env`, and must match `companion-auth`'s `.env` exactly.
+
+**DoD check 5 (auth boundary, not scope):** confirm the header check
+actually rejects bad requests, not just accepts good ones. Verified live
+(2026-09-16, from inside a container on `joelab-ingress` — `monitor-app`
+itself can't reach `companion-auth` directly, by design, so run this from
+`schwab-connector` or similar):
+
+```bash
+# no header at all
+curl -s -o /dev/null -w "%{http_code}\n" http://companion-auth:8766/access_token
+# -> 401 {"error":"UNAUTHORIZED"}
+
+# wrong header value
+curl -s -o /dev/null -w "%{http_code}\n" http://companion-auth:8766/access_token \
+  -H "X-Internal-Auth: definitely-wrong"
+# -> 401 {"error":"UNAUTHORIZED"}
+
+# correct header
+curl -s -o /dev/null -w "%{http_code}\n" http://companion-auth:8766/access_token \
+  -H "X-Internal-Auth: $INTERNAL_AUTH_SECRET"
+# -> 200 once bootstrapped, 409 if not bootstrapped yet
+```
+
+Record all three status codes. This replaces the original "Portal shows
+Market Data Production only" scope check, which is stale under the
+revised credential model (`specs.md` §4): the running credential
+deliberately has BOTH Market Data and Accounts and Trading scopes (the
+existing ToS_Companion app registration is reused — a dedicated
+Market-Data-only app isn't achievable under Schwab's one-app-per-developer
+limit), so a portal screenshot of scopes would no longer show what this
+tool's safety actually depends on. What it depends on instead is (a) this
+header check failing closed, and (b) `momentum_monitor` containing zero
+order-placement/account-endpoint code paths — see `specs.md` §4 and
+`AGENT_PROTOCOL.md`'s Credentials section.
 
 ---
 
@@ -184,5 +224,5 @@ Report phase 1 complete only when all six are true and evidenced:
 | 2 | One real symbol, several real minutes | `bar_count` over time |
 | 3 | Actual `/api/state` numbers pasted | the JSON |
 | 4 | One value (VWAP or EMA) vs a real chart, match stated | both numbers + verdict |
-| 5 | Portal shows Market Data Production only | screenshot |
+| 5 | companion-auth's `/access_token` rejects missing/wrong `X-Internal-Auth` (401), accepts the correct one | curl status codes for no-header / wrong-header / correct-header |
 | 6 | Restart: no re-auth, bars still present | logs + `bar_count` + bar file |
