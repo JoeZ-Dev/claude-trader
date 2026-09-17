@@ -390,6 +390,145 @@ def test_watch_backfill_failure_does_not_block_live_streaming(tmp_path):
         assert [b["ts"] for b in bars] == [b["ts"] for b in FIXTURE_BARS]
 
 
+# -- push (leg 1 of the poll -> push replacement, see specs.md) ----------
+
+class _OneShotAgg:
+    """A fake BarAggregator that hands back exactly one pre-built bar the
+    first time drain() is called -- isolates _drain/_notify behavior from
+    real feed/flush bucket mechanics, which is already covered above."""
+    def __init__(self, bar):
+        self._bars = [bar]
+
+    def drain(self):
+        out, self._bars = self._bars, []
+        return out
+
+
+def test_drain_notifies_subscriber_synchronously(tmp_path):
+    """The whole point of push over poll: a subscriber sees a bar the
+    instant _drain stores it, with no sleep/await needed to observe it."""
+    from app import Connector
+
+    store = BarStore(tmp_path / "bars")
+    connector = Connector(store=store, source_factory=lambda w: None,
+                          replay=True, now_fn=lambda: RTH_1030)
+    bar = _backfill_bar(RTH_1030, 10.0)
+
+    async def run():
+        async with connector.subscribe() as q:
+            connector._drain("AEHL", _OneShotAgg(bar))
+            item = q.get_nowait()  # no await, no sleep
+            assert item == {"symbol": "AEHL", "bar": bar}
+
+    asyncio.run(run())
+
+
+def test_subscribe_unregisters_on_exit(tmp_path):
+    from app import Connector
+
+    store = BarStore(tmp_path / "bars")
+    connector = Connector(store=store, source_factory=lambda w: None,
+                          replay=True, now_fn=lambda: RTH_1030)
+
+    async def run():
+        async with connector.subscribe():
+            assert len(connector._subscribers) == 1
+        assert len(connector._subscribers) == 0
+
+    asyncio.run(run())
+
+
+def test_slow_subscriber_drops_oldest_without_blocking_others_or_store(tmp_path):
+    from app import Connector
+
+    store = BarStore(tmp_path / "bars")
+    connector = Connector(store=store, source_factory=lambda w: None,
+                          replay=True, now_fn=lambda: RTH_1030,
+                          subscriber_maxsize=2)
+    bars = [_backfill_bar(RTH_1030 + i, 10.0 + i) for i in range(4)]
+
+    async def run():
+        async with connector.subscribe() as slow, connector.subscribe() as fast:
+            for bar in bars[:3]:  # overflows slow's maxsize=2 by one
+                connector._drain("AEHL", _OneShotAgg(bar))
+                fast.get_nowait()  # keep fast fully drained
+            # slow never drained -- must have dropped the OLDEST, not raised
+            # or blocked, and the other subscriber + the store are unaffected
+            got = [slow.get_nowait()["bar"]["ts"] for _ in range(2)]
+            assert got == [bars[1]["ts"], bars[2]["ts"]]
+            connector._drain("AEHL", _OneShotAgg(bars[3]))
+            assert fast.get_nowait()["bar"]["ts"] == bars[3]["ts"]
+
+    asyncio.run(run())
+    assert [b["ts"] for b in store.since("AEHL", 0.0)] == [b["ts"] for b in bars]
+
+
+async def _drive_streaming_route(app, path):
+    """Drive an ASGI streaming route directly, bypassing
+    fastapi.testclient's httpx ASGITransport -- which fully buffers a
+    response (runs the whole ASGI app call to completion) before
+    returning anything to the caller, so it can never observe partial
+    output from a route that streams until client disconnect, which is
+    exactly what /events (and monitor-app's /api/state/stream) do.
+    Returns (task, chunks, disconnect) -- read body bytes off `chunks` as
+    they're sent; set() `disconnect` and await `task` to end the drive."""
+    chunks: asyncio.Queue = asyncio.Queue()
+    disconnect = asyncio.Event()
+    sent_body = False
+
+    async def receive():
+        nonlocal sent_body
+        if not sent_body:
+            sent_body = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await disconnect.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if message["type"] == "http.response.body":
+            await chunks.put(message.get("body", b""))
+
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+        "method": "GET", "path": path, "raw_path": path.encode(),
+        "query_string": b"", "headers": [], "scheme": "http",
+        "server": ("testserver", 80), "client": ("testclient", 50000),
+        "root_path": "",
+    }
+    task = asyncio.create_task(app(scope, receive, send))
+    return task, chunks, disconnect
+
+
+def test_events_route_delivers_bar_over_sse(tmp_path):
+    app, _ = _app(tmp_path)
+
+    async def run():
+        task, chunks, disconnect = await _drive_streaming_route(app, "/events")
+        try:
+            first = await asyncio.wait_for(chunks.get(), timeout=2.0)
+            assert first == b": connected\n\n"
+
+            app.state.connector.watch("AEHL")  # same effect as POST /watch
+
+            buf = b""
+            while b"data:" not in buf:
+                buf += await asyncio.wait_for(chunks.get(), timeout=2.0)
+            line = next(l for l in buf.decode().split("\n") if l.startswith("data:"))
+            payload = json.loads(line[len("data:"):].strip())
+            assert payload["symbol"] == "AEHL"
+            assert payload["bar"]["ts"] == FIXTURE_BARS[0]["ts"]
+            assert payload["bar"]["close"] == FIXTURE_BARS[0]["close"]
+        finally:
+            disconnect.set()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(run())
+
+
 def test_bars_survive_new_app_on_same_store_dir(tmp_path):
     app1, _ = _app(tmp_path)
     with TestClient(app1) as c:

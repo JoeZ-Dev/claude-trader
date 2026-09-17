@@ -29,7 +29,10 @@ import logging
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+import json
+
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from aggregator import BUCKET_SECONDS, BarAggregator
@@ -49,6 +52,12 @@ FLUSH_INTERVAL_SECONDS = 2.0
 # LEVELONE_EQUITIES ticks for a given symbol at all versus the
 # subscription silently never receiving them.
 HEARTBEAT_FLUSH_CYCLES = 30
+# Bound on each /events subscriber's queue (expected: one subscriber, the
+# monitor-app shared consumer). Normal volume is tiny -- one event per
+# watched symbol per ~10s bucket -- so this never binds in practice; it
+# exists purely to cap worst-case memory if a subscriber stops reading
+# entirely, turning a potential leak into a fixed small one.
+SUBSCRIBER_QUEUE_MAXSIZE = 1000
 
 
 class WatchRequest(BaseModel):
@@ -84,7 +93,8 @@ class Connector:
 
     def __init__(self, *, store: BarStore, source_factory, replay: bool,
                  now_fn=time.time, flush_interval: float = FLUSH_INTERVAL_SECONDS,
-                 history_fetcher=None, heartbeat_flush_cycles: int = HEARTBEAT_FLUSH_CYCLES):
+                 history_fetcher=None, heartbeat_flush_cycles: int = HEARTBEAT_FLUSH_CYCLES,
+                 subscriber_maxsize: int = SUBSCRIBER_QUEUE_MAXSIZE):
         self._store = store
         self._source_factory = source_factory
         self._replay = replay
@@ -92,10 +102,12 @@ class Connector:
         self._flush_interval = flush_interval
         self._history_fetcher = history_fetcher
         self._heartbeat_flush_cycles = heartbeat_flush_cycles
+        self._subscriber_maxsize = subscriber_maxsize
         self._aggs: dict[str, BarAggregator] = {}
         self._tick_counters: dict[str, _TickCounter] = {}
         self._shared_source: object | None = None
         self._consume_task: asyncio.Task | None = None
+        self._subscribers: set[asyncio.Queue] = set()
 
     @property
     def watching(self) -> list[str]:
@@ -235,17 +247,58 @@ class Connector:
     def _drain(self, symbol: str, agg: BarAggregator) -> None:
         for bar in agg.drain():
             self._store.append(symbol, bar)
+            try:
+                self._notify(symbol, bar)
+            except Exception:
+                logger.exception("notify failed for %s; bar still stored", symbol)
+
+    @asynccontextmanager
+    async def subscribe(self):
+        """One queue per live GET /events connection (expected: one, from
+        monitor-app's shared consumer). Registered on enter, discarded on
+        exit/exception -- a dropped connection can never leak forever."""
+        q: asyncio.Queue = asyncio.Queue(maxsize=self._subscriber_maxsize)
+        self._subscribers.add(q)
+        try:
+            yield q
+        finally:
+            self._subscribers.discard(q)
+
+    def _notify(self, symbol: str, bar: dict) -> None:
+        """Best-effort fan-out; must never raise or block the tick path
+        that stores bars (same standard as the tick-diagnostic crash found
+        live 2026-09-17: instrumentation must never be able to take down
+        the production message-delivery path it observes). A full queue
+        (slow/stalled subscriber) drops its OLDEST item, not the newest --
+        a lagging consumer cares about catching up to "now", and the
+        receiving Poller's ts-dedup guard tolerates the resulting gap the
+        same way it already tolerates catch-up/push overlap."""
+        event = {"symbol": symbol, "bar": bar}
+        for q in list(self._subscribers):
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    q.put_nowait(event)
+                except asyncio.QueueFull:
+                    pass
 
 
 def create_app(*, store: BarStore, source_factory, replay: bool,
                now_fn=time.time, history_fetcher=None,
                flush_interval: float = FLUSH_INTERVAL_SECONDS,
-               heartbeat_flush_cycles: int = HEARTBEAT_FLUSH_CYCLES) -> FastAPI:
+               heartbeat_flush_cycles: int = HEARTBEAT_FLUSH_CYCLES,
+               subscriber_maxsize: int = SUBSCRIBER_QUEUE_MAXSIZE) -> FastAPI:
     connector = Connector(store=store, source_factory=source_factory,
                           replay=replay, now_fn=now_fn,
                           history_fetcher=history_fetcher,
                           flush_interval=flush_interval,
-                          heartbeat_flush_cycles=heartbeat_flush_cycles)
+                          heartbeat_flush_cycles=heartbeat_flush_cycles,
+                          subscriber_maxsize=subscriber_maxsize)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -276,5 +329,29 @@ def create_app(*, store: BarStore, source_factory, replay: bool,
             "watching": connector.watching,
             "connected": connector.connected,
         }
+
+    @app.get("/events")
+    async def events(request: Request):
+        """Leg 1 of the poll -> push replacement (specs.md): one shared
+        SSE connection streams every bar close, for every watched symbol,
+        the instant it's stored -- monitor-app no longer needs to poll
+        GET /bars/{symbol} on a timer to find out."""
+        async def event_stream():
+            async with connector.subscribe() as q:
+                # Flushed immediately on connect -- confirms the connection
+                # is live without waiting on the first real bar or the
+                # keep-alive interval, so a fresh consumer's reconnect loop
+                # never mistakes "no bars yet" for "not connected."
+                yield ": connected\n\n"
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        item = await asyncio.wait_for(q.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        yield ": keep-alive\n\n"
+                        continue
+                    yield f"event: bar\ndata: {json.dumps(item, separators=(',', ':'))}\n\n"
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     return app
