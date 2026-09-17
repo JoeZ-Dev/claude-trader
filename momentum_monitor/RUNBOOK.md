@@ -121,15 +121,33 @@ order-placement/account-endpoint code paths — see `specs.md` §4 and
 ## 3. Bring the stack up on live data — DoD check 1
 
 Pick one liquid, currently-active symbol (during regular hours, so bars
-actually flow). Then:
+actually flow). `SPY` (used below) is a reasonable default **for this
+check specifically** — a neutral, always-liquid smoke test for "does the
+pipeline work at all," not a stand-in for how this tool is actually used
+day to day. The real use case is thinly-traded momentum candidates (see
+whatever's in `schwab-connector/data/bars/` from actual sessions), which
+aren't guaranteed to be trading at all whenever you happen to run this
+checklist — that's exactly why they're the wrong choice for a repeatable
+smoke test.
+
+Credentials and the watched symbol live in `momentum_monitor/.env`
+(gitignored — see section 1–2 above for `AUTH_HELPER_URL` /
+`INTERNAL_AUTH_SECRET`). Set `WATCH_SYMBOL` there, then:
 
 ```bash
 cd momentum_monitor
-export SCHWAB_API_KEY=YOUR_APP_KEY
-export SCHWAB_APP_SECRET=YOUR_APP_SECRET
-export WATCH_SYMBOL=SPY            # or whatever you picked
 docker compose up --build         # STREAM_SOURCE defaults to "schwab"
 ```
+
+`SCHWAB_API_KEY` / `SCHWAB_APP_SECRET` are still read by
+`schwab-connector` and passed to schwab-py's `client_from_access_functions`,
+but are not functionally required under the current (companion-auth)
+credential model — verified live: the actual running container has
+`SCHWAB_API_KEY` unset entirely and streams real data correctly regardless.
+schwab-py's ordinary REST/streaming calls authenticate with the bearer
+access token alone, the same reasoning `.env`'s own comment already gives
+for `SCHWAB_APP_SECRET` being an unused placeholder. Leave both unset
+unless something about this changes.
 
 **DoD check 1 passes if:** both `schwab-connector` and `monitor-app`
 reach "Application startup complete" with no errors, and
@@ -149,9 +167,22 @@ docker compose exec monitor-app python -c \
 ## 4. Let it run — DoD check 2
 
 Leave it up for **several real minutes** during regular trading hours.
-Watch `http://localhost:8012` fill in and refresh every 5s. Confirm
-`bar_count` climbs roughly one per 10 seconds and `last_price` tracks the
-tape.
+`http://localhost:8012` updates in place via JS polling `GET /api/state`
+every 4 seconds and patching specific elements directly (price, VWAP,
+EMAs, MACD, levels, the journal section) — not a full-page reload. A
+full-page `<meta http-equiv="refresh">` every 5s was the original,
+unintended behavior here (a bug, not the design — it caused visible
+flicker) and has since been replaced with this in-place update mechanism.
+
+A "Pause updates" button in the top bar (next to the ticker box) can stop
+polling entirely — both this client-side display loop and, via
+`POST /api/polling`, `monitor-app`'s own server-side poll loop against
+`schwab-connector` (the one that actually costs anything; the client-side
+loop alone never left localhost/the LAN). Confirm it reads **live**, not
+**paused**, before treating a flat readout as meaningful for this check.
+
+Confirm `bar_count` climbs roughly one per 10 seconds and `last_price`
+tracks the tape.
 
 ---
 
