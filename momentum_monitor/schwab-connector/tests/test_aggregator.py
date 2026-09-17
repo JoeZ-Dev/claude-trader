@@ -90,6 +90,28 @@ def test_flush_forward_fills_quiet_tail():
     assert bars[-1]["volume"] == 0.0
 
 
+def test_flush_keeps_forward_filling_across_repeated_calls_with_no_ticks():
+    # The real production call pattern (Connector._flush_loop, app.py):
+    # flush() fires every FLUSH_INTERVAL_SECONDS (2s) on a timer, forever,
+    # independent of whether ticks are arriving. A single flush() call
+    # closes the currently-open bucket and sets _cur_start back to None --
+    # if a SECOND flush() call (with no ticks in between) then did nothing
+    # just because _cur_start is None again, a genuinely quiet stream would
+    # forward-fill ONCE and then freeze forever, never catching up to wall
+    # clock time again even though the flusher keeps calling flush() on
+    # schedule. Found live (2026-09-17): watched symbols going stale for
+    # extended periods with a live, error-free stream connection -- this
+    # is why.
+    agg = BarAggregator()
+    agg.feed(tick(RTH_1030 + 3, 10.0, 100))
+    agg.flush(RTH_1030 + 15)     # closes bucket 0, no gap yet (bucket 1 is "now")
+    agg.flush(RTH_1030 + 35)     # SECOND flush, still no new ticks -- must still advance
+    bars = agg.drain()
+    assert [b["ts"] for b in bars] == [RTH_1030, RTH_1030 + 10, RTH_1030 + 20]
+    assert bars[-1]["volume"] == 0.0
+    assert bars[-1]["close"] == 10.0
+
+
 def test_out_of_order_tick_is_dropped():
     agg = BarAggregator()
     agg.feed(tick(RTH_1030 + 12, 10.0, 100))   # opens bucket 1

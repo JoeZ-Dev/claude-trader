@@ -101,15 +101,26 @@ class BarAggregator:
         # b < self._cur_start: out-of-order straggler, dropped on purpose.
 
     def flush(self, now_ts: float) -> None:
-        """Finalize the open bucket and forward-fill flat bars up to (but not
-        including) the bucket containing now_ts, when that bucket is newer
-        than the one currently open."""
-        if self._cur_start is None:
-            return
+        """Finalize the open bucket (if any and if stale) and forward-fill
+        flat bars up to (but not including) the bucket containing now_ts.
+
+        BUG FIXED 2026-09-17: this used to return immediately whenever
+        self._cur_start was None, which _finalize_current() always leaves
+        it as. In production, flush() is called on a fixed timer
+        (Connector._flush_loop, app.py) independent of whether ticks are
+        arriving -- so the OLD code forward-filled a quiet stream exactly
+        ONCE (the flush call that closed the then-open bucket), and every
+        later flush() call on a still-quiet stream was a silent no-op
+        forever, since nothing ever reopens a bucket except a real tick.
+        Found live: watched symbols went stale for extended periods with a
+        healthy, error-free stream connection -- last_bar_ts was frozen at
+        whatever moment the one-shot fill happened to catch up to, not
+        actually stuck, just never advancing again without a real tick.
+        Gap-filling now runs on every call, independent of self._cur_start."""
         target = bucket_start(now_ts)
-        if target > self._cur_start:
+        if self._cur_start is not None and target > self._cur_start:
             self._finalize_current()
-            self._fill_gap_until(target)
+        self._fill_gap_until(target)
 
     def drain(self) -> list[dict]:
         """Return finalized bars accumulated since the last call, then clear."""

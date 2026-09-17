@@ -365,6 +365,47 @@ asserts every event kind this module emits carries it). `events.py`
 needed no change — `format_event` was already generic over kwargs, so
 `event=stream_error symbol='DAIC' error=...` just falls out of it.
 
+This fix is what made the NEXT bug findable at all — see below.
+
+**`BarAggregator.flush()` only forward-filled a quiet stream ONCE, ever
+(found live 2026-09-17, fixed) — the real root cause of the stale-feeds
+incident that prompted the symbol-tagging fix above.** Symptom: a
+watched symbol's bars would burst-update after being re-added, then
+freeze completely — `last_bar_ts` stuck for 5+ minutes at a time — with
+`/health` reporting `connected: true` and NO stream errors in the logs
+at all (confirmed only AFTER the symbol-tagging fix above made it
+possible to watch one specific symbol's events in isolation and see
+that literally nothing was firing for it, not even a `proactive_refresh`
+— genuine silence, not a masked error). Root cause, in `aggregator.py`:
+`flush(now_ts)` began with `if self._cur_start is None: return` —
+`_finalize_current()` always sets `self._cur_start = None` when it
+closes a bucket, so the FIRST `flush()` call after a bucket goes quiet
+correctly forward-fills up to that moment, but `self._cur_start` stays
+`None` afterward, and there is nothing that reopens it except a real
+tick. In production, `Connector._flush_loop` (`app.py`) calls `flush()`
+on a fixed 2-second timer forever, independent of whether ticks are
+arriving — so on a stream that goes quiet for longer than one flush
+interval (not a failure — real, thin-volume names do this), the series
+forward-filled exactly once and then froze at whatever moment that one
+flush happened to catch up to, even though the flush loop kept running
+correctly every 2 seconds after that, because every one of those later
+calls hit the same early-return and did nothing. Confirmed directly:
+DAIC printed real, heavy volume (1,000–6,000+ shares per 10s bucket)
+right up to its last bar, then produced literally zero further bars for
+20+ minutes on a connection that never errored — not a quiet market, a
+frozen aggregator. Reproduced in a unit test first
+(`test_flush_keeps_forward_filling_across_repeated_calls_with_no_ticks`)
+before touching the fix, confirming two consecutive `flush()` calls with
+no ticks between them, exactly `Connector._flush_loop`'s real call
+pattern. Fix: gap-filling (`_fill_gap_until`) now runs on every `flush()`
+call unconditionally, not gated on `self._cur_start is not None` —
+bucket-closing (`_finalize_current`) still only happens when there's an
+actually-open bucket to close, but the forward-fill itself no longer
+depends on one existing. This is a genuine correctness bug that
+predates today, present since aggregator.py was first written in phase
+1 — it just took multi-symbol concurrent live load (phase 2) with
+symbol-tagged logging to actually catch it happening and prove why.
+
 **Price-history date-range quirk (platform-enforced, confirmed live):**
 `GET /marketdata/v1/pricehistory` (wrapped by schwab-py's
 `get_price_history`), when called with `periodType=day&period=1` and no
