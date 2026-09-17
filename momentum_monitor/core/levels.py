@@ -14,7 +14,16 @@ confirmation before trusting a break through it - not less. Keeping them
 in one module makes that relationship visible instead of accidental.
 """
 from __future__ import annotations
+import math
 from dataclasses import dataclass, field
+
+# Half-dollar grid -- retail attention tends to cluster at round numbers,
+# especially in low-priced names. Shared by both the proximity bonus
+# below (nearest EITHER side, used to score an already-detected level)
+# and setup_types.py's round-number reclaim candidate (nearest ABOVE
+# only, since that candidate is breakout-above-direction-only) -- one
+# canonical grid definition, not two independently-chosen ones.
+_ROUND_NUMBER_INCREMENT = 0.5
 
 
 @dataclass
@@ -58,10 +67,31 @@ def _swing_points(bars: list[dict], window: int, kind: str) -> list[int]:
     return idxs
 
 
+def _nearest_round_number(price: float, increment: float = _ROUND_NUMBER_INCREMENT) -> float:
+    """Nearest round-number grid point on EITHER side of `price`."""
+    return round(price / increment) * increment
+
+
+def nearest_round_number_above(price: float, increment: float = _ROUND_NUMBER_INCREMENT) -> float:
+    """Smallest round-number grid point STRICTLY ABOVE `price`. Used by
+    setup_types.py's round-number reclaim candidate: that setup type is
+    breakout-above-direction-only (specs.md phase 3.5's deliberate scope
+    for this pass), so the relevant round level is always the next one
+    up, never merely the nearest in either direction the way the bonus
+    below needs. The while-loop is a float-precision guard (price could
+    land fractionally below an increment boundary due to float
+    representation, e.g. 9.0 stored as 8.999999999999998), not expected
+    to loop more than once in practice."""
+    candidate = (math.floor(price / increment) + 1) * increment
+    while candidate <= price:
+        candidate += increment
+    return round(candidate, 4)
+
+
 def _round_number_bonus(price: float) -> float:
     """Small bonus for proximity to a half-dollar/dollar level - retail
     attention tends to cluster there, especially in low-priced names."""
-    nearest_half = round(price * 2) / 2
+    nearest_half = _nearest_round_number(price)
     distance_pct = abs(price - nearest_half) / price
     return max(0.0, 1.0 - distance_pct / 0.01)  # full bonus within 1%, fades to 0
 
