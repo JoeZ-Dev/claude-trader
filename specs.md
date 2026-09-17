@@ -112,8 +112,62 @@ as-is), not just the live-transition boundary. It was deferred rather
 than built immediately because it means reworking `core/`'s public
 function signatures (`ema`/`macd` currently take plain `values:
 list[float]`, with no timestamps) and its authoritative test suite — a
-real redesign, not a quick patch. Candidate for a future phase, alongside
-3.5 below, not assumed by the current one.
+real redesign, not a quick patch. Candidate for a future phase (roadmap
+item 3.6 below — 3.5, the other item originally listed alongside it, is
+now built, see below), not assumed by the current one.
+
+**Multi-scenario setup evaluation (phase 3.5, built 2026-09-17) —
+`core/setup_types.py`.** Rather than surfacing only the nearest
+above/below level (`select_levels`, phase 1's simpler design, still used
+for the existing resistance/support blocks below), `evaluate_setups()`
+computes four DISTINCT candidate setup types in parallel and lets the
+caller compare them side by side — a direct evolution of ToS_Companion's
+`candidate_generator.py` three-setup-type design, rebuilt on this
+repo's corrected level detection instead of its buggy nearest-price
+picking.
+
+- **Resistance breakout** — the existing `detect_levels` +
+  `evaluate_hold`, reused completely unchanged (swing_window=3, the
+  `detect_levels` default).
+- **Micro-breakout** — the SAME `detect_levels` function, called a
+  second time with `swing_window=1` (`MICRO_SWING_WINDOW`) instead of 3.
+  No new detection logic. 1 is half of the main window's default (3),
+  floored to an integer — a window that small only needs a single bar
+  beaten on each side, so it catches short-term micro-structure swings
+  the main window is too coarse to see, at the cost of more noise.
+- **VWAP pullback-reclaim** — trend context (current price at/above
+  session VWAP, a simple instantaneous check, not a multi-bar trend
+  model), gated by a pullback proximity check (`VWAP_PULLBACK_
+  THRESHOLD_PCT = 0.5%` of VWAP), then `evaluate_hold` treating VWAP
+  itself as the level to hold/reclaim closes above, same 3-bar
+  confirmation as everywhere else.
+- **Round-number reclaim** — `nearest_round_number_above()` (refactored
+  out of `levels.py`'s existing `_round_number_bonus` scoring, which
+  keeps its own nondirectional "nearest either side" version for
+  proximity scoring) treated as the level for `evaluate_hold`. The one
+  type watchable even with ZERO prior price touches at that level — an
+  untested round number is still a psychologically real level to retail
+  traders, unlike a swing level which requires an actual prior touch to
+  exist at all.
+
+**Comparison metric: raw dollar distance to trigger, deliberately NOT
+percentage and NOT volatility-relative.** A percentage or ATR-relative
+metric would already be doing exactly the kind of implicit normalizing
+this document's scoring principle (above) rejects for level-strength
+components — it would silently favor triggers on more volatile names
+over genuinely nearer ones, exactly the sort of collapsed, opaque
+comparison this tool exists to avoid. `evaluate_setups()` returns
+candidates pre-sorted ascending by this distance; the first one is
+"closest," surfaced with full visual weight in the UI (section 5), the
+rest as expandable chips.
+
+**Scope for this pass (deliberate, not an oversight): bullish/
+breakout-ABOVE direction only.** A symmetric breakdown-below version of
+each type is a natural future extension, not built now — kept this pass
+a manageable size. All four trigger prices are therefore always
+`>= current_price` by construction; a type that isn't watchable right
+now (no level above price, no real VWAP pullback in progress) is simply
+absent from the result, never a null/zero placeholder entry.
 
 ### 4. Data source
 
@@ -434,6 +488,27 @@ principle, with no code living loose at repo root:
   room — rather than failing or evicting silently; a live `N / 4 symbols
   watched` counter sits next to it.
 
+  **Multi-scenario setups in the grid (phase 3.5, built).** `build_state`
+  (`state.py`) adds a `"setups"` key — `setup_types.evaluate_setups()`'s
+  output, already sorted ascending by dollar distance (section 3) — using
+  the exact same `bars`/`live_bars` split every other bar-count-windowed
+  computation on this page already uses, not a second split invented for
+  this. Each card shows the closest candidate with the same visual weight
+  as the resistance/support tables below it (type, trigger price, dollar
+  distance, its own hold-state, its own factors — never collapsed into a
+  score), and the remaining candidates as compact chips (type + dollar
+  distance) that expand in place on click to reveal that type's own
+  factors — a local DOM toggle (`chip.nextElementSibling.hidden`), no
+  fetch, delegated on `#symbols` the same way the remove control is.
+  Expanded state does NOT survive the next poll (the whole card's
+  `innerHTML` gets rebuilt every 4s, same as everything else on this
+  page) — an accepted tradeoff, not an oversight. One generic row
+  renderer (`_setup_hold_and_factor_rows_html` / `setupHoldAndFactorRows`
+  in the JS mirror) handles all four types' `factors` dicts rather than
+  four hand-written table layouts, since the "don't collapse into a
+  score" principle only requires each factor to stay visible, not a
+  bespoke layout per type.
+
   **Pause/resume polling — two layers, not one.** A "Pause updates"
   button next to the ticker box stops polling entirely, but "polling"
   here means two independent things and the button controls both: (1)
@@ -569,21 +644,12 @@ section, same style as the existing levels tables — no new framework.
 3. Event-triggered LLM narration via `claude-connector`, firing only on
    meaningful state changes (level hold-confirmed, volume threshold
    crossed, MACD cross, retest, sharp reversal) — never polled.
-3.5. **Multi-scenario setup evaluation.** Rather than tracking only the
-   nearest above/below levels (phase 1's simpler version), evaluate
-   several distinct candidate setup TYPES in parallel — e.g. a
-   resistance breakout, a shorter-term micro-breakout, a VWAP
-   pullback-reclaim, and a round-number reclaim (the last of which can
-   be watched even before price has actually tested it — untested
-   round numbers are still psychologically real levels, unlike swing
-   levels which require an actual prior touch). This is a direct
-   evolution of ToS_Companion's `candidate_generator.py` three-setup-type
-   design, rebuilt on `monitor_core`'s corrected level detection instead
-   of its buggy nearest-price picking. Surface whichever candidate is
-   closest to a real setup, but per the "no collapsed grades" principle
-   established for the LLM Coach: show the factors that make it the
-   best candidate (proximity, level strength, volume confirmation) —
-   don't reduce the comparison to an opaque score.
+3.5. **(built, 2026-09-17) Multi-scenario setup evaluation.** See section
+   3 (`core/setup_types.py`) for the four setup types and the
+   dollar-distance comparison metric, and section 5 for the grid UI.
+   Bullish/breakout-ABOVE direction only for this pass, deliberately — a
+   symmetric breakdown-below version of each type is a natural future
+   extension, not built now.
 3.6. **Time-aware core indicators.** Rework `ema`/`macd`/`relative_volume`/
    `evaluate_hold`/`detect_levels`'s swing-point window (section 3) to
    decay/compare/require by elapsed real time rather than by bar count,
