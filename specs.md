@@ -177,6 +177,32 @@ full reconnects) - that would reach past schwab-py's supported interface,
 which contradicts the original reason for choosing a vetted library over
 hand-rolling this layer.
 
+**SCHWAB_API_KEY / SCHWAB_APP_SECRET are vestigial in this architecture
+(traced, then verified live against the REST path specifically):**
+`client_from_access_functions` passes both into authlib's `OAuth2Client`
+as `client_id`/`client_secret`. Traced through authlib's actual source:
+`client_id`/`client_secret` are used only for (a) building the OAuth
+authorize URL, and (b) `client_secret_basic` auth on TOKEN-ENDPOINT calls
+(`fetch_token`/`refresh_token`/`revoke_token`/`introspect_token`).
+Ordinary resource-server calls — REST (`get_price_history`) and streaming
+alike — authenticate via the bearer access token alone
+(`self.token_auth`, attached by authlib's `request()`), never
+`client_id`/`client_secret` — confirmed by reading that method, not
+assumed. Since `schwab-connector` never lets its own `OAuth2Client`
+refresh itself in place (see "Token refresh architecture" above — it's
+rebuilt fresh from a new access token instead), the one code path where
+these values would matter is never exercised here at all. Verified live
+(2026-09-17) against the path this actually needs proving on — REST, not
+streaming, since they're different call paths and a stream working
+doesn't establish a REST call does: triggered a fresh backfill (the
+price-history REST endpoint) for NVDA, never previously watched, with
+`SCHWAB_API_KEY` confirmed empty throughout. The request returned `200
+OK` and backfilled 775 real bars. Do not reintroduce these as "required"
+without re-tracing this — and if `schwab-connector`'s token handling is
+ever reworked to let schwab-py refresh in place instead of being rebuilt
+externally, revisit this specifically, since that's the code path where
+they'd start mattering.
+
 **Reconnect-storm incident (2026-09-16, root-caused and fixed):** for a
 full hour, `schwab-connector` reconnected roughly every ~15-75ms instead
 of every ~30 minutes — 46,695 reconnects, confirmed via

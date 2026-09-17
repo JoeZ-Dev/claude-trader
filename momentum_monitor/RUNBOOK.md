@@ -142,12 +142,46 @@ docker compose up --build         # STREAM_SOURCE defaults to "schwab"
 `SCHWAB_API_KEY` / `SCHWAB_APP_SECRET` are still read by
 `schwab-connector` and passed to schwab-py's `client_from_access_functions`,
 but are not functionally required under the current (companion-auth)
-credential model — verified live: the actual running container has
-`SCHWAB_API_KEY` unset entirely and streams real data correctly regardless.
-schwab-py's ordinary REST/streaming calls authenticate with the bearer
-access token alone, the same reasoning `.env`'s own comment already gives
-for `SCHWAB_APP_SECRET` being an unused placeholder. Leave both unset
-unless something about this changes.
+credential model. This needs the precise mechanism, not just "streaming
+still works" — a live tick stream and a REST call (like the price-history
+endpoint backfill uses) are different call paths, and schwab-py's own
+source shows `api_key` genuinely being sent as a request parameter in
+places. Traced through both schwab-py's and authlib's actual source:
+
+- `client/base.py` stores `api_key` on the client (`self.api_key =
+  api_key`) but never reads it again anywhere in the file — grepped for
+  every `self.api_key` reference to confirm. It's passed on into
+  `client_from_access_functions`'s `session_class(api_key, client_secret=
+  app_secret, ...)` as authlib's OAuth2 `client_id`.
+- authlib's `OAuth2Client` (`oauth2/client.py`) uses `client_id` /
+  `client_secret` in exactly two places: building the OAuth **authorize
+  URL**, and `client_secret_basic` auth on **token-endpoint** calls
+  (`fetch_token` / `refresh_token` / `revoke_token` / `introspect_token`).
+- Ordinary resource-server calls — `get_price_history` included — go
+  through authlib's httpx integration `request()`
+  (`integrations/httpx_client/oauth2_client.py`), which attaches
+  `self.token_auth` (the bearer access token, as a header) and nothing
+  client-id-related at all.
+- `schwab-connector` never lets its own `OAuth2Client` refresh itself in
+  place — `companion-auth` does all refreshing externally, and
+  `schwab-connector` rebuilds a fresh client with a new access token
+  before each ~30-minute expiry (see section 1–2 above / specs.md §4)
+  rather than calling `refresh_token`. So even the token-endpoint code
+  paths where `client_id`/`client_secret` would matter are never
+  exercised here, on top of not mattering for ordinary calls in the
+  first place.
+
+Verified live against the specific call path this matters for
+(2026-09-17): triggered a **fresh backfill** — Schwab's price-history REST
+endpoint, not the streaming feed — by watching NVDA, a symbol never
+previously watched, with `SCHWAB_API_KEY` confirmed empty the whole time.
+The real request
+(`GET https://api.schwabapi.com/marketdata/v1/pricehistory?symbol=NVDA...`)
+returned `200 OK` and backfilled 775 real bars. Leave both env vars unset
+unless something about this changes — but if `schwab-connector`'s token
+handling is ever reworked to let schwab-py refresh in place instead of
+being rebuilt externally, revisit this, since that's precisely the code
+path where `client_id`/`client_secret` would start mattering.
 
 **DoD check 1 passes if:** both `schwab-connector` and `monitor-app`
 reach "Application startup complete" with no errors, and
