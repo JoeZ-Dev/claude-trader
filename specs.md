@@ -339,25 +339,49 @@ principle, with no code living loose at repo root:
 - **`momentum_monitor/monitor-app/`** — the FastAPI web app. Holds no
   credentials. Polls `schwab-connector` for bars, runs them through
   `momentum_monitor/core/`, serves a web view. The only container with a
-  port published to the host (`8012`). `WATCH_SYMBOL` is only the
-  STARTING symbol (optional — unset means idle, no symbol watched until
-  one is entered): the page has a ticker text box (`POST /api/watch
-  {"symbol": "..."}` as a urlencoded form) that switches which symbol the
-  running container watches, without a restart. `Poller.switch_symbol`
-  (app.py) resets the accumulated bar history and re-announces the watch
-  to `schwab-connector`, which backfills the new symbol's session the
-  same as any fresh watch (section 5, `POST /watch`) — switching symbols
-  is not a second-class cold start. A poll already in flight for the OLD
-  symbol when a switch lands has its result discarded rather than
-  appended to the new symbol's just-reset series (`_poll_once` re-checks
-  the current symbol after the fetch's `await` returns). `switch_symbol`
-  also calls `POST /unwatch` (section 5) on whatever symbol it was
-  PREVIOUSLY watching, restoring the one-symbol-at-a-time invariant —
-  first shipped without this and confirmed live to accumulate every
-  symbol ever typed into the box (6 simultaneously watched from normal
-  use before the fix); this stays a genuine invariant, not a "usually
-  fine" convention: this repo does not run multi-symbol concurrently
-  (see roadmap phase 2, which this feature is explicitly NOT).
+  port published to the host (`8012`).
+
+  **Multi-symbol (phase 2, built) — up to `MAX_SYMBOLS` (4) concurrently.**
+  `WATCH_SYMBOL` is only the STARTING symbol (optional — unset means idle,
+  no symbol watched until one is added). `Poller` (app.py) tracks a `dict`
+  of up to 4 `_SymbolSlot`s keyed by symbol — each slot holds its own bar
+  history, computed state, and journal position, fully independent of the
+  others. `POST /api/watch {"symbol": "..."}` (urlencoded form) ADDS a
+  symbol to the watched set, filling the next empty slot — it does NOT
+  replace whatever else is watched (that was the phase-1 ticker box's
+  behavior; phase 2 deliberately changes it, since concurrent multi-symbol
+  is now the actual point). Rejections are explicit JSON, never a silent
+  failure or a silent slot replacement: an invalid ticker, a duplicate
+  already being watched, or the set already at 4 (`"already watching 4
+  symbols (the maximum) -- remove one first"`) each get their own reason,
+  HTTP 409. `POST /api/unwatch {"symbol": "..."}` removes one specific
+  symbol, force-closing its own open virtual-journal position (see section
+  6) without touching any other slot. A poll already in flight for a
+  symbol that gets removed (and possibly re-added) mid-fetch has its
+  result discarded — `_poll_once` re-checks the slot's object identity,
+  not just its key, after the fetch's `await` returns, so "removed" and
+  "removed then re-added" are both caught. `schwab-connector` itself
+  needed zero structural changes for this — `Connector._sources`/`_tasks`
+  were already dicts keyed by symbol with no built-in cap (this is what
+  made the phase-1 watch/unwatch leak possible in the first place before
+  its fix); confirmed by reading it, not assumed. One architectural fact
+  worth knowing, not a defect: each watched symbol gets its own
+  independent Schwab streaming connection and its own independent
+  ~30-minute token-refresh cycle — 4 concurrent symbols means 4
+  independent WebSocket sessions, not one connection multiplexing many.
+  Verified live (2026-09-16) under real 4-symbol concurrent load: a
+  natural reconnect on one symbol's stream did not disturb the other
+  three's bars or journal state.
+
+  **`GET /api/state` shape change (breaking, deliberate, no back-compat
+  shim — nothing else in this repo depended on the old single-object
+  form).** Old (phase 1): one flat object for the single watched symbol.
+  New (phase 2): `{"symbols": {SYM: {...same per-symbol shape as phase
+  1's whole response, plus a "journal": {"open": {...}|null}}, ...},
+  "recent_closed": [...], "poll_enabled": bool, "max_symbols": int}`.
+  `recent_closed` stays intentionally cross-symbol (it already was in
+  phase 1) — audited specifically to confirm it should stay that way, not
+  get scoped per-symbol.
 
   **Page refresh mechanism (redesigned from a bug, not a style choice):**
   the page originally used `<meta http-equiv="refresh" content="5">` — a
@@ -365,24 +389,37 @@ principle, with no code living loose at repo root:
   original intent was always in-place JS updates); the full reload was
   the actual cause of visible flicker/redraw, not a matter of taste. It's
   gone, replaced with an inline `<script>`: `setInterval(refresh, 4000)`
-  calls `GET /api/state` and updates specific elements by id (price,
-  VWAP, EMAs, MACD, relative volume, the resistance/support blocks, the
-  journal section) rather than replacing large chunks of markup or
-  reloading. The Python side (`app.py`'s `_page`) still computes the same
-  real first-paint HTML from current `state`/`journal` on every server
-  request — a fresh load shows real data immediately, and it keeps
-  server-side rendering meaningfully testable without a browser — while
-  the JS mirrors the same rendering logic for subsequent in-place
+  calls `GET /api/state` and rebuilds the `#symbols` container's innerHTML
+  in place from the current set of watched symbols (still no meta-refresh,
+  no full-page reload — a coarser-grained in-place update than phase 1's
+  per-element patching, chosen because the set of symbols itself can
+  change size between polls). The Python side (`app.py`'s `_page`) still
+  computes the same real first-paint HTML from current `state`/`journal`
+  on every server request — a fresh load shows real data immediately, and
+  it keeps server-side rendering meaningfully testable without a browser
+  — while the JS mirrors the same rendering logic for subsequent in-place
   updates. The two renderers are deliberately duplicated, not shared:
   "single file, no framework, no build step" rules out a shared
   template, so this is a small, contained, explicitly-commented tradeoff,
-  not an oversight. The visual redesign that came with this (dark
-  card-based layout, a real type scale, meaningful color: price vs VWAP,
-  price vs EMA9, MACD histogram sign, open/closed P&L sign) stays inside
-  the same non-negotiable constraint as core's own scoring (section 3):
-  nothing gets collapsed into a single composite number — level strength
+  not an oversight. The visual redesign (dark card-based layout, a real
+  type scale, meaningful color: price vs VWAP, price vs EMA9, MACD
+  histogram sign, open/closed P&L sign) stays inside the same
+  non-negotiable constraint as core's own scoring (section 3): nothing
+  gets collapsed into a single composite number — level strength
   components and hold-confirmation's consecutive-bars/failed-attempts
   detail are exactly as visible as before, just better laid out.
+
+  **Multi-panel grid (phase 2 Stage B, built).** `#symbols` is a
+  responsive CSS grid (`auto-fit, minmax(22rem, 1fr)`), one card per
+  watched symbol, each showing exactly what phase 1's single card showed
+  (price, indicators, levels, virtual position) plus its own `remove`
+  button scoped to that panel's own symbol (`data-symbol`, wired via
+  event delegation on `#symbols` so it survives the container's innerHTML
+  being replaced every poll). An add-symbol form (text input + "Add")
+  above the grid POSTs `/api/watch` and shows the server's own rejection
+  reason inline on a 409 (a full 5th symbol, a duplicate, an invalid
+  ticker) rather than failing silently; a live `N / 4 symbols watched`
+  counter sits next to it.
 
   **Pause/resume polling — two layers, not one.** A "Pause updates"
   button next to the ticker box stops polling entirely, but "polling"
@@ -425,9 +462,18 @@ the page (`state["levels"]["resistance"]["hold"]["confirmed"]`, from
 practice: the latest bar in the poll cycle where the transition is first
 seen — the finest granularity available without re-running
 `evaluate_hold` per-bar inside a single poll, which would itself be
-inventing new entry logic). Only one open virtual position at a time,
-tied to whichever symbol is currently watched; if a position is already
-open, a continued or repeated `True` reading does not fire a duplicate.
+inventing new entry logic). At most one open virtual position PER SYMBOL
+(phase 2: up to 4 symbols can each have their own independently open
+position at once, not one global position for whichever symbol happens
+to be watched); if a position is already open for a symbol, a continued
+or repeated `True` reading for that same symbol does not fire a
+duplicate. `journal_logic.py`/`journal_store.py` needed no changes for
+multi-symbol — audited specifically for a single-global-position
+assumption and found none: every lookup was already scoped by symbol
+(`open_position_for`) or by the specific row id
+(`update_trailing`/`close_position`). The single-position assumption that
+did exist lived in `Poller`'s own state, fixed by giving each watched
+symbol its own `_SymbolSlot` (section 5).
 
 **Exit — trailing stop only, no fixed target, by design.** A fixed R:R
 target was explicitly rejected for this project: it capped winners in the
@@ -452,18 +498,28 @@ by design, not by omission.
   (a virtual/simulated-fill modeling choice — assume the stop fills at
   the stop price — not a claim about real fill behavior).
 
-**Symbol switching (an edge case that didn't exist when phase 4 was first
-scoped, added once the watch/unwatch text box did — section 5).** When
-`Poller.switch_symbol` moves off a symbol with an open virtual position,
-it force-closes that position at the symbol's last known close,
-`exit_reason="symbol_switched"` — distinct from `"trailing_stop"` so
-later review doesn't conflate "the trade stopped out" with "the user just
-moved on." A position is never left open with no further price updates,
-which could never resolve. Switching back to (or restarting into) a
-symbol with an already-open position resumes tracking it from
-`journal_store` rather than losing or duplicating it — proven by test
-(two `JournalStore` instances over the same SQLite file), the same rigor
-already applied to bars/tokens surviving a restart.
+**Removing a watched symbol (an edge case that didn't exist when phase 4
+was first scoped, added once the watch/unwatch text box did — section
+5).** When `Poller.remove_symbol` drops a symbol with an open virtual
+position, it force-closes that position at the symbol's last known
+close, `exit_reason="symbol_switched"` (kept as the same reason string
+phase 1's ticker-switch used, since removal is the phase-2 equivalent
+event) — distinct from `"trailing_stop"` so later review doesn't conflate
+"the trade stopped out" with "the symbol was removed." A position is
+never left open with no further price updates, which could never
+resolve. Removing another symbol, or resuming an open position on
+re-add (or a full restart), never touches a DIFFERENT symbol's own open
+position — proven by test, including a dedicated multi-symbol test
+driving two symbols through real `hold_confirmed` transitions
+concurrently and confirming one's trailing-stop exit leaves the other's
+`id`/`entry_price`/`high_water_mark`/`stop_level` completely untouched,
+and verified live (2026-09-17): a real entry+exit fired on one of 4
+concurrently-watched real symbols with the other three's journal state
+confirmed unchanged via direct DB inspection throughout. Re-adding (or
+restarting into) a symbol with an already-open position resumes tracking
+it from `journal_store` rather than losing or duplicating it — proven by
+test (two `JournalStore` instances over the same SQLite file), the same
+rigor already applied to bars/tokens surviving a restart.
 
 **Storage: SQLite, not JSONL.** A different access pattern from
 schwab-connector's bars (append-only, replayed sequentially start to
@@ -485,20 +541,18 @@ section, same style as the existing levels tables — no new framework.
 
 ### 7. Roadmap / phases
 
-1. **(current)** One symbol, live Schwab data through the tested core,
+1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,
    no LLM.
-2. Multi-symbol (4-6 concurrent), same architecture extended. Not the same
-   thing as the phase-1 ticker-switch box (section 5) — that box
-   deliberately unwatches the previous symbol on every switch specifically
-   to STAY one-symbol-at-a-time. Actual concurrent multi-symbol support is
-   a distinct, larger decision (schwab-connector already technically
-   allows N simultaneously-watched symbols via repeated `POST /watch` with
-   no built-in cap — that capability existing is not the same as this
-   phase being started) that needs its own explicit design pass and
-   testing under real concurrent load, not backing into it silently
-   through a convenience feature the way section 5's incident did before
-   the unwatch fix.
+2. **(built, 2026-09-17)** Multi-symbol, up to 4 concurrent. See section 5
+   for the full design (`_SymbolSlot`, the `/api/watch`/`/api/unwatch`
+   add/remove semantics, the `/api/state` shape change) and section 6 for
+   the per-symbol journal scoping. `schwab-connector` needed no structural
+   changes — confirmed by reading it, not assumed, before writing any
+   code. Proven live under real concurrent 4-symbol load, including a
+   natural stream reconnect on one symbol not disturbing the other three,
+   and a real virtual-position entry+exit on one symbol with the other
+   three's journal state confirmed unchanged via direct DB inspection.
 3. Event-triggered LLM narration via `claude-connector`, firing only on
    meaningful state changes (level hold-confirmed, volume threshold
    crossed, MACD cross, retest, sharp reversal) — never polled.

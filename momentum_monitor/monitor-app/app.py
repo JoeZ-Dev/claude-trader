@@ -15,15 +15,15 @@ math N times, not different math) after every poll. Serves:
                         Deliberate breaking change from phase 1's single-
                         object shape -- nothing else depends on the old
                         form, no back-compat shim.
-  GET  /             -> phase 2 Stage A interim view: a plain, unstyled-
-                        beyond-existing-cards list of whatever's currently
-                        watched, JS-refreshed the same way as before (no
-                        meta-refresh). NOT the Stage B multi-panel grid --
-                        that's explicitly a separate, later piece of work;
-                        this is just enough to not leave the page broken
-                        while Stage A's backend is being proven live.
-                        Adding/removing symbols during Stage A is via the
-                        API directly (curl), not this page.
+  GET  /             -> Stage B: a responsive grid of up to 4 symbol
+                        panels, an add-symbol form (POSTs /api/watch,
+                        fills the next empty slot -- never replaces an
+                        existing one), and a remove control on each panel
+                        (POSTs /api/unwatch for that panel's own symbol
+                        only). JS-refreshed in place the same way as
+                        phase 1 (no meta-refresh, no full-page reload):
+                        refresh() re-fetches /api/state and rebuilds
+                        #symbols' innerHTML each poll.
   POST /api/watch    -> {"symbol": "..."} (urlencoded form) ADDS a symbol
                         to the watched set (up to max_symbols) -- this is
                         a deliberate behavior change from phase 1, where
@@ -468,26 +468,34 @@ def _journal_closed_rows_html(closed: list[dict]) -> str:
     return "".join(rows)
 
 
+def _remove_button_html(symbol: str) -> str:
+    sym = html.escape(symbol)
+    return f"<button type='button' class='remove-btn' data-symbol='{sym}'>remove</button>"
+
+
 def _symbol_card_html(symbol: str, state: dict) -> str:
-    """Stage A interim only -- NOT the Stage B multi-panel grid. One card
-    per watched symbol, reusing the same per-block renderers phase 1's
-    single-symbol page used, just called once per symbol instead of once
-    total."""
+    """One grid panel per watched symbol: the same per-block renderers
+    phase 1's single-symbol page used, plus a remove control scoped to
+    this panel's own symbol (data-symbol, wired via event delegation on
+    #symbols in _SCRIPT -- see refresh())."""
     sym = html.escape(symbol)
     if state.get("status") != "ok":
         msg = (f"Warming up — waiting for bars for {sym}." if state.get("symbol")
               else "No data yet.")
-        return f"<section class='card'><h2>{sym}</h2><p class='muted'>{html.escape(msg)}</p></section>"
+        return (f"<section class='card' data-symbol='{sym}'>"
+                f"<div class='hero'><h2>{sym}</h2>{_remove_button_html(symbol)}</div>"
+                f"<p class='muted'>{html.escape(msg)}</p></section>")
 
     s = state["session"]
     price_cls = _cmp_class(state["last_price"], s["vwap"])
     ema9_cls = _cmp_class(state["last_price"], s["ema9"])
     hist_cls = _sign_class(s["macd"]["histogram"])
     return f"""
-<section class="card">
+<section class="card" data-symbol="{sym}">
   <div class="hero">
     <div class="hero-symbol">{sym}</div>
     <div class="hero-price {price_cls}">{_fmt(state['last_price'], 2)}</div>
+    {_remove_button_html(symbol)}
   </div>
   <table class="detail">
     <tr><th>Bars</th><td>{state['bar_count']}</td></tr>
@@ -508,15 +516,28 @@ def _symbol_card_html(symbol: str, state: dict) -> str:
 """
 
 
-def _page(full_states: dict[str, dict], recent_closed: list[dict], poll_enabled: bool) -> str:
+def _watch_form_html(count: int, max_symbols: int) -> str:
+    return f"""
+<form id="watch-form" class="watch-form">
+  <input type="text" id="watch-input" placeholder="Add symbol (e.g. NVDA)" maxlength="10" autocomplete="off">
+  <button type="submit">Add</button>
+  <span id="slot-count" class="muted">{count} / {max_symbols} symbols watched</span>
+  <span id="watch-status" class="muted"></span>
+</form>
+"""
+
+
+def _page(full_states: dict[str, dict], recent_closed: list[dict], poll_enabled: bool,
+          max_symbols: int) -> str:
     if full_states:
         cards_html = "".join(_symbol_card_html(sym, st) for sym, st in full_states.items())
     else:
-        cards_html = ("<p class='muted'>No symbols watched yet — add one via "
-                      "<code>POST /api/watch</code> (up to 4).</p>")
+        cards_html = ("<p class='muted'>No symbols watched yet — add one below "
+                      f"(up to {max_symbols}).</p>")
 
     body = f"""
-<div id="symbols">{cards_html}</div>
+{_watch_form_html(len(full_states), max_symbols)}
+<div id="symbols" class="grid">{cards_html}</div>
 <section class="card">
   <h2>Recent closed trades</h2>
   <table class="detail">
@@ -610,19 +631,24 @@ function journalClosedRows(closed) {
       '<td class="' + cls + '">' + pnl + '</td></tr>';
   }).join('');
 }
+function removeButtonHtml(symbol) {
+  return '<button type="button" class="remove-btn" data-symbol="' + esc(symbol) + '">remove</button>';
+}
 function symbolCardHtml(symbol, state) {
   const sym = esc(symbol);
   if (state.status !== 'ok') {
-    return '<section class="card"><h2>' + sym + '</h2>' +
+    return '<section class="card" data-symbol="' + sym + '">' +
+      '<div class="hero"><h2>' + sym + '</h2>' + removeButtonHtml(symbol) + '</div>' +
       '<p class="muted">Warming up \\u2014 waiting for bars.</p></section>';
   }
   const s = state.session;
   const priceCls = cmpClass(state.last_price, s.vwap);
   const ema9Cls = cmpClass(state.last_price, s.ema9);
   const histCls = signClass(s.macd.histogram);
-  return '<section class="card">' +
+  return '<section class="card" data-symbol="' + sym + '">' +
     '<div class="hero"><div class="hero-symbol">' + sym + '</div>' +
-    '<div class="hero-price ' + priceCls + '">' + fmt(state.last_price, 2) + '</div></div>' +
+    '<div class="hero-price ' + priceCls + '">' + fmt(state.last_price, 2) + '</div>' +
+    removeButtonHtml(symbol) + '</div>' +
     '<table class="detail">' +
     '<tr><th>Bars</th><td>' + state.bar_count + '</td></tr>' +
     '<tr><th>Last bar extended-hours</th><td>' + (state.last_bar_is_extended ? 'yes' : 'no') + '</td></tr>' +
@@ -650,11 +676,67 @@ async function refresh() {
   applyPollUiState(data.poll_enabled);  // stay in sync even if another tab paused/resumed it
   const symbolsEl = document.getElementById('symbols');
   const syms = Object.keys(data.symbols || {});
+  const maxSymbols = data.max_symbols || 4;
   symbolsEl.innerHTML = syms.length
     ? syms.map(function(sym) { return symbolCardHtml(sym, data.symbols[sym]); }).join('')
-    : '<p class="muted">No symbols watched yet \\u2014 add one via POST /api/watch (up to 4).</p>';
+    : '<p class="muted">No symbols watched yet \\u2014 add one below (up to ' + maxSymbols + ').</p>';
   document.getElementById('journal-closed-tbody').innerHTML = journalClosedRows(data.recent_closed);
+  document.getElementById('slot-count').textContent = syms.length + ' / ' + maxSymbols + ' symbols watched';
 }
+
+// Add-symbol form: POSTs /api/watch, which ADDS to the watched set (fills
+// the next empty slot) rather than replacing whatever's already watched --
+// a rejected 5th add (or a duplicate, or an invalid ticker) shows the
+// server's own reason text right in the form, not a silent failure.
+document.getElementById('watch-form').addEventListener('submit', async function (e) {
+  e.preventDefault();
+  const input = document.getElementById('watch-input');
+  const statusEl = document.getElementById('watch-status');
+  const symbol = input.value.trim();
+  if (!symbol) return;
+  statusEl.textContent = '';
+  statusEl.className = 'muted';
+  let body;
+  try {
+    const r = await fetch('/api/watch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'symbol=' + encodeURIComponent(symbol),
+    });
+    body = await r.json();
+  } catch (err) {
+    statusEl.textContent = 'request failed';
+    statusEl.className = 'neg';
+    return;
+  }
+  if (body.ok) {
+    input.value = '';
+  } else {
+    statusEl.textContent = body.reason;
+    statusEl.className = 'neg';
+  }
+  refresh();
+});
+
+// Remove control: one per panel, delegated on the #symbols container so it
+// keeps working after refresh() replaces the container's innerHTML (no
+// re-binding needed on every poll).
+document.getElementById('symbols').addEventListener('click', async function (e) {
+  const btn = e.target.closest('.remove-btn');
+  if (!btn) return;
+  const symbol = btn.getAttribute('data-symbol');
+  btn.disabled = true;
+  try {
+    await fetch('/api/unwatch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'symbol=' + encodeURIComponent(symbol),
+    });
+  } catch (err) {
+    // leave the panel as-is; the next poll will reflect actual state either way
+  }
+  refresh();
+});
 
 // Pause/resume BOTH the client-side display loop AND (via POST
 // /api/polling) monitor-app's own server-side poller -- the client loop
@@ -707,7 +789,7 @@ _STYLE = """
 *{box-sizing:border-box}
 body{font:15px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
   margin:0;padding:1.5rem;background:var(--bg);color:var(--text);
-  max-width:52rem;margin-inline:auto}
+  max-width:76rem;margin-inline:auto}
 h1,h2,h3{margin:0 0 .5rem}
 h2{font-size:.95rem;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
 h3{font-size:.9rem;color:var(--text)}
@@ -717,13 +799,28 @@ h3{font-size:.9rem;color:var(--text)}
 .poll-controls button{background:var(--card);color:var(--text);
   border:1px solid var(--border);border-radius:.4rem;padding:.4rem .8rem;
   cursor:pointer}
+.watch-form{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;
+  margin-bottom:1rem}
+.watch-form input{background:var(--card);color:var(--text);
+  border:1px solid var(--border);border-radius:.4rem;padding:.4rem .6rem;
+  font-size:.9rem;width:12rem}
+.watch-form button{background:var(--accent);color:#fff;border:none;
+  border-radius:.4rem;padding:.4rem .9rem;cursor:pointer;font-size:.9rem}
+#watch-status{font-size:.85rem}
+#watch-status.neg{color:var(--neg);font-weight:600}
 .banner{background:var(--pending);color:#1a1400;padding:.6rem 1rem;
   border-radius:.4rem;margin-bottom:1rem;font-weight:600}
+.grid{display:grid;grid-template-columns:repeat(auto-fit, minmax(22rem, 1fr));
+  gap:1rem;margin-bottom:1rem}
 .card{background:var(--card);border:1px solid var(--border);
-  border-radius:.6rem;padding:1rem 1.2rem;margin-bottom:1rem}
+  border-radius:.6rem;padding:1rem 1.2rem}
 .hero{display:flex;align-items:baseline;gap:1rem}
 .hero-symbol{font-size:1.4rem;font-weight:700;letter-spacing:.02em}
-.hero-price{font-size:2.4rem;font-weight:700;font-variant-numeric:tabular-nums}
+.hero-price{font-size:2.4rem;font-weight:700;font-variant-numeric:tabular-nums;flex:1}
+.remove-btn{background:transparent;color:var(--muted);
+  border:1px solid var(--border);border-radius:.4rem;padding:.25rem .6rem;
+  font-size:.78rem;cursor:pointer;align-self:center}
+.remove-btn:hover{color:var(--neg);border-color:var(--neg)}
 table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
 table.detail th,table.detail td{padding:.3rem .5rem;text-align:left;
   border-bottom:1px solid var(--border);font-size:.9rem}
@@ -747,9 +844,7 @@ def _wrap(body: str, poll_enabled: bool) -> str:
         f"<style>{_STYLE}</style></head><body>"
         f"<div class='topbar'><h1>momentum monitor</h1>{_poll_toggle_html(poll_enabled)}</div>"
         f"{body}"
-        "<p class='footer'>Read-only technical read. Not advice, not an order. "
-        "Phase 2 Stage A: no add/remove UI yet -- use POST /api/watch / "
-        "POST /api/unwatch directly.</p>"
+        "<p class='footer'>Read-only technical read. Not advice, not an order.</p>"
         f"<script>{_SCRIPT}</script>"
         "</body></html>"
     )
@@ -792,7 +887,7 @@ def create_app(*, fetch_bars, watch_symbol=None, poll_interval: float = 5.0,
     @app.get("/", response_class=HTMLResponse)
     async def root():
         return _page(poller.all_full_states(), poller.recent_closed(limit=10),
-                    poller.poll_enabled)
+                    poller.poll_enabled, poller.max_symbols)
 
     @app.post("/api/watch")
     async def api_watch(request: Request):
