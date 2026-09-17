@@ -150,6 +150,46 @@ picking.
   traders, unlike a swing level which requires an actual prior touch to
   exist at all.
 
+**Round-number grid, TIERED by price (fixed 2026-09-17 — see
+`levels.py`'s `_round_number_increment`).** The original version used a
+single fixed $0.50 increment everywhere. That's wrong at both ends of
+this tool's actual price range: a $0.50 jump is meaningless noise for a
+$150 stock, and it's a huge, arbitrary jump for a $1 one — confirmed
+live against RETO trading at $0.5989, where the fixed grid's nearest
+level above was $1.00 (a 40-cent jump) versus the tiered grid's $0.60
+(about a tenth of a cent away, the actually-meaningful next dime).
+Tiers: **under
+$2 → $0.10** (dimes), **$2 up to $10 → $0.25** (quarters), **$10 and up
+→ $0.50** (half-dollars) — chosen to roughly cover the user's stated
+$0.50–$15 trading range, not empirically fit past that range. The two
+breakpoints ($2, $10) were deliberately chosen because they're a shared
+multiple of the increments on both sides of each boundary (2.0 is a
+multiple of both $0.10 and $0.25; 10.0 is a multiple of both $0.25 and
+$0.50), so the grid has no gap or overlap exactly at a tier boundary —
+confirmed by test (`test_nearest_round_number_above_has_no_discontinuity
+_at_tier_boundaries`). Applies to both the round-number reclaim
+candidate above and the existing proximity bonus in level-strength
+scoring (section 3, `Level.round_number_bonus`) — one canonical grid
+definition, still, same as before this fix.
+
+**Known limitation: round-number reclaim structurally biases "closest"
+toward itself, not necessarily toward "best."** Round-number reclaim is
+the only one of the four setup types with NO gating condition — it
+always produces a candidate, because there is always a round number
+somewhere above any price. The other three require real detected
+structure to exist at all (a swing-high cluster for resistance/micro-
+breakout, an actual VWAP pullback in progress for VWAP reclaim) and are
+simply ABSENT when that structure doesn't exist near price. This means
+whenever price isn't near real structure, round-number reclaim will
+systematically win "closest by dollar distance" by default — not
+because it's a better opportunity, but because it's the only candidate
+computable at all at that moment. "Closest" is a distance ranking among
+whatever candidates happen to exist, not a claim that the closest one is
+the best setup; a future reader must not conflate the two. Not fixed in
+this pass — flagged here so it's a known, documented tradeoff of the
+current comparison method rather than a silent bias someone has to
+rediscover.
+
 **Comparison metric: raw dollar distance to trigger, deliberately NOT
 percentage and NOT volatility-relative.** A percentage or ATR-relative
 metric would already be doing exactly the kind of implicit normalizing

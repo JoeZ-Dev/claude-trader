@@ -17,13 +17,29 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-# Half-dollar grid -- retail attention tends to cluster at round numbers,
-# especially in low-priced names. Shared by both the proximity bonus
-# below (nearest EITHER side, used to score an already-detected level)
-# and setup_types.py's round-number reclaim candidate (nearest ABOVE
-# only, since that candidate is breakout-above-direction-only) -- one
-# canonical grid definition, not two independently-chosen ones.
-_ROUND_NUMBER_INCREMENT = 0.5
+# Round-number grid, TIERED by price -- retail attention clusters at
+# round numbers, but what counts as "round" scales with price: a nickel
+# matters at $1, but is meaningless noise at $150, while a half-dollar
+# jump is far too coarse to mean anything for a $1 stock. A single fixed
+# $0.50 grid (the original version of this) got that wrong at both ends.
+# Tiers (see specs.md section 3 for the full reasoning): under $2, dimes
+# ($0.10); $2 up to $10, quarters ($0.25); $10 and up, half-dollars
+# ($0.50) -- chosen to roughly cover the user's stated $0.50-$15 trading
+# range, with the two breakpoints ($2, $10) deliberately picked so they
+# land on a shared multiple of every tier's increment on both sides (2.0
+# is a multiple of both 0.10 and 0.25; 10.0 is a multiple of both 0.25
+# and 0.50), so the grid has no discontinuity exactly at a boundary.
+# Shared by both the proximity bonus below (nearest EITHER side, used to
+# score an already-detected level) and setup_types.py's round-number
+# reclaim candidate (nearest ABOVE only, since that candidate is
+# breakout-above-direction-only) -- one canonical grid definition, not
+# two independently-chosen ones.
+def _round_number_increment(price: float) -> float:
+    if price < 2.0:
+        return 0.10
+    if price < 10.0:
+        return 0.25
+    return 0.50
 
 
 @dataclass
@@ -67,32 +83,38 @@ def _swing_points(bars: list[dict], window: int, kind: str) -> list[int]:
     return idxs
 
 
-def _nearest_round_number(price: float, increment: float = _ROUND_NUMBER_INCREMENT) -> float:
-    """Nearest round-number grid point on EITHER side of `price`."""
-    return round(price / increment) * increment
+def _nearest_round_number(price: float, increment: float | None = None) -> float:
+    """Nearest round-number grid point on EITHER side of `price`. Grid
+    increment is picked by `_round_number_increment(price)` (that price's
+    own tier) unless the caller overrides it explicitly."""
+    inc = increment if increment is not None else _round_number_increment(price)
+    return round(price / inc) * inc
 
 
-def nearest_round_number_above(price: float, increment: float = _ROUND_NUMBER_INCREMENT) -> float:
-    """Smallest round-number grid point STRICTLY ABOVE `price`. Used by
-    setup_types.py's round-number reclaim candidate: that setup type is
-    breakout-above-direction-only (specs.md phase 3.5's deliberate scope
-    for this pass), so the relevant round level is always the next one
-    up, never merely the nearest in either direction the way the bonus
-    below needs. The while-loop is a float-precision guard (price could
-    land fractionally below an increment boundary due to float
-    representation, e.g. 9.0 stored as 8.999999999999998), not expected
-    to loop more than once in practice."""
-    candidate = (math.floor(price / increment) + 1) * increment
+def nearest_round_number_above(price: float, increment: float | None = None) -> float:
+    """Smallest round-number grid point STRICTLY ABOVE `price`, on the
+    grid tier `price` itself falls into (see `_round_number_increment`).
+    Used by setup_types.py's round-number reclaim candidate: that setup
+    type is breakout-above-direction-only (specs.md phase 3.5's
+    deliberate scope for this pass), so the relevant round level is
+    always the next one up, never merely the nearest in either direction
+    the way the bonus below needs. The while-loop is a float-precision
+    guard (price could land fractionally below an increment boundary due
+    to float representation, e.g. 9.0 stored as 8.999999999999998), not
+    expected to loop more than once in practice."""
+    inc = increment if increment is not None else _round_number_increment(price)
+    candidate = (math.floor(price / inc) + 1) * inc
     while candidate <= price:
-        candidate += increment
+        candidate += inc
     return round(candidate, 4)
 
 
 def _round_number_bonus(price: float) -> float:
-    """Small bonus for proximity to a half-dollar/dollar level - retail
-    attention tends to cluster there, especially in low-priced names."""
-    nearest_half = _nearest_round_number(price)
-    distance_pct = abs(price - nearest_half) / price
+    """Small bonus for proximity to a round-number grid point (tiered by
+    price -- see `_round_number_increment`) - retail attention tends to
+    cluster there, especially in low-priced names."""
+    nearest = _nearest_round_number(price)
+    distance_pct = abs(price - nearest) / price
     return max(0.0, 1.0 - distance_pct / 0.01)  # full bonus within 1%, fades to 0
 
 

@@ -130,7 +130,39 @@ def test_round_number_reclaim_watchable_with_zero_prior_touches():
 def test_nearest_round_number_above_always_strictly_greater():
     assert nearest_round_number_above(24.7) == 25.0
     assert nearest_round_number_above(25.0) == 25.5  # exactly on the grid -- next one up, not itself
-    assert nearest_round_number_above(0.02) == 0.5
+
+
+def test_nearest_round_number_above_uses_the_tier_for_price():
+    # Under $2: dimes.
+    assert nearest_round_number_above(0.02) == 0.10
+    assert nearest_round_number_above(1.23) == 1.30
+    # $2 up to $10: quarters.
+    assert nearest_round_number_above(2.05) == 2.25
+    assert nearest_round_number_above(5.10) == 5.25
+    # $10 and up: half-dollars (the pre-tiering behavior, unchanged).
+    assert nearest_round_number_above(10.01) == 10.5
+    assert nearest_round_number_above(153.6) == 154.0
+
+
+def test_nearest_round_number_above_has_no_discontinuity_at_tier_boundaries():
+    # The dime grid reaching $2 must land exactly on $2.00 (also a valid
+    # quarter-grid point) -- no gap or overlap where the tiers meet.
+    assert nearest_round_number_above(1.99) == 2.00
+    # Same for the quarter grid reaching $10 (also a valid half-dollar
+    # grid point).
+    assert nearest_round_number_above(9.99) == 10.00
+
+
+def test_round_number_reclaim_uses_the_dime_tier_for_a_sub_two_dollar_symbol():
+    # A fixed $0.50 grid (the pre-tiered behavior) would put the trigger
+    # a full 43 cents away here -- a huge, meaningless jump for a stock
+    # trading under $2. The dime tier must be what actually surfaces
+    # end to end through evaluate_setups, not just the standalone helper.
+    live_bars = [bar(0, 1.05, 1.1, 1.0, 1.07, 10_000)]
+    candidates = evaluate_setups([], live_bars, current_price=1.07, vwap=None)
+    reclaim = next(c for c in candidates if c.setup_type == "round_number_reclaim")
+    assert reclaim.trigger_price == 1.10
+    assert reclaim.distance == round(1.10 - 1.07, 4)
 
 
 # -- dollar-distance sort ---------------------------------------------------
