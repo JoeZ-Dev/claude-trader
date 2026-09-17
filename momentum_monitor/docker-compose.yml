@@ -1,8 +1,14 @@
 # momentum_monitor phase 1 -- two live services (claude-connector is a
 # phase-3 placeholder, deliberately not a service here).
 #
-#   Live Schwab data:  set SCHWAB_API_KEY / SCHWAB_APP_SECRET / WATCH_SYMBOL /
-#                      AUTH_HELPER_URL, then:  docker compose up
+#   Live Schwab data:  set AUTH_HELPER_URL / INTERNAL_AUTH_SECRET / WATCH_SYMBOL
+#                      in momentum_monitor/.env (gitignored -- see RUNBOOK.md
+#                      section 1-2 for provisioning), then: docker compose up --build
+#                      (SCHWAB_API_KEY / SCHWAB_APP_SECRET are also read here but
+#                      NOT functionally required under the companion-auth
+#                      credential model -- traced and verified live against the
+#                      REST path specifically, see RUNBOOK.md section 3 / specs.md
+#                      section 4; leave them unset unless that changes)
 #   Replay (no token): STREAM_SOURCE=replay WATCH_SYMBOL=AEHL docker compose up
 #
 # Networks:

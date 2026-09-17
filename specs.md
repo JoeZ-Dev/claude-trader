@@ -358,6 +358,52 @@ principle, with no code living loose at repo root:
   use before the fix); this stays a genuine invariant, not a "usually
   fine" convention: this repo does not run multi-symbol concurrently
   (see roadmap phase 2, which this feature is explicitly NOT).
+
+  **Page refresh mechanism (redesigned from a bug, not a style choice):**
+  the page originally used `<meta http-equiv="refresh" content="5">` — a
+  full page reload every 5 seconds. That was never the design (the
+  original intent was always in-place JS updates); the full reload was
+  the actual cause of visible flicker/redraw, not a matter of taste. It's
+  gone, replaced with an inline `<script>`: `setInterval(refresh, 4000)`
+  calls `GET /api/state` and updates specific elements by id (price,
+  VWAP, EMAs, MACD, relative volume, the resistance/support blocks, the
+  journal section) rather than replacing large chunks of markup or
+  reloading. The Python side (`app.py`'s `_page`) still computes the same
+  real first-paint HTML from current `state`/`journal` on every server
+  request — a fresh load shows real data immediately, and it keeps
+  server-side rendering meaningfully testable without a browser — while
+  the JS mirrors the same rendering logic for subsequent in-place
+  updates. The two renderers are deliberately duplicated, not shared:
+  "single file, no framework, no build step" rules out a shared
+  template, so this is a small, contained, explicitly-commented tradeoff,
+  not an oversight. The visual redesign that came with this (dark
+  card-based layout, a real type scale, meaningful color: price vs VWAP,
+  price vs EMA9, MACD histogram sign, open/closed P&L sign) stays inside
+  the same non-negotiable constraint as core's own scoring (section 3):
+  nothing gets collapsed into a single composite number — level strength
+  components and hold-confirmation's consecutive-bars/failed-attempts
+  detail are exactly as visible as before, just better laid out.
+
+  **Pause/resume polling — two layers, not one.** A "Pause updates"
+  button next to the ticker box stops polling entirely, but "polling"
+  here means two independent things and the button controls both: (1)
+  the client-side `setInterval` above (browser → `monitor-app`, traffic
+  that never left localhost/the LAN, so pausing it alone saves nothing
+  real), and (2), the one that actually matters, `monitor-app`'s own
+  background `Poller.run()` loop hitting `schwab-connector`'s
+  `GET /bars/{symbol}` on its own `POLL_INTERVAL` (default 5s) —
+  completely independent of any browser activity, and still running even
+  with every browser tab closed until this second layer is paused too.
+  `POST /api/polling {"enabled": bool}` controls the server-side loop;
+  `GET /api/state`'s `poll_enabled` field is the resulting server truth,
+  which the page's JS treats as authoritative (re-syncing its own
+  button/interval to it on every poll) rather than keeping a client-only
+  preference — correct across multiple tabs/devices, not just the one
+  that clicked the button. Pausing never touches `schwab-connector`'s own
+  live Schwab stream or its stored bars either way; resuming needs no
+  backfill, just picks polling back up. Verified live (2026-09-16):
+  paused, `bar_count` genuinely stopped advancing for 12 real seconds
+  against the running stack; resumed, it advanced again immediately.
 - **`momentum_monitor/docker-compose.yml`** — orchestrates all three.
 
 ### 6. Virtual trade journal — momentum_monitor phase 4
