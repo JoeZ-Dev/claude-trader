@@ -2,11 +2,22 @@
 monitor-app FastAPI web app -- phase 2: up to MAX_SYMBOLS (4) concurrently
 watched symbols, each independently polled, analyzed, and journaled.
 
-Holds no credentials. A background poller pulls new bars from
-schwab-connector for every currently-watched symbol, keeps each symbol's
-own running bar list, and recomputes that symbol's full state
-(state.build_state, UNCHANGED -- phase 2 runs the exact same per-symbol
-math N times, not different math) after every poll. Serves:
+Holds no credentials. Bars now arrive by PUSH, not poll (fixed
+2026-09-17 -- see specs.md: the old 5s poll of schwab-connector stacked
+with the browser's old 4s poll of this service added up to ~9s of
+self-inflicted latency on top of Schwab's own, separately-fixed,
+throttling ceiling). schwab-connector streams every bar close over one
+shared SSE connection (GET /events); main.py's stream_events() consumes
+it and calls Poller.apply_bar_push() the instant one arrives, which
+keeps each symbol's own running bar list and recomputes that symbol's
+full state (state.build_state, UNCHANGED -- still the exact same
+per-symbol math run N times, not different math). A REST catch-up
+fetch (Poller.catch_up(), still using fetch_bars) still runs once when
+a symbol is first added, and again for every watched symbol on
+stream_events' on_reconnect callback (Poller.resync_all()) -- both
+close any gap between "what monitor-app has" and "what schwab-connector
+has stored", the same dedup guard `_apply_new_bars` always applied.
+Serves:
 
   GET  /api/state    -> {"symbols": {SYM: {...same shape as phase 1's
                         whole response, plus a per-symbol "journal.open"},
@@ -14,7 +25,18 @@ math N times, not different math) after every poll. Serves:
                         "max_symbols": int}
                         Deliberate breaking change from phase 1's single-
                         object shape -- nothing else depends on the old
-                        form, no back-compat shim.
+                        form, no back-compat shim. Kept for first paint
+                        and tooling even now that live updates are
+                        pushed -- see /api/state/stream below.
+  GET  /api/state/stream -> Server-Sent Events, one `data:` line per
+                        SAME-SHAPED snapshot as GET /api/state above,
+                        pushed the instant Poller state changes (a new
+                        bar applied, a symbol added/removed, a journal
+                        row deleted) -- replaces the browser's old 4s
+                        setInterval poll. Emits one immediate snapshot on
+                        connect so a fresh tab doesn't wait for the next
+                        change, plus a 15s keep-alive comment line while
+                        idle.
   GET  /             -> Stage B: a responsive grid of up to 4 symbol
                         panels, an add-symbol form (POSTs /api/watch,
                         fills the next empty slot -- never replaces an
@@ -22,8 +44,9 @@ math N times, not different math) after every poll. Serves:
                         (POSTs /api/unwatch for that panel's own symbol
                         only). JS-refreshed in place the same way as
                         phase 1 (no meta-refresh, no full-page reload):
-                        refresh() re-fetches /api/state and rebuilds
-                        #symbols' innerHTML each poll.
+                        render(data) rebuilds #symbols' innerHTML on
+                        every EventSource message (or explicit
+                        post-action refresh()).
   POST /api/watch    -> {"symbol": "..."} (urlencoded form) ADDS a symbol
                         to the watched set (up to max_symbols) -- this is
                         a deliberate behavior change from phase 1, where
@@ -44,9 +67,12 @@ math N times, not different math) after every poll. Serves:
                         force-closing any open virtual-journal position
                         for it (see Poller.remove_symbol).
   POST /api/polling  -> {"enabled": bool} pauses/resumes monitor-app's own
-                        background poll loop for ALL watched symbols at
-                        once (one global switch, not per-symbol) -- see
-                        Poller.set_poll_enabled.
+                        applying of incoming bar-push events for ALL
+                        watched symbols at once (one global switch, not
+                        per-symbol) -- see Poller.set_poll_enabled. Route
+                        name kept from the poll-based design; the pause
+                        semantic is unchanged, only what it gates (push
+                        application instead of a poll timer) is new.
   POST /api/journal/delete -> {"id": "..."} (urlencoded form) permanently
                         deletes ONE closed trade row from the SQLite
                         journal (never an open position -- see
@@ -83,21 +109,19 @@ and BarStore's cache is already keyed by symbol. The earlier watch/unwatch
 leak (fixed pre-phase-2) was only possible BECAUSE schwab-connector was
 already happily running multiple concurrent per-symbol streams with no
 artificial limit -- that capability existing is exactly why this phase
-needs no schwab-connector changes, per specs.md's own roadmap note. One
-architectural fact worth knowing, not a defect: each watched symbol gets
-its own independent Schwab streaming connection and its own independent
-~30-minute proactive token-refresh cycle (main.py's _source_factory builds
-a fresh ReconnectingStreamSource, with its own AccessTokenSource, per
-symbol) rather than one connection multiplexing many symbols -- 4
-concurrent symbols means 4 independent WebSocket sessions and 4
-independent refresh cycles. This needs to be watched under real load, not
-assumed to be fine because it's not a "single-symbol assumption" bug (see
-the phase 2 live-proof evidence for whether it actually holds up).
+needs no schwab-connector changes, per specs.md's own roadmap note.
+
+(Superseded 2026-09-17, twice over -- see specs.md: schwab-connector now
+serves every watched symbol over ONE shared Schwab stream connection,
+not one per symbol as this paragraph originally described; and bars now
+reach this service by push over that same shared-connection pattern
+(GET /events), not by this service polling schwab-connector on a timer.)
 """
 from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 import re
 import time
@@ -106,7 +130,7 @@ from dataclasses import dataclass, field
 from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from journal_logic import ExitEvent, OpenPosition, advance_journal
 from state import build_state
@@ -153,7 +177,7 @@ class _SymbolSlot:
 
 
 class Poller:
-    def __init__(self, *, fetch_bars, watch_symbol=None, poll_interval, announce_watch,
+    def __init__(self, *, fetch_bars, watch_symbol=None, announce_watch,
                  announce_unwatch=None,
                  announce_retry_attempts=ANNOUNCE_RETRY_ATTEMPTS,
                  announce_retry_base_delay=ANNOUNCE_RETRY_BASE_DELAY_SECONDS,
@@ -162,7 +186,6 @@ class Poller:
                  max_symbols=MAX_SYMBOLS):
         self._fetch_bars = fetch_bars
         self._initial_symbol = watch_symbol.upper() if watch_symbol else None
-        self._interval = poll_interval
         self._announce_watch = announce_watch
         self._announce_unwatch = announce_unwatch
         self._announce_retry_attempts = announce_retry_attempts
@@ -174,6 +197,7 @@ class Poller:
         self._max_symbols = max_symbols
         self._slots: dict[str, _SymbolSlot] = {}
         self._poll_enabled = True
+        self._state_subscribers: set[asyncio.Queue] = set()
 
     @property
     def symbols(self) -> list[str]:
@@ -188,16 +212,22 @@ class Poller:
     def poll_enabled(self) -> bool:
         return self._poll_enabled
 
-    def set_poll_enabled(self, enabled: bool) -> None:
-        """Pause/resume the background poll loop for ALL watched symbols
-        at once (one global switch, not per-symbol) -- schwab-connector's
-        live stream(s) and stored bars are unaffected either way, this
-        only stops monitor-app from pulling new ones in while nobody's
-        watching. Distinct from (and the thing that actually matters,
-        unlike) the client-side setInterval the page also has -- that only
-        stops browser<->monitor-app traffic, which never left localhost/
-        the LAN in the first place."""
+    async def set_poll_enabled(self, enabled: bool) -> None:
+        """Pause/resume applying incoming bar-push events for ALL watched
+        symbols at once (one global switch, not per-symbol) --
+        schwab-connector's live stream and stored bars are unaffected
+        either way, this only stops monitor-app from applying new ones
+        in while nobody's watching. Distinct from (and the thing that
+        actually matters, unlike) the client-side EventSource the page
+        also has -- that only stops browser<->monitor-app traffic, which
+        never left localhost/the LAN in the first place. Same semantic as
+        the original poll-based design, just re-triggered by push instead
+        of a timer: on resume, resync_all() catches up on anything that
+        arrived (and was dropped) while paused, so nothing pushed during
+        a pause is silently lost."""
         self._poll_enabled = enabled
+        if enabled:
+            await self.resync_all()
 
     def state_for(self, symbol: str) -> dict | None:
         slot = self._slots.get(symbol.upper())
@@ -235,7 +265,10 @@ class Poller:
         open position."""
         if self._journal_store is None:
             return False
-        return self._journal_store.delete_closed(trade_id)
+        deleted = self._journal_store.delete_closed(trade_id)
+        if deleted:
+            self._broadcast_state()
+        return deleted
 
     def clear_symbol_switched(self) -> int:
         """Permanently deletes every symbol_switched closed row (the bulk
@@ -243,7 +276,10 @@ class Poller:
         number removed."""
         if self._journal_store is None:
             return 0
-        return self._journal_store.delete_symbol_switched()
+        deleted = self._journal_store.delete_symbol_switched()
+        if deleted:
+            self._broadcast_state()
+        return deleted
 
     def _journal_open_for(self, slot: _SymbolSlot) -> dict | None:
         if slot.journal_position is None:
@@ -260,13 +296,13 @@ class Poller:
         }
 
     async def run(self) -> None:
+        """No longer a polling loop (fixed 2026-09-17 -- see specs.md):
+        seeds the STARTING symbol once, if configured, then returns. New
+        bars now arrive via apply_bar_push(), driven by main.py's
+        stream_events() consuming schwab-connector's shared SSE
+        connection, not by this method looping on a timer."""
         if self._initial_symbol is not None:
             await self.add_symbol(self._initial_symbol)
-        while True:
-            if self._poll_enabled:
-                for symbol in list(self._slots.keys()):
-                    await self._poll_once(symbol)
-            await asyncio.sleep(self._interval)
 
     async def add_symbol(self, symbol: str) -> tuple[bool, str]:
         """Add a symbol to the watched set. Returns (True, note) on
@@ -307,6 +343,13 @@ class Poller:
             self._slots[symbol].journal_was_confirmed = resumed is not None
         if self._announce_watch is not None:
             await self._announce_watch_with_retry(symbol)
+        if self._poll_enabled:
+            # Same gating as apply_bar_push: paused means monitor-app
+            # doesn't ingest anything, including a brand-new symbol's
+            # initial history -- it picks up on the next resync_all()
+            # when polling resumes, same as the old poll-based design
+            # left a newly-added symbol for the next timer tick.
+            await self.catch_up(symbol)
         return True, note
 
     async def remove_symbol(self, symbol: str) -> bool:
@@ -343,6 +386,7 @@ class Poller:
                     "watching it until explicitly unwatched again: %s",
                     symbol, exc,
                 )
+        self._broadcast_state()
         return True
 
     async def _announce_watch_with_retry(self, symbol: str) -> None:
@@ -368,7 +412,34 @@ class Poller:
                         symbol, self._announce_retry_attempts, exc,
                     )
 
-    async def _poll_once(self, symbol: str) -> None:
+    def _apply_new_bars(self, symbol: str, slot: _SymbolSlot, incoming: list[dict]) -> None:
+        """Shared core for both ingestion paths: catch_up()'s REST fetch
+        and apply_bar_push()'s single pushed bar. The ts-dedup guard
+        below is what makes it safe to call this with overlapping data
+        from either path in either order -- a bar already appended (by
+        push) is silently skipped when catch_up's REST fetch later
+        includes it too, and vice versa."""
+        new_bars = []
+        for bar in incoming:
+            if not slot.bars or bar["ts"] > slot.bars[-1]["ts"]:
+                slot.bars.append(bar)
+                new_bars.append(bar)
+        if new_bars:
+            slot.last_ts = slot.bars[-1]["ts"]
+        slot.state = build_state(slot.bars, symbol)
+        slot.poll_ok = True
+        self._update_journal(symbol, slot, new_bars)
+        self._broadcast_state()
+
+    async def catch_up(self, symbol: str) -> None:
+        """One-shot REST backfill via the existing fetch_bars/GET
+        /bars/{symbol} -- called once when a symbol is first added, and
+        again for every watched symbol by resync_all() (see
+        set_poll_enabled and main.py's stream_events' on_reconnect
+        callback). Any overlap with concurrently-arriving pushed bars is
+        handled by _apply_new_bars' dedup guard, so subscribing to the
+        push stream first and catching up after (rather than the other
+        way around) can never lose or duplicate a bar."""
         slot = self._slots.get(symbol)
         if slot is None:
             return
@@ -385,16 +456,68 @@ class Poller:
             # object) cases. Same class of race phase 1's switch_symbol
             # guarded against, generalized to per-symbol slots.
             return
-        new_bars = []
-        for bar in incoming:
-            if not slot.bars or bar["ts"] > slot.bars[-1]["ts"]:
-                slot.bars.append(bar)
-                new_bars.append(bar)
-        if new_bars:
-            slot.last_ts = slot.bars[-1]["ts"]
-        slot.state = build_state(slot.bars, symbol)
-        slot.poll_ok = True
-        self._update_journal(symbol, slot, new_bars)
+        self._apply_new_bars(symbol, slot, incoming)
+
+    async def resync_all(self) -> None:
+        """Catches up every watched symbol -- called on every
+        stream_events (re)connect (closes the gap for both "the shared
+        push connection wasn't up yet" and "it just dropped and
+        reconnected") and on poll resume (closes the gap for whatever
+        arrived, and was dropped, while paused)."""
+        for symbol in list(self._slots):
+            await self.catch_up(symbol)
+
+    async def apply_bar_push(self, symbol: str, bar: dict) -> None:
+        """Entry point for a bar pushed over schwab-connector's shared
+        SSE connection (main.py's stream_events -> here). Gated by
+        poll_enabled exactly like catch_up: paused means don't apply
+        incoming updates at all -- schwab-connector keeps streaming and
+        storing regardless either way, same meaning this flag has always
+        had, just re-triggered by push instead of a timer tick."""
+        if not self._poll_enabled:
+            return
+        symbol = symbol.upper()
+        slot = self._slots.get(symbol)
+        if slot is None:
+            return  # not (or no longer) watched by this instance
+        self._apply_new_bars(symbol, slot, [bar])
+
+    @asynccontextmanager
+    async def subscribe_state(self):
+        """One queue per open GET /api/state/stream browser connection.
+        maxsize=1, overwrite-latest (not schwab-connector's Connector.
+        subscribe's drop-oldest) -- correct here specifically because
+        every payload is a full snapshot, not a delta, so only the
+        newest one a slow browser hasn't read yet still matters."""
+        q: asyncio.Queue = asyncio.Queue(maxsize=1)
+        self._state_subscribers.add(q)
+        try:
+            yield q
+        finally:
+            self._state_subscribers.discard(q)
+
+    def _state_payload(self) -> dict:
+        return {
+            "symbols": self.all_full_states(),
+            "recent_closed": self.recent_closed(limit=10),
+            "poll_enabled": self.poll_enabled,
+            "max_symbols": self.max_symbols,
+        }
+
+    def _broadcast_state(self) -> None:
+        payload = self._state_payload()
+        for q in list(self._state_subscribers):
+            try:
+                q.put_nowait(payload)
+            except asyncio.QueueFull:
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    q.put_nowait(payload)
+                except asyncio.QueueFull:
+                    pass
 
     def _update_journal(self, symbol: str, slot: _SymbolSlot, new_bars: list[dict]) -> None:
         if self._journal_store is None:
@@ -920,23 +1043,23 @@ function symbolCardHtml(symbol, state) {
     levelChipsHtml(symbol, state.levels.resistance, state.levels.support) +
     '</section>';
 }
-async function refresh() {
-  let data;
-  try {
-    const r = await fetch('/api/state');
-    data = await r.json();
-  } catch (e) {
-    return;  // keep showing the last-good render, same philosophy as the server's own poll_ok
-  }
+// render(data) does the actual DOM patch, driven by EITHER a push
+// (EventSource.onmessage) or the explicit post-action fetch() below --
+// same DOM-patch approach either way (fixed 2026-09-17: no full-page or
+// full-#symbols replace beyond what's needed), so a push arriving
+// mid-interaction is no more disruptive than a poll-triggered one was.
+function render(data) {
   applyPollUiState(data.poll_enabled);  // stay in sync even if another tab paused/resumed it
   const symbolsEl = document.getElementById('symbols');
 
   // Preserve which setup-chip/level-chip detail sections are currently
-  // expanded across this poll's full innerHTML rebuild -- fixed
+  // expanded across this render's full innerHTML rebuild -- fixed
   // 2026-09-17: without this, an expanded section silently re-collapsed
-  // on the very next ~4s poll, since #symbols' whole subtree gets
-  // rebuilt from scratch every refresh() and a freshly-built chip always
-  // starts hidden, with nothing remembering which ones were open.
+  // on the very next update, since #symbols' whole subtree gets rebuilt
+  // from scratch every render() and a freshly-built chip always starts
+  // hidden, with nothing remembering which ones were open. Still applies
+  // now that updates are pushed rather than polled -- a push can land
+  // mid-interaction just as easily as a poll could.
   const expandedKeys = new Set();
   symbolsEl.querySelectorAll('.setup-chip[data-key]').forEach(function (chip) {
     const detail = chip.nextElementSibling;
@@ -957,6 +1080,22 @@ async function refresh() {
 
   document.getElementById('journal-closed-tbody').innerHTML = journalClosedRows(data.recent_closed);
   document.getElementById('slot-count').textContent = syms.length + ' / ' + maxSymbols + ' symbols watched';
+}
+
+// Thin wrapper kept for the explicit post-action call sites below
+// (watch/unwatch/journal delete/clear/poll-toggle) -- a same-request-
+// cycle fetch is snappier for the tab that just took the action than
+// waiting on the next push, which the SSE connection below still
+// delivers to every OTHER open tab.
+async function refresh() {
+  let data;
+  try {
+    const r = await fetch('/api/state');
+    data = await r.json();
+  } catch (e) {
+    return;  // keep showing the last-good render, same philosophy as the server's own poll_ok
+  }
+  render(data);
 }
 
 // Add-symbol form: POSTs /api/watch, which ADDS to the watched set (fills
@@ -1001,11 +1140,9 @@ document.getElementById('watch-form').addEventListener('submit', async function 
 
 // Setup chip expand/collapse: purely local DOM toggle, no fetch, no
 // refresh() -- delegated on #symbols for the same reason as the remove
-// control below. Expanded state is NOT preserved across the next poll
-// (refresh() rebuilds #symbols' innerHTML from scratch every 4s, same as
-// every other in-place update this page does) -- an accepted tradeoff,
-// not an oversight, consistent with this page's existing "no persistent
-// client state across polls" design.
+// control below. Expanded state IS preserved across the next render(),
+// whether it's push- or fetch()-triggered -- see render()'s expandedKeys
+// save/restore above.
 document.getElementById('symbols').addEventListener('click', function (e) {
   const chip = e.target.closest('.setup-chip');
   if (!chip) return;
@@ -1088,27 +1225,20 @@ document.getElementById('clear-symbol-switched-btn').addEventListener('click', a
   refresh();
 });
 
-// Pause/resume BOTH the client-side display loop AND (via POST
-// /api/polling) monitor-app's own server-side poller -- the client loop
-// alone only stops browser<->monitor-app traffic, which never left
-// localhost/the LAN; the server-side one is what actually stops hitting
-// schwab-connector. Server truth (poll_enabled, from /api/state) is
-// authoritative, not a client-only preference -- correct across multiple
-// tabs/devices and across a fresh page load, with no localStorage needed.
-const POLL_MS = 4000;
-let pollTimer = null;
+// Pause/resume (via POST /api/polling) monitor-app's own applying of
+// incoming bar-push events -- the EventSource connection below stays
+// open either way (nothing to start/stop client-side, unlike the old
+// setInterval poll), it just goes quiet because the server stops
+// broadcasting while paused. Server truth (poll_enabled, from
+// /api/state or /api/state/stream) is authoritative, not a client-only
+// preference -- correct across multiple tabs/devices and across a fresh
+// page load, with no localStorage needed.
 let pollEnabled = true;
 
 function applyPollUiState(enabled) {
   pollEnabled = enabled;
   document.getElementById('poll-toggle').textContent = enabled ? 'Pause updates' : 'Resume updates';
   document.getElementById('poll-status').textContent = enabled ? 'live' : 'paused';
-  if (enabled) {
-    if (!pollTimer) pollTimer = setInterval(refresh, POLL_MS);
-  } else if (pollTimer) {
-    clearInterval(pollTimer);
-    pollTimer = null;
-  }
 }
 
 document.getElementById('poll-toggle').addEventListener('click', async function () {
@@ -1125,10 +1255,29 @@ document.getElementById('poll-toggle').addEventListener('click', async function 
     return;  // request failed -- leave the UI showing the last known real state
   }
   applyPollUiState(body.poll_enabled);
-  if (body.poll_enabled) refresh();  // immediate refresh on resume, not a wait for the next tick
+  if (body.poll_enabled) refresh();  // immediate refresh on resume, not a wait for the next push
 });
 
-refresh();
+// Leg 2 of the poll -> push replacement (specs.md): pushes state updates
+// the moment they change, via the browser's native EventSource API --
+// replaces the old setInterval(refresh, POLL_MS) timer. No manual
+// reconnect logic needed: EventSource retries per spec, including across
+// a monitor-app restart, and each reconnect's first message is always a
+// fresh full snapshot (see /api/state/stream), not a delta.
+let evtSource = null;
+function connectEventSource() {
+  evtSource = new EventSource('/api/state/stream');
+  evtSource.onmessage = function (e) {
+    let data;
+    try {
+      data = JSON.parse(e.data);
+    } catch (err) {
+      return;
+    }
+    render(data);
+  };
+}
+connectEventSource();
 """
 
 _STYLE = """
@@ -1226,15 +1375,15 @@ def _wrap(body: str, poll_enabled: bool) -> str:
     )
 
 
-def create_app(*, fetch_bars, watch_symbol=None, poll_interval: float = 5.0,
-               announce_watch=None, announce_unwatch=None,
+def create_app(*, fetch_bars, watch_symbol=None,
+               announce_watch=None, announce_unwatch=None, stream_events=None,
                announce_retry_attempts=ANNOUNCE_RETRY_ATTEMPTS,
                announce_retry_base_delay=ANNOUNCE_RETRY_BASE_DELAY_SECONDS,
                announce_retry_max_delay=ANNOUNCE_RETRY_MAX_DELAY_SECONDS,
                journal_store=None, trail_pct=DEFAULT_TRAIL_PCT,
                now_fn=time.time, max_symbols=MAX_SYMBOLS) -> FastAPI:
     poller = Poller(fetch_bars=fetch_bars, watch_symbol=watch_symbol,
-                    poll_interval=poll_interval, announce_watch=announce_watch,
+                    announce_watch=announce_watch,
                     announce_unwatch=announce_unwatch,
                     announce_retry_attempts=announce_retry_attempts,
                     announce_retry_base_delay=announce_retry_base_delay,
@@ -1244,21 +1393,47 @@ def create_app(*, fetch_bars, watch_symbol=None, poll_interval: float = 5.0,
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        task = asyncio.create_task(poller.run())
+        # Background tasks, not awaited here -- a slow (or, in a test,
+        # deliberately blocked) initial catch-up fetch must not block the
+        # app from starting up and serving requests (e.g. /api/state
+        # showing "warming_up") while it's in flight, same non-blocking-
+        # startup property the old poll loop had as a background task.
+        run_task = asyncio.create_task(poller.run())
+        stream_task = None
+        if stream_events is not None:
+            stream_task = asyncio.create_task(
+                stream_events(poller.apply_bar_push, poller.resync_all))
         yield
-        task.cancel()
+        run_task.cancel()
+        if stream_task is not None:
+            stream_task.cancel()
 
     app = FastAPI(title="monitor-app", lifespan=lifespan)
     app.state.poller = poller
 
     @app.get("/api/state")
     async def api_state():
-        return JSONResponse({
-            "symbols": poller.all_full_states(),
-            "recent_closed": poller.recent_closed(limit=10),
-            "poll_enabled": poller.poll_enabled,
-            "max_symbols": poller.max_symbols,
-        })
+        return JSONResponse(poller._state_payload())
+
+    @app.get("/api/state/stream")
+    async def api_state_stream(request: Request):
+        """Leg 2 of the poll -> push replacement (specs.md): replaces the
+        browser's old 4s setInterval poll of GET /api/state. Same payload
+        shape, pushed the instant Poller state changes instead of on a
+        timer."""
+        async def event_stream():
+            async with poller.subscribe_state() as q:
+                yield f"data: {json.dumps(poller._state_payload())}\n\n"
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        payload = await asyncio.wait_for(q.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        yield ": keep-alive\n\n"
+                        continue
+                    yield f"data: {json.dumps(payload)}\n\n"
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     @app.get("/", response_class=HTMLResponse)
     async def root():
@@ -1286,14 +1461,14 @@ def create_app(*, fetch_bars, watch_symbol=None, poll_interval: float = 5.0,
 
     @app.post("/api/polling")
     async def api_polling(request: Request):
-        # Pauses/resumes monitor-app's own background poll loop (the thing
-        # that actually hits schwab-connector) -- distinct from, and more
-        # important than, the client-side setInterval toggle, which only
-        # stops browser<->monitor-app traffic. JSON body, not a form: this
-        # is only ever called from the page's own JS, never submitted as an
-        # HTML form.
+        # Pauses/resumes monitor-app's own applying of incoming bar-push
+        # events (the thing that actually reflects schwab-connector's
+        # data) -- distinct from, and more important than, the browser's
+        # EventSource connection, which only carries browser<->monitor-app
+        # traffic. JSON body, not a form: this is only ever called from
+        # the page's own JS, never submitted as an HTML form.
         body = await request.json()
-        poller.set_poll_enabled(bool(body.get("enabled", True)))
+        await poller.set_poll_enabled(bool(body.get("enabled", True)))
         return JSONResponse({"poll_enabled": poller.poll_enabled})
 
     @app.post("/api/journal/delete")

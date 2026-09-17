@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sys
 import threading
@@ -39,6 +40,13 @@ class FakeFetch:
         self.calls = []          # (symbol, since_ts) pairs
         self.raise_next_for = None
 
+    def queue_more(self, symbol, batch):
+        """Append one more batch for `symbol`, to be popped by the NEXT
+        call -- lets a test add data mid-run (e.g. simulating "the store
+        now has one more bar") without racing a batch already queued at
+        construction against whatever triggers the next real call."""
+        self._queues.setdefault(symbol.upper(), []).append(list(batch))
+
     async def __call__(self, symbol, since_ts):
         self.calls.append((symbol, since_ts))
         if self.raise_next_for == symbol:
@@ -49,6 +57,40 @@ class FakeFetch:
             return []
         batch = q.pop(0)
         return [b for b in batch if b["ts"] >= since_ts]
+
+
+class FakeStreamEvents:
+    """Test double for create_app's stream_events dependency (main.py's
+    real one consumes schwab-connector's shared SSE connection). Lets a
+    test push a bar event into the running Poller from the synchronous
+    test thread, bridged onto the app's own event loop via
+    call_soon_threadsafe (NOT run_in_executor on a blocking stdlib Queue
+    -- that leaves a worker thread parked forever in a blocking get(),
+    which then hangs the event loop's shutdown_default_executor() at
+    TestClient teardown, since asyncio can't interrupt a real OS thread's
+    blocking call the way it can cancel a coroutine awaiting an
+    asyncio.Queue). Mirrors how a real push arrives asynchronously,
+    without needing a live network or TestClient's (fully-buffering, see
+    schwab-connector's own /events tests) HTTP layer."""
+
+    def __init__(self):
+        self._loop = None
+        self._queue = None
+        self.reconnects = 0
+
+    def push_bar(self, symbol, bar):
+        while self._loop is None:  # __call__ hasn't started yet -- brief, bounded wait
+            time.sleep(0.005)
+        self._loop.call_soon_threadsafe(self._queue.put_nowait, (symbol, bar))
+
+    async def __call__(self, on_bar, on_reconnect):
+        self._loop = asyncio.get_running_loop()
+        self._queue = asyncio.Queue()
+        await on_reconnect()
+        self.reconnects += 1
+        while True:
+            symbol, bar = await self._queue.get()
+            await on_bar(symbol, bar)
 
 
 def _wait_until(pred, timeout=3.0):
@@ -63,15 +105,15 @@ def _wait_until(pred, timeout=3.0):
 def _client(fetch, *, symbol="AEHL", announce=None, unwatch=None,
             announce_retry_attempts=5, announce_retry_base_delay=0.02,
             announce_retry_max_delay=0.02, journal_store=None,
-            trail_pct=0.05, max_symbols=4, poll_interval=0.05):
+            trail_pct=0.05, max_symbols=4, stream_events=None):
     app = create_app(fetch_bars=fetch, watch_symbol=symbol,
-                     poll_interval=poll_interval, announce_watch=announce,
+                     announce_watch=announce,
                      announce_unwatch=unwatch,
                      announce_retry_attempts=announce_retry_attempts,
                      announce_retry_base_delay=announce_retry_base_delay,
                      announce_retry_max_delay=announce_retry_max_delay,
                      journal_store=journal_store, trail_pct=trail_pct,
-                     max_symbols=max_symbols)
+                     max_symbols=max_symbols, stream_events=stream_events)
     return TestClient(app)
 
 
@@ -121,7 +163,12 @@ def test_poller_advances_since_ts_and_dedups_boundary_bar():
     second = [overlap] + _bars(5, start=overlap["ts"] + 10, base=11.0)
     fetch = FakeFetch({"AEHL": [first, second]})
     with _client(fetch) as c:
-        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("bar_count", 0) >= 25)
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("bar_count", 0) >= 20)
+        # No timer re-fetches on its own anymore -- pause+resume (resync_all)
+        # is what pulls the second, overlapping batch in, the same way a
+        # real resync after a schwab-connector /events reconnect would.
+        c.post("/api/polling", json={"enabled": False})
+        c.post("/api/polling", json={"enabled": True})
         st = _sym_state(c, "AEHL")
         assert st["bar_count"] == 25
         assert any(s > 0 for sym, s in fetch.calls if sym == "AEHL")
@@ -435,6 +482,13 @@ def test_one_symbols_fetch_error_does_not_affect_others():
             (_sym_state(c, s) or {}).get("status") == "ok" for s in ("AEHL", "S2")
         ))
         fetch.raise_next_for = "AEHL"
+        # Pause+resume is what actually triggers a fresh catch_up (via
+        # resync_all) now that there's no timer re-fetching on its own --
+        # this is what exercises AEHL's fetch error and confirms S2 (whose
+        # queued batch is already exhausted, so its own catch_up call is a
+        # harmless no-op) is untouched by it.
+        c.post("/api/polling", json={"enabled": False})
+        c.post("/api/polling", json={"enabled": True})
         time.sleep(0.2)
         # AEHL keeps serving its last good state; S2 is untouched throughout
         assert _sym_state(c, "AEHL")["status"] == "ok"
@@ -495,34 +549,160 @@ def test_api_state_exposes_poll_enabled_default_true():
         assert c.get("/api/state").json()["poll_enabled"] is True
 
 
-def test_poll_control_pauses_the_background_poller_for_all_symbols():
+def test_poll_control_pauses_applying_pushed_bars_for_all_symbols():
     fetch = FakeFetch({"AEHL": [_bars(3)], "S2": [_bars(3, base=20.0)]})
-    with _client(fetch, symbol="AEHL") as c:
+    fse = FakeStreamEvents()
+    with _client(fetch, symbol="AEHL", stream_events=fse) as c:
         c.post("/api/watch", data={"symbol": "S2"})
         assert _wait_until(lambda: all(
             (_sym_state(c, s) or {}).get("status") == "ok" for s in ("AEHL", "S2")
         ))
         r = c.post("/api/polling", json={"enabled": False})
         assert r.json()["poll_enabled"] is False
-        assert _wait_until(lambda: c.get("/api/state").json()["poll_enabled"] is False)
 
-        calls_at_pause = len(fetch.calls)
-        time.sleep(0.3)
-        assert len(fetch.calls) == calls_at_pause, \
-            "fetch_bars was called again after pausing -- polling didn't stop for all symbols"
+        pushed = _bars(1, start=RTH + 1000, base=50.0)[0]
+        fse.push_bar("AEHL", pushed)
+        time.sleep(0.1)
+        assert _sym_state(c, "AEHL")["bar_count"] == 3, \
+            "a pushed bar was applied while paused -- polling didn't stop for all symbols"
+        assert _sym_state(c, "S2")["bar_count"] == 3  # untouched either way
 
 
-def test_poll_control_resumes_the_background_poller():
+def test_poll_control_resumes_and_resyncs_what_was_dropped_while_paused():
+    # The REST endpoint a real resync hits always reflects schwab-
+    # connector's current stored history, so the bar dropped while paused
+    # is exactly what a resync's catch_up fetch would return.
+    dropped = _bars(1, start=RTH + 1000, base=50.0)[0]
     fetch = FakeFetch({"AEHL": [_bars(3)]})
-    with _client(fetch) as c:
+    fse = FakeStreamEvents()
+    with _client(fetch, stream_events=fse) as c:
         assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        # fse's on_reconnect fires resync_all() once already, right at
+        # stream startup (same as a real reconnect would) -- queuing the
+        # "dropped" batch only now, after that's had time to settle,
+        # avoids racing it against the startup resync.
+        time.sleep(0.05)
         c.post("/api/polling", json={"enabled": False})
-        assert _wait_until(lambda: c.get("/api/state").json()["poll_enabled"] is False)
-        calls_while_paused = len(fetch.calls)
 
+        fse.push_bar("AEHL", dropped)
+        time.sleep(0.1)
+        assert _sym_state(c, "AEHL")["bar_count"] == 3  # dropped while paused
+
+        fetch.queue_more("AEHL", [dropped])  # what schwab-connector's store now has
         r = c.post("/api/polling", json={"enabled": True})
         assert r.json()["poll_enabled"] is True
-        assert _wait_until(lambda: len(fetch.calls) > calls_while_paused)
+        assert _sym_state(c, "AEHL")["bar_count"] == 4  # resync_all() caught it up
+        assert _sym_state(c, "AEHL")["last_price"] == round(dropped["close"], 4)
+
+
+def test_apply_bar_push_reaches_state_the_instant_its_awaited():
+    # The whole point of push over poll: no sleep/wait needed to observe a
+    # pushed bar land in Poller state -- see specs.md for the ~9s of
+    # stacked polling latency this replaces. Driven directly on a
+    # standalone Poller (no TestClient/HTTP layer) so the assertion can
+    # run in the same coroutine, immediately after the await returns.
+    from app import Poller
+
+    async def run():
+        poller = Poller(fetch_bars=FakeFetch({}), watch_symbol=None,
+                        announce_watch=None)
+        await poller.add_symbol("AEHL")
+        bar = _bars(1, start=RTH, base=50.0)[0]
+
+        await poller.apply_bar_push("AEHL", bar)  # no sleep before checking below
+
+        st = poller.state_for("AEHL")
+        assert st["bar_count"] == 1
+        assert st["last_price"] == round(bar["close"], 4)
+
+    asyncio.run(run())
+
+
+def test_apply_bar_push_broadcasts_to_state_subscribers_synchronously():
+    from app import Poller
+
+    async def run():
+        poller = Poller(fetch_bars=FakeFetch({}), watch_symbol=None,
+                        announce_watch=None)
+        await poller.add_symbol("AEHL")
+        bar = _bars(1, start=RTH, base=50.0)[0]
+
+        async with poller.subscribe_state() as q:
+            await poller.apply_bar_push("AEHL", bar)
+            payload = q.get_nowait()  # no await, no sleep
+            assert payload["symbols"]["AEHL"]["bar_count"] == 1
+
+    asyncio.run(run())
+
+
+async def _drive_streaming_route(app, path):
+    """Drive an ASGI streaming route directly, bypassing
+    fastapi.testclient's httpx ASGITransport -- which fully buffers a
+    response (runs the whole ASGI app call to completion) before
+    returning anything to the caller, so it can never observe partial
+    output from a route that streams until client disconnect, which is
+    exactly what /api/state/stream (and schwab-connector's /events) do.
+    Returns (task, chunks, disconnect) -- read body bytes off `chunks` as
+    they're sent; set() `disconnect` and await `task` to end the drive."""
+    chunks: asyncio.Queue = asyncio.Queue()
+    disconnect = asyncio.Event()
+    sent_body = False
+
+    async def receive():
+        nonlocal sent_body
+        if not sent_body:
+            sent_body = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await disconnect.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if message["type"] == "http.response.body":
+            await chunks.put(message.get("body", b""))
+
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+        "method": "GET", "path": path, "raw_path": path.encode(),
+        "query_string": b"", "headers": [], "scheme": "http",
+        "server": ("testserver", 80), "client": ("testclient", 50000),
+        "root_path": "",
+    }
+    task = asyncio.create_task(app(scope, receive, send))
+    return task, chunks, disconnect
+
+
+def test_state_stream_route_pushes_a_snapshot_then_a_live_update():
+    fetch = FakeFetch({"AEHL": [_bars(3)]})
+    app = create_app(fetch_bars=fetch, watch_symbol="AEHL", announce_watch=None)
+
+    async def run():
+        # Let the startup background task's initial catch_up land first,
+        # so the immediate on-connect snapshot already shows AEHL.
+        async def _lifespan_started():
+            async with app.router.lifespan_context(app):
+                task, chunks, disconnect = await _drive_streaming_route(app, "/api/state/stream")
+                try:
+                    first = await asyncio.wait_for(chunks.get(), timeout=2.0)
+                    snapshot = json.loads(first.decode()[len("data: "):].strip())
+                    assert "AEHL" in snapshot["symbols"] or snapshot["symbols"] == {}
+
+                    await app.state.poller.apply_bar_push(
+                        "AEHL", _bars(1, start=RTH + 1000, base=77.0)[0])
+                    buf = b""
+                    while b"data:" not in buf:
+                        buf += await asyncio.wait_for(chunks.get(), timeout=2.0)
+                    payload = json.loads(buf.decode()[len("data:"):].strip())
+                    assert payload["symbols"]["AEHL"]["last_price"] == 77.0
+                finally:
+                    disconnect.set()
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+        await _lifespan_started()
+
+    asyncio.run(run())
 
 
 # -- page rendering (Stage A interim) ---------------------------------------
@@ -532,10 +712,16 @@ def test_root_page_has_no_meta_refresh():
         assert 'http-equiv="refresh"' not in c.get("/").text.lower()
 
 
-def test_root_page_polls_api_state_via_js_without_reloading():
+def test_root_page_subscribes_to_state_updates_via_eventsource_without_reloading():
+    # Fixed 2026-09-17 (specs.md): the browser leg of poll -> push. No more
+    # setInterval(...) call anywhere in the page -- EventSource carries
+    # live updates now; fetch('/api/state') is kept only for the explicit
+    # post-action refresh() (watch/unwatch/journal actions), not a timer.
     with _client(FakeFetch({"AEHL": [_bars(5)]})) as c:
         page = c.get("/").text
-        assert "setInterval" in page
+        assert "new EventSource(" in page
+        assert "/api/state/stream" in page
+        assert "pollTimer" not in page  # the old timer variable is gone entirely
         assert "fetch(" in page
         assert "/api/state" in page
 
@@ -543,7 +729,6 @@ def test_root_page_polls_api_state_via_js_without_reloading():
 def test_root_page_has_a_pause_polling_toggle():
     with _client(FakeFetch({"AEHL": [_bars(5)]})) as c:
         page = c.get("/").text
-        assert "clearInterval" in page
         assert "poll-toggle" in page
         assert "poll_enabled" in page
 

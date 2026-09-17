@@ -86,7 +86,7 @@ class FakeFetch:
 
 def _client(fetch, *, journal_store, symbol="AEHL", trail_pct=TRAIL_PCT,
            announce=None, unwatch=None, now_fn=time.time):
-    app = create_app(fetch_bars=fetch, watch_symbol=symbol, poll_interval=0.05,
+    app = create_app(fetch_bars=fetch, watch_symbol=symbol,
                      announce_watch=announce, announce_unwatch=unwatch,
                      announce_retry_attempts=1,
                      journal_store=journal_store, trail_pct=trail_pct,
@@ -103,6 +103,19 @@ def _wait_until(pred, timeout=3.0):
     return pred()
 
 
+def _resync(c):
+    """Advances every watched symbol by one queued FakeFetch batch --
+    there's no more background poll timer doing this on its own (fixed
+    2026-09-17, see specs.md), so these tests drive it explicitly the
+    same way a real resync_all() would fire, via a pause/resume round
+    trip on the already-existing POST /api/polling toggle (both calls
+    are awaited fully server-side before responding, so this is
+    synchronous from the caller's point of view -- no sleep needed
+    between calling this and checking its effect)."""
+    c.post("/api/polling", json={"enabled": False})
+    c.post("/api/polling", json={"enabled": True})
+
+
 def _sym(client, symbol):
     return client.get("/api/state").json()["symbols"].get(symbol) or {}
 
@@ -114,8 +127,11 @@ def test_entry_fires_on_real_hold_confirmed_transition(tmp_path):
     fetch = FakeFetch({"AEHL": [_pre_break_bars(), _break_bars(), _pullback_bars()]})
 
     with _client(fetch, journal_store=store) as c:
-        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 20)
-        assert _wait_until(lambda: store.open_position_for("AEHL") is not None)
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)  # initial catch_up
+        _resync(c)  # break_bars
+        _resync(c)  # pullback_bars -- the real transition
+        assert _sym(c, "AEHL")["bar_count"] == 20
+        assert store.open_position_for("AEHL") is not None
 
     pos = store.open_position_for("AEHL")
     assert pos.entry_price == 9.8
@@ -131,8 +147,11 @@ def test_entry_does_not_duplicate_on_subsequent_confirmed_polls(tmp_path):
                                 more_but_still_confirmed]})
 
     with _client(fetch, journal_store=store) as c:
-        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 22)
-        time.sleep(0.2)  # make sure no second entry sneaks in
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        _resync(c)  # break_bars
+        _resync(c)  # pullback_bars -- the real transition, entry fires
+        _resync(c)  # more_but_still_confirmed -- make sure no second entry sneaks in
+        assert _sym(c, "AEHL")["bar_count"] == 22
 
     assert store.recent_closed() == []
     assert store.open_position_for("AEHL") is not None
@@ -143,7 +162,10 @@ def test_root_page_renders_open_position_after_real_entry(tmp_path):
     fetch = FakeFetch({"AEHL": [_pre_break_bars(), _break_bars(), _pullback_bars()]})
 
     with _client(fetch, journal_store=store) as c:
-        assert _wait_until(lambda: store.open_position_for("AEHL") is not None)
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        _resync(c)  # break_bars
+        _resync(c)  # pullback_bars -- the real transition
+        assert store.open_position_for("AEHL") is not None
         page = c.get("/").text
         # the real, meaningful proof is the entry price actually showing up
         # in the server-rendered card content, not a generic string match
@@ -158,8 +180,12 @@ def test_stop_exit_recorded_in_journal_store(tmp_path):
     fetch = FakeFetch({"AEHL": [_pre_break_bars(), _break_bars(), _pullback_bars(), breach]})
 
     with _client(fetch, journal_store=store) as c:
-        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 21)
-        assert _wait_until(lambda: store.open_position_for("AEHL") is None)
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        _resync(c)  # break_bars
+        _resync(c)  # pullback_bars -- entry fires
+        _resync(c)  # breach -- trailing stop trips
+        assert _sym(c, "AEHL")["bar_count"] == 21
+        assert store.open_position_for("AEHL") is None
 
     (closed,) = store.recent_closed()
     assert closed["exit_reason"] == "trailing_stop"
@@ -173,7 +199,10 @@ def test_unwatch_force_closes_open_position(tmp_path):
     fetch = FakeFetch({"AEHL": [_pre_break_bars(), _break_bars(), _pullback_bars()]})
 
     with _client(fetch, journal_store=store) as c:
-        assert _wait_until(lambda: store.open_position_for("AEHL") is not None)
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        _resync(c)  # break_bars
+        _resync(c)  # pullback_bars -- the real transition
+        assert store.open_position_for("AEHL") is not None
         c.post("/api/unwatch", data={"symbol": "AEHL"})
         assert _wait_until(lambda: store.open_position_for("AEHL") is None)
 
@@ -190,7 +219,10 @@ def test_restart_resumes_open_position_without_duplicate_entry(tmp_path):
     store1 = JournalStore(db_path)
     fetch1 = FakeFetch({"AEHL": [_pre_break_bars(), _break_bars(), _pullback_bars()]})
     with _client(fetch1, journal_store=store1) as c:
-        assert _wait_until(lambda: store1.open_position_for("AEHL") is not None)
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        _resync(c)  # break_bars
+        _resync(c)  # pullback_bars -- the real transition
+        assert store1.open_position_for("AEHL") is not None
     del store1
 
     store2 = JournalStore(db_path)
@@ -216,24 +248,31 @@ def test_two_symbols_journal_positions_are_fully_independent(tmp_path):
     # trigger anything on it."
     store = JournalStore(tmp_path / "journal.db")
     breach = [_bar(200, 9.2, high=9.85, low=9.0)]  # AEHL only: breaches its 9.31 stop
-    still_fine = [_bar(200, 9.85), _bar(210, 9.9)]  # MSFT only: stays well above its stop
     fetch = FakeFetch({
+        # AEHL gets a 4th batch (breach); MSFT's queue ends at 3 -- resync_all
+        # advances every watched symbol in lockstep, one queued batch each,
+        # so giving MSFT nothing further to consume is what actually proves
+        # it's undisturbed (a no-op catch_up, not raced against AEHL's).
         "AEHL": [_pre_break_bars(), _break_bars(), _pullback_bars(), breach],
-        "MSFT": [_pre_break_bars(), _break_bars(), _pullback_bars(), still_fine],
+        "MSFT": [_pre_break_bars(), _break_bars(), _pullback_bars()],
     })
 
     with _client(fetch, journal_store=store, symbol="AEHL") as c:
         c.post("/api/watch", data={"symbol": "MSFT"})
-        # Wait for MSFT to open first, specifically -- AEHL can cycle all
-        # the way through open-then-stopped-out faster than MSFT even
-        # opens (polling order, not a bug), so waiting for "both open at
-        # once" can miss the window entirely. Waiting for MSFT alone, then
-        # for AEHL's eventual close, avoids that race in the test itself.
-        assert _wait_until(lambda: store.open_position_for("MSFT") is not None)
+        assert _wait_until(lambda: all(
+            (_sym(c, s) or {}).get("bar_count") == 15 for s in ("AEHL", "MSFT")
+        ))
+        _resync(c)  # break_bars, both symbols
+        _resync(c)  # pullback_bars, both symbols -- both enter
+        assert _wait_until(lambda: all(
+            store.open_position_for(s) is not None for s in ("AEHL", "MSFT")
+        ))
         msft_before = store.open_position_for("MSFT")
 
-        # drive AEHL to its stop-out
-        assert _wait_until(lambda: store.open_position_for("AEHL") is None)
+        # drive AEHL to its stop-out (its 4th batch; MSFT's queue is
+        # already exhausted, so this resync is a harmless no-op for it)
+        _resync(c)
+        assert store.open_position_for("AEHL") is None
 
         # MSFT must be completely unaffected: still open, identical values
         msft_after = store.open_position_for("MSFT")
@@ -262,8 +301,13 @@ def test_removing_one_symbol_does_not_close_another_symbols_position(tmp_path):
 
     with _client(fetch, journal_store=store, symbol="AEHL") as c:
         c.post("/api/watch", data={"symbol": "MSFT"})
-        assert _wait_until(lambda: store.open_position_for("AEHL") is not None
-                           and store.open_position_for("MSFT") is not None)
+        assert _wait_until(lambda: all(
+            (_sym(c, s) or {}).get("bar_count") == 15 for s in ("AEHL", "MSFT")
+        ))
+        _resync(c)  # break_bars, both symbols
+        _resync(c)  # pullback_bars, both symbols -- both enter
+        assert store.open_position_for("AEHL") is not None \
+            and store.open_position_for("MSFT") is not None
 
         c.post("/api/unwatch", data={"symbol": "AEHL"})
         assert _wait_until(lambda: store.open_position_for("AEHL") is None)

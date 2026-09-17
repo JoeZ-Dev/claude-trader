@@ -74,7 +74,6 @@ services:
     environment:
       SCHWAB_CONNECTOR_URL: http://schwab-connector:7878
       WATCH_SYMBOL: "${WATCH_SYMBOL:-}"
-      POLL_INTERVAL: "${POLL_INTERVAL:-5}"
       JOURNAL_DB_PATH: /data/journal.db
       # Virtual trade journal trailing-stop percent (specs.md section 6) --
       # a starting point to tune against real logged data, not a validated
