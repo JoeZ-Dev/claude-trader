@@ -346,6 +346,55 @@ process for the call's duration, not just during a storm. Added
 synchronous `refresh()`. `refresh()` itself is unchanged and still used
 directly by anything that isn't running on this process's event loop.
 
+**Reconnect-storm incident, root cause now confirmed (2026-09-17) — the
+`companion-auth` side of the mystery above.** The paragraph above left
+`companion-auth`'s stale-cache behavior as "very likely," not confirmed,
+since it's a separate repo/service out of this one's reach. Root-caused
+tonight, from `companion-auth`'s own code plus its token file's mtime
+(not a live occurrence — the earlier incident had already passed):
+`companion-auth`'s `tokens.py` only re-hits Schwab once its cached
+token is within `REFRESH_SKEW_SECONDS` of expiry; this repo's own
+`token_source.py`'s `AccessTokenSource` (the "matching schwab-py's own
+5-minute internal leeway convention" value referenced above) treats a
+token as stale at `LEEWAY_SECONDS = 300`. `companion-auth`'s
+`REFRESH_SKEW_SECONDS` sat at 60 — **below**, not above, this repo's
+300 — creating a real ~240-second dead zone every ~30-minute cycle
+where `token_source.refresh_async()` asks for a token it already
+considers too-stale-to-use, and gets the identical not-yet-refreshed
+one back, because `companion-auth`'s own narrower threshold doesn't
+consider it due for a real Schwab round-trip yet. Confirmed precisely
+via `companion-auth/data/tokens.json`'s mtime landing exactly on the
+one request (of five, 60s apart) that actually changed — the other
+four never touched the file.
+
+This is the SAME failure signature as the storm above, and the
+`ticks()` backoff fix from that incident is exactly what kept this
+recurrence from becoming a second storm — it degraded to a slow,
+rate-limited retry loop (one attempt per `auth_retry_seconds`, not a
+tight zero-await loop) instead. Two things now exist specifically so
+this class of incident stops needing after-the-fact mtime archaeology
+to diagnose, both in `companion-auth` (a separate repo, not this one —
+noted here because the *contract* this repo's `LEEWAY_SECONDS`
+participates in belongs in both places' documentation, not just one):
+(1) `tokens.py` now logs `access_token_cache_hit` /
+`access_token_refreshing` / `access_token_refreshed` /
+`access_token_refresh_failed` distinctly (previously: zero
+application-level logging at all — `app.py` didn't even call
+`logging.basicConfig()`, so none of this would have reached `docker
+logs` regardless of what was logged); (2) `REFRESH_SKEW_SECONDS` raised
+from 60 to 420 — 120 seconds of real margin above this repo's 300,
+deliberately not an exact tie, with both a code comment and a
+regression-guarding test in `companion-auth`'s own suite
+(`test_refresh_skew_has_real_margin_over_known_consumer_leeway`)
+tying it explicitly to this repo's `LEEWAY_SECONDS=300`. The general
+principle, not just today's numbers: `companion-auth`'s cache-hit skew
+must always stay comfortably above the LARGEST leeway any consumer
+uses (this repo's 300s is the only known one right now) — if
+`LEEWAY_SECONDS` here is ever changed, `companion-auth`'s
+`REFRESH_SKEW_SECONDS` needs its margin re-checked by hand against the
+new value, since the two repos have no shared import to enforce this
+automatically.
+
 **Stream events weren't tagged by symbol (found live 2026-09-17, fixed):**
 each watched symbol gets its own independent `ReconnectingStreamSource`
 instance (up to `MAX_SYMBOLS`, section 5), but all of them share one
