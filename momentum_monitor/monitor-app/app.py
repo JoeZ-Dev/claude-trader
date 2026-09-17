@@ -552,10 +552,18 @@ def _journal_closed_rows_html(closed: list[dict]) -> str:
         return "<tr><td colspan='5' class='muted'>No closed trades yet.</td></tr>"
     rows = []
     for t in closed:
-        cls = _sign_class(t["realized_pnl_pct"])
+        # symbol_switched isn't a trading outcome -- it's watchlist
+        # housekeeping (the symbol got unwatched/evicted while a position
+        # was open, so it was force-closed at whatever price happened to
+        # be current). Muted end to end, including overriding the pos/neg
+        # P&L coloring other rows get, so nobody reads it as a real
+        # win/loss at a glance -- see specs.md section 6.
+        is_housekeeping = t["exit_reason"] == "symbol_switched"
+        cls = "muted" if is_housekeeping else _sign_class(t["realized_pnl_pct"])
         pnl = "" if t["realized_pnl_pct"] is None else f"{_fmt(t['realized_pnl_pct'], 2)}%"
+        row_open = "<tr class='row-housekeeping'>" if is_housekeeping else "<tr>"
         rows.append(
-            "<tr>"
+            f"{row_open}"
             f"<td>{html.escape(str(t['symbol']))}</td>"
             f"<td>{_fmt(t['entry_price'], 2)}</td><td>{_fmt(t['exit_price'], 2)}</td>"
             f"<td>{html.escape(str(t['exit_reason']))}</td>"
@@ -725,9 +733,14 @@ function journalClosedRows(closed) {
     return '<tr><td colspan="5" class="muted">No closed trades yet.</td></tr>';
   }
   return closed.map(function(t) {
-    const cls = signClass(t.realized_pnl_pct);
+    // symbol_switched = watchlist housekeeping, not a trading outcome --
+    // see _journal_closed_rows_html's comment (Python side) for why the
+    // whole row is muted, overriding pos/neg P&L coloring too.
+    const isHousekeeping = t.exit_reason === 'symbol_switched';
+    const cls = isHousekeeping ? 'muted' : signClass(t.realized_pnl_pct);
     const pnl = t.realized_pnl_pct === null ? '' : fmt(t.realized_pnl_pct, 2) + '%';
-    return '<tr><td>' + esc(t.symbol) + '</td><td>' + fmt(t.entry_price, 2) + '</td>' +
+    const rowOpen = isHousekeeping ? '<tr class="row-housekeeping">' : '<tr>';
+    return rowOpen + '<td>' + esc(t.symbol) + '</td><td>' + fmt(t.entry_price, 2) + '</td>' +
       '<td>' + fmt(t.exit_price, 2) + '</td><td>' + esc(t.exit_reason) + '</td>' +
       '<td class="' + cls + '">' + pnl + '</td></tr>';
   }).join('');
@@ -1010,6 +1023,7 @@ table.detail th{color:var(--muted);font-weight:500;width:45%}
 .setup-chip:hover{border-color:var(--accent)}
 .setup-detail{margin:.3rem 0 .6rem;padding:.5rem .6rem;
   background:var(--bg);border:1px solid var(--border);border-radius:.4rem}
+.row-housekeeping td{color:var(--muted)}
 .footer{color:var(--muted);font-size:.8rem;margin-top:1rem}
 """
 

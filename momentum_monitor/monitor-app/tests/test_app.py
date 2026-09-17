@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(_APP_DIR), "core"))
 
 from fastapi.testclient import TestClient
 
-from app import create_app
+from app import _journal_closed_rows_html, create_app
 
 RTH = 1756909800  # 2025-09-03 10:30:00 ET
 
@@ -511,3 +511,30 @@ def test_root_page_renders_closest_setup_and_chips_for_other_candidates():
         assert "<p class='muted'>none currently watchable</p>" not in page
         if len(state["setups"]) > 1:
             assert "setup-chip" in page
+
+
+# -- closed-trades table: symbol_switched rows visually muted ------------
+
+def _closed_row(symbol, exit_reason, pnl=1.0):
+    return {"symbol": symbol, "entry_price": 10.0, "exit_price": 10.1,
+            "exit_reason": exit_reason, "realized_pnl_pct": pnl}
+
+
+def test_symbol_switched_rows_get_the_muted_housekeeping_class():
+    rows = _journal_closed_rows_html([_closed_row("AEHL", "symbol_switched", pnl=2.5)])
+    assert "<tr class='row-housekeeping'>" in rows
+    # muted overrides the pos/neg P&L coloring a real trade outcome gets --
+    # a symbol_switched exit isn't a strategy signal, so it must never be
+    # colored as a win even though realized_pnl_pct is technically positive.
+    assert "<td class='muted'>2.50%</td>" in rows
+    assert "<td class='pos'>" not in rows
+
+
+def test_trailing_stop_rows_are_not_muted_and_keep_pos_neg_coloring():
+    rows = _journal_closed_rows_html([
+        _closed_row("AEHL", "trailing_stop", pnl=2.5),
+        _closed_row("MSFT", "trailing_stop", pnl=-1.0),
+    ])
+    assert "row-housekeeping" not in rows
+    assert "<td class='pos'>2.50%</td>" in rows
+    assert "<td class='neg'>-1.00%</td>" in rows

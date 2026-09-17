@@ -609,6 +609,21 @@ it from `journal_store` rather than losing or duplicating it — proven by
 test (two `JournalStore` instances over the same SQLite file), the same
 rigor already applied to bars/tokens surviving a restart.
 
+`symbol_switched` closed-trade rows are visually muted end to end in
+the closed-trades table (`_journal_closed_rows_html`/`journalClosedRows`,
+`row-housekeeping` CSS class) — including overriding the pos/neg P&L
+coloring a real `trailing_stop` exit gets, even though `realized_pnl_pct`
+is a real, computed number for a `symbol_switched` row too. The point
+isn't that the number is wrong, it's that it was never a trading
+decision the strategy made — muting it stops anyone from reading it as
+a win/loss at a glance. Any future win-rate/expectancy summary (see
+"eventually compute win rate/expectancy" below) MUST filter to
+`trailing_stop` (and eventually `target_hit`, if a target is ever added
+— it isn't currently, see above) exits only; a `symbol_switched` row is
+never a trading outcome and must never be counted as strategy
+performance, no matter how tempting it is to just average
+`realized_pnl_pct` across every closed row.
+
 **Storage: SQLite, not JSONL.** A different access pattern from
 schwab-connector's bars (append-only, replayed sequentially start to
 finish, one file per symbol) — trade records need to be QUERIED and
