@@ -1,4 +1,6 @@
+import asyncio
 import json
+import logging
 import os
 import sys
 import time
@@ -131,6 +133,48 @@ def test_boots_without_working_source(tmp_path):
         assert body["watching"] == ["AEHL"]
         assert body["connected"] is False
         assert c.get("/bars/AEHL").json() == []
+
+
+# -- tick heartbeat: confirms real ticks are (or aren't) actually flowing --
+
+class _FakeLiveSource:
+    """Minimal non-replay source: yields a fixed batch of ticks immediately,
+    then hangs forever -- simulates a live connection that's genuinely
+    healthy (never errors, never disconnects) but has simply stopped
+    receiving anything further, the exact scenario the heartbeat log
+    exists to make visible (found live 2026-09-17: aggregator and
+    reconnect layers both reported healthy while real ticks had silently
+    stopped arriving for a symbol Schwab was actively trading)."""
+    connected = True
+
+    def __init__(self, ticks):
+        self._ticks = ticks
+
+    async def ticks(self, symbol):
+        for t in self._ticks:
+            yield t
+        await asyncio.Event().wait()
+
+
+def test_tick_heartbeat_reports_real_count_then_zero_when_stream_goes_quiet(tmp_path, caplog):
+    ticks = [{"ts": RTH_1030 + i, "price": 10.0 + i * 0.01, "size": 5} for i in range(4)]
+    app = create_app(
+        store=BarStore(tmp_path / "bars"),
+        source_factory=lambda: _FakeLiveSource(ticks),
+        replay=False,
+        now_fn=lambda: RTH_1030 + 40,
+        flush_interval=0.02,
+        heartbeat_flush_cycles=2,
+    )
+    with caplog.at_level(logging.INFO, logger="schwab-connector.ticks"):
+        with TestClient(app) as c:
+            c.post("/watch", json={"symbol": "AEHL"})
+            time.sleep(0.25)
+
+    counts = [r.args[2] for r in caplog.records if "tick_heartbeat" in r.getMessage()]
+    assert len(counts) >= 2, "expected multiple heartbeat cycles to fire"
+    assert counts[0] == 4        # the 4 ticks fed right at connection start
+    assert all(n == 0 for n in counts[1:])  # stream went quiet -- must show 0, not go silent
 
 
 def test_unwatch_removes_symbol_from_watching_list(tmp_path):

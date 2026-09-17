@@ -37,8 +37,19 @@ from aggregator import BUCKET_SECONDS, BarAggregator
 from store import BarStore
 
 logger = logging.getLogger("schwab-connector.backfill")
+tick_logger = logging.getLogger("schwab-connector.ticks")
 
 FLUSH_INTERVAL_SECONDS = 2.0
+# One heartbeat log line per symbol roughly every 60s (30 flush cycles at
+# the 2s default interval) reporting how many REAL ticks arrived in that
+# window. Exists because "connected: true" and "no stream errors" are not
+# proof real ticks are flowing -- found live 2026-09-17 diagnosing why
+# several symbols showed forward-filled, real-market-contradicting flat
+# bars: the aggregator/reconnect layers were both healthy and silent, and
+# there was no direct way to see whether Schwab was actually delivering
+# LEVELONE_EQUITIES ticks for a given symbol at all versus the
+# subscription silently never receiving them.
+HEARTBEAT_FLUSH_CYCLES = 30
 
 
 class WatchRequest(BaseModel):
@@ -51,16 +62,27 @@ class _DisconnectedSource:
     connected = False
 
 
+class _TickCounter:
+    """A plain mutable box for a real-tick count, shared between _consume's
+    tick loop (increments it) and _flush_loop (reads and resets it on its
+    own heartbeat cadence) -- simpler than threading a nonlocal through an
+    async closure, and gives _flush_loop an object identity to hold onto
+    across the whole task's lifetime."""
+    def __init__(self) -> None:
+        self.count = 0
+
+
 class Connector:
     def __init__(self, *, store: BarStore, source_factory, replay: bool,
                  now_fn=time.time, flush_interval: float = FLUSH_INTERVAL_SECONDS,
-                 history_fetcher=None):
+                 history_fetcher=None, heartbeat_flush_cycles: int = HEARTBEAT_FLUSH_CYCLES):
         self._store = store
         self._source_factory = source_factory
         self._replay = replay
         self._now_fn = now_fn
         self._flush_interval = flush_interval
         self._history_fetcher = history_fetcher
+        self._heartbeat_flush_cycles = heartbeat_flush_cycles
         self._sources: dict[str, object] = {}
         self._tasks: dict[str, asyncio.Task] = {}
 
@@ -121,12 +143,14 @@ class Connector:
         await self._maybe_backfill(symbol)
         agg = BarAggregator()
         last_tick_ts = 0.0
+        tick_counter = _TickCounter()
 
         flusher = None
         if not self._replay:
-            flusher = asyncio.create_task(self._flush_loop(symbol, agg))
+            flusher = asyncio.create_task(self._flush_loop(symbol, agg, tick_counter))
         try:
             async for tick in source.ticks(symbol):
+                tick_counter.count += 1
                 agg.feed(tick)
                 last_tick_ts = tick["ts"]
                 self._drain(symbol, agg)
@@ -157,11 +181,22 @@ class Connector:
             self._store.append_many(symbol, bars)
         logger.info("backfilled %d bar(s) for %s", len(bars), symbol)
 
-    async def _flush_loop(self, symbol: str, agg: BarAggregator) -> None:
+    async def _flush_loop(self, symbol: str, agg: BarAggregator,
+                          tick_counter: "_TickCounter") -> None:
+        cycles = 0
         while True:
             await asyncio.sleep(self._flush_interval)
             agg.flush(self._now_fn())
             self._drain(symbol, agg)
+            cycles += 1
+            if cycles >= self._heartbeat_flush_cycles:
+                window_seconds = cycles * self._flush_interval
+                tick_logger.info(
+                    "event=tick_heartbeat symbol=%r ticks_in_last_%.0fs=%d",
+                    symbol, window_seconds, tick_counter.count,
+                )
+                tick_counter.count = 0
+                cycles = 0
 
     def _drain(self, symbol: str, agg: BarAggregator) -> None:
         for bar in agg.drain():
@@ -169,10 +204,14 @@ class Connector:
 
 
 def create_app(*, store: BarStore, source_factory, replay: bool,
-               now_fn=time.time, history_fetcher=None) -> FastAPI:
+               now_fn=time.time, history_fetcher=None,
+               flush_interval: float = FLUSH_INTERVAL_SECONDS,
+               heartbeat_flush_cycles: int = HEARTBEAT_FLUSH_CYCLES) -> FastAPI:
     connector = Connector(store=store, source_factory=source_factory,
                           replay=replay, now_fn=now_fn,
-                          history_fetcher=history_fetcher)
+                          history_fetcher=history_fetcher,
+                          flush_interval=flush_interval,
+                          heartbeat_flush_cycles=heartbeat_flush_cycles)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
