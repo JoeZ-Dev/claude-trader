@@ -920,7 +920,7 @@ def test_root_page_displays_base_equity_and_risk_pct_alongside_strategy_params(t
         assert "risk_pct_per_trade=0.0100" in page
 
 
-# -- two-phase exit + session-level volume gate, specs.md section 13 ------
+# -- two-phase exit + session-level volume gate, specs.md section 12 ------
 
 def test_root_page_displays_the_new_section_13_strategy_params(tmp_path):
     c, store = _client_with_real_store(

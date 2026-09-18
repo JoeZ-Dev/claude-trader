@@ -1219,9 +1219,14 @@ about a trade or what the strategy itself accounts for, not yet closed.
   a compounding virtual account balance — not just entry/exit price and
   percentage.
 - No portfolio-level risk cap across the 4 concurrent symbol slots.
-- `TRAIL_PCT` was one global value despite volatility varying hugely
-  across candidates — section 8 below is the first step toward fixing
-  that (live-tunable, not yet per-symbol or volatility-adjusted).
+- ~~`TRAIL_PCT` was one global value despite volatility varying hugely
+  across candidates.~~ **Partially addressed 2026-09-18 — see section
+  13.** Section 8's live-tunable mechanism was the first step; section
+  13 goes further for the early/pattern-forming part of a trade
+  specifically (a swing-low-anchored stop, tighter and more structure-
+  aware than a flat percentage) — still not per-symbol or volatility-
+  adjusted, and the flat percentage still governs once a trade is
+  established, so this gap isn't fully closed, just narrowed.
 - Breakdown-below variants of the three phase-3.5 setup types remain
   deliberately deferred.
 
@@ -1753,7 +1758,245 @@ closed row's real `shares`/`P&L $` columns alongside their existing
 percentages — confirmed in the server-rendered markup itself, not
 just the JSON API.
 
-### 12. Roadmap / phases
+### 12. Pattern-anchored early stop + session-level volume gate
+
+**The gap, closed 2026-09-18.** Section 6's original trailing-stop
+design (a single flat `TRAIL_PCT` below the running high-water-mark for
+a position's ENTIRE life) considered, and explicitly did not choose, an
+alternative anchor: the most recent CONFIRMED higher-low, tracked via
+real swing-point structure rather than a fixed percentage. That option
+is built now, scoped specifically to a trade's early, pattern-forming
+phase — not a replacement for the proven flat trail, which still
+governs once a trade has shown real progress. Alongside it: a
+session-level volume gate, a SEPARATE check from the existing bar-level
+`VOLUME_CONFIRM_THRESHOLD` (section 6), requiring today's cumulative
+session volume to clear a multiple of the symbol's typical daily
+volume before an entry fires at all.
+
+**Part 1 — two-phase exit.** `OpenPosition.exit_phase` (`journal_logic.
+py`) is `"swing_low"` or `"trailing"`, defaulting to `"trailing"` on the
+dataclass itself — deliberately the ORIGINAL, single-phase behavior,
+not the new early phase: a position built without opting into this
+feature (every pre-existing test fixture, and a resumed pre-migration
+open position) must ratchet exactly as it always has, unaffected by
+this feature's mere existence. Only `advance_journal`'s own real
+entry-construction path sets `"swing_low"` for a genuinely new trade —
+the same safe-default-vs.-real-opt-in split `trail_pct`/`shares`/etc.
+already use.
+
+- **Phase 1, `"swing_low"`.** Stop anchors to the LOWEST confirmed
+  swing low since entry — reusing `core/levels.confirmed_swing_lows`
+  (new, built on the existing `_swing_points` primitive `detect_levels`
+  already used for resistance/support — not a new detection algorithm),
+  applied to the position's own bar history since its entry, buffered
+  down by `swing_low_buffer_pct`. Taking the MINIMUM across every
+  confirmed low seen so far — not just the most recent — is what makes
+  "the stop never moves up in this phase" true automatically: the set
+  of confirmed lows only grows as more bars arrive, so its minimum can
+  only fall or stay put. Before any swing low has confirmed yet (too
+  early in the trade for `_swing_points`' own window-based confirmation
+  delay — the exact same delay `detect_levels` already imposes, not a
+  new one), the anchor falls back to the entry-trigger level actually
+  broken to enter this trade (`OpenPosition.factors["trigger_price"]`),
+  buffered the same way — an explicit, non-arbitrary interim value,
+  never a raw crash or an invented number. `swing_low_buffer_pct`
+  defaults to 0.005 (0.5%): enough to absorb a typical wick-through-
+  the-exact-low without meaningfully widening the stop, small enough
+  that it's still anchored to a REAL level, not a guess.
+- **Phase 2, `"trailing"`.** The original, unchanged flat
+  `trail_pct`-from-high-water-mark mechanism (section 6), unaffected.
+- **Transition, one-way, checked precisely per-bar (not the swing-low
+  anchor's own batch-level granularity — see below).** Once
+  `high_water_mark` clears `entry_price * (1 +
+  pattern_progress_threshold_pct)`, `exit_phase` becomes `"trailing"`
+  and never reverts, even on a later pullback.
+  `pattern_progress_threshold_pct` defaults to 0.03 (3%): comfortably
+  past normal intrabar noise/spread on these volatile low-priced
+  candidates, while still handing off early enough that most real
+  winners actually reach phase 2 — the whole point of having a proven
+  fallback mechanism at all. `high_water_mark` itself keeps ratcheting
+  every bar UNCONDITIONALLY, regardless of phase — needed the instant
+  phase 2 begins, and it's how "real progress" is measured in the first
+  place.
+- **Batch-level granularity for the swing-low anchor, by design, not
+  oversight.** `Poller._update_journal` computes the anchor ONCE per
+  poll cycle — the position's full bar history since entry, sliced from
+  `slot.bars`, fed to `confirmed_swing_lows` — and passes that single
+  value through the whole ratchet loop for that batch, the same
+  granularity tradeoff this codebase already accepted for
+  `round_number_reclaim`'s own entry timing (section 6: "the finest
+  granularity available without re-running `evaluate_hold` per-bar
+  inside a single poll cycle, which would be inventing new entry
+  logic"). The PHASE TRANSITION check, by contrast, needs no swing-low
+  data at all (just `entry_price`/`high_water_mark`/the threshold
+  already on the position) and is checked exactly per-bar.
+- **A real bug found and fixed while building this, not by inspection
+  — `_phase1_anchor`'s clamp.** `entry_price` is the CONFIRMING bar's
+  own close (section 6's existing "finest granularity" rule); but
+  `evaluate_hold`'s "once confirmed, a single close back through
+  doesn't retroactively un-confirm history" rule (`core/levels.py`)
+  means the level that triggered confirmation can sit ABOVE the price
+  the position actually enters at, if price pulled back between
+  confirming and the entry bar itself. Confirmed directly against real
+  `setup_types.evaluate_setups` output, not assumed: `round_number_
+  reclaim` confirmed with `trigger_price=9.25` while the confirming
+  bar's own close was `9.1`. An unclamped anchor there would price
+  phase 1's "protective" stop ABOVE the entry itself — a
+  near-guaranteed immediate stop-out, defeating the entire point of a
+  two-phase exit. `_phase1_anchor(candidate_anchor, entry_price)` —
+  `min(candidate_anchor, entry_price)` — is applied in BOTH the
+  entry-construction and ratchet code paths, so this invariant ("phase
+  1's stop is never above entry") holds regardless of which anchor
+  source (the trigger-price fallback, or a genuinely confirmed swing
+  low) produced the candidate.
+- **Snapshot at entry, same "don't lose the reasoning" discipline as
+  `trail_pct_used`/`watch_note`.** `trades` gains `exit_phase`,
+  `swing_low_buffer_pct_used`, `pattern_progress_threshold_pct_used`
+  (all locked in once, at entry, never re-read live for an open
+  position — a parameter change never reaches it, same precedent as
+  every prior live-tunable param) and `phase_transitioned_ts` (the ts
+  of the bar the transition happened at, `None` while still in phase 1
+  or for a position that never transitioned) — `JournalStore.
+  update_trailing` now persists `exit_phase`/`phase_transitioned_ts`
+  too, not just `high_water_mark`/`stop_level`, since the one-way
+  transition happens mid-trade, on a ratchet, and must survive a
+  restart the same way the rest of an open position's live state
+  already does.
+- **Migration is NOT the usual "`NULL` reads back as the dataclass
+  default" story.** A pre-migration OPEN position, resumed after this
+  feature ships, was ALREADY using the original flat-trail-only
+  mechanism the whole time it's been open. `_row_to_position` explicitly
+  reads a `NULL` `exit_phase` column back as `"trailing"` — which
+  happens to equal the dataclass field's own default here, but for a
+  DIFFERENT, deliberate reason (never retroactively drop an in-flight
+  trade into a phase it was never actually in), not because that's
+  merely the fallback value like every other nullable numeric column in
+  this schema.
+
+**Part 2 — session-level volume gate.** A new, additional entry
+condition in `should_enter` (`journal_logic.py`): today's cumulative
+session volume must clear `avg_daily_volume * session_volume_multiple`
+— stacking with, never replacing, the existing bar-level
+`relative_volume`/`volume_confirm_threshold` check. `session_volume_
+multiple` defaults to 3.0, the user's own stated criterion, not a
+guess. `state.build_state` exposes `session.cumulative_volume` (summed
+from the SAME `session_bars_for_vwap` slice VWAP already uses, not a
+separately-invented one).
+
+- **"Typical daily volume" needed data this project didn't have.**
+  Checked first, not assumed: neither the existing same-day intraday
+  backfill (`schwab-connector/price_history.py`'s `fetch_today_bars`)
+  nor anything else already fetched covers a multi-week daily lookback.
+  A new `fetch_daily_history` (same module) requests DAILY candles over
+  an explicit date range ending at today's own NY midnight —
+  EXCLUSIVE of today's still-forming volume, and the same explicit-
+  range discipline `fetch_today_bars` already established (`period_
+  type=DAY` was confirmed, live, to silently return the wrong range —
+  see section 4 — so this reuses the fix, not the trap). Exposed via a
+  new, deliberately thin, on-demand REST pass-through — `GET
+  /daily_bars/{symbol}` — no caching or `BarStore` involvement at the
+  schwab-connector layer at all, same division of labor as `GET
+  /bars/{symbol}`: schwab-connector fetches and serves raw Schwab data,
+  monitor-app owns the strategy-level business logic (the average, the
+  gating threshold) on top of it.
+- **Fetched once per symbol, at watch-time, cached — never per-bar.**
+  `Poller.add_symbol` calls the new `fetch_daily_bars` dependency
+  (mirroring `fetch_bars`'s own injection pattern) once, right after
+  creating the symbol's slot, and caches the average on `_SymbolSlot.
+  avg_daily_volume` for that symbol's whole watch lifetime.
+- **Missing data SKIPS the gate — an explicit, documented choice, not
+  a silent one.** A fetch failure (network error, or schwab-connector's
+  own `GET /daily_bars/{symbol}` returning 503/502 when unconfigured or
+  itself failing) or an empty result (a symbol too new to have daily
+  history yet) leaves `avg_daily_volume` as `None`, logged as a
+  warning, never a crash. `should_enter` treats `avg_daily_volume=
+  None` as "skip this gate entirely" rather than "block every entry" —
+  deliberately chosen over the alternative (block when data is
+  missing): this tool's own stated purpose is watching volatile,
+  often very-recently-listed small caps, exactly the names most likely
+  to lack multi-week daily history at all; blocking on missing data
+  would make the tool non-functional for its own primary use case. The
+  existing bar-level `relative_volume` gate still applies regardless,
+  so a missing daily-history fetch never removes volume screening
+  entirely, only this one additional, session-level layer of it.
+- **Snapshotted at entry into `factors`** (`session_cumulative_volume`,
+  `avg_daily_volume`, `session_volume_multiple_used`) — reusing the
+  EXISTING JSON `factors` column (no new `trades` columns needed),
+  same "why did this trade happen" discipline `relative_volume` already
+  gets there. `avg_daily_volume=None` in a trade's own snapshot means
+  the gate was SKIPPED for that specific trade, distinct from a real
+  ratio that happened to pass — never silently indistinguishable.
+
+**Verified live (2026-09-18) — against a real isolated pair, both
+halves, checked against real DB rows and real API responses, not
+simulated. Production was not restarted** (three real open positions —
+AEMD, AIFF, DTSS — at verification time; per this project's own
+standing discipline, confirmed every time this session, left running
+untouched). Same real `schwab-connector` (`STREAM_SOURCE=replay`,
+`fixtures/replay_sample.jsonl`) as every prior live proof this session.
+No real Schwab credentials are available in this dev environment for
+the daily-history REST call specifically — verified instead with a
+small entry-point script, identical to the real `main.py` in every
+other respect (real HTTP calls to schwab-connector for bars/watch/
+events, real `journal_store.py`/SQLite, real `Poller`/`journal_logic`
+code, unmodified), with `fetch_daily_bars` stubbed at the EXACT same
+injection seam `main.py` itself uses for it — a controlled substitute
+for the one genuinely-external boundary, the same principle already
+established for `STREAM_SOURCE=replay` replacing the Schwab-stream
+boundary itself.
+
+Two full runs of the same real 32-bar cascading replay, from a fresh
+`journal.db` each: with `avg_daily_volume=50,000,000` (session_
+cumulative_volume would need to clear 150,000,000), the replay ran to
+completion (`bar_count=32`) with the real hold-confirmed transitions
+this fixture is known to produce — and a direct query against the real
+`trades` table confirmed exactly ZERO rows, not merely `GET /api/state`
+showing none. With `avg_daily_volume=50,000` (needs only 150,000,
+comfortably cleared by the real, computed `session_cumulative_volume`
+of 1,501,000), a real position opened — confirmed via a direct `trades`
+row query showing the full real snapshot: `entry_price=7.86`,
+`setup_type=vwap_reclaim`, `trigger_price=7.8572` (below `entry_price`,
+so `_phase1_anchor` doesn't clamp here), `exit_phase='swing_low'`,
+`swing_low_buffer_pct_used=0.005`, and `factors` holding the real
+`session_cumulative_volume=1501000.0`/`avg_daily_volume=50000.0`/
+`session_volume_multiple_used=3.0` together. `stop_level` (7.8179)
+confirmed to equal `7.8572 * (1 - 0.005)` exactly. The rendered page
+(fetched live) showed `stop phase: swing-low anchored (early)` on that
+open position's own panel, and `swing_low_buffer_pct=0.0050`/
+`pattern_progress_threshold_pct=0.0300`/`session_volume_multiple=
+3.0000` on the strategy-params line. Live-tuning verified both
+directions against that same running instance: `POST /api/
+strategy_params {"session_volume_multiple": 10.0, "swing_low_buffer_
+pct": 0.02}` took effect immediately (confirmed via `GET`, with the
+real old/new values in `history`) — while the ALREADY-OPEN position's
+own `stop_level` (7.8179) and the real `trades` row's `swing_low_
+buffer_pct_used` (still `0.005`, not `0.02`) stayed completely
+unchanged, confirming the "locked at entry, a live change never
+reaches an open position" requirement live, not just at the unit-test
+level.
+
+The swing-low anchor actually REPRICING a stop mid-trade (a confirmed
+low replacing the entry-trigger fallback) and the one-way phase
+transition were verified at the wiring-test level instead of via a
+second live run — `test_a_real_confirmed_swing_low_reprices_the_
+phase1_stop` and `test_a_parameter_change_after_entry_does_not_
+affect_the_open_positions_ratchet` (`test_journal_wiring.py`) — real
+`Poller`/`journal_logic`/`JournalStore(tmp_path)` code, real `core/`
+hold-confirmation and swing-point detection, real SQLite, driven
+through `TestClient` rather than a second separate OS process; the
+32-bar replay fixture's own real cascade doesn't hand-tunably produce
+these two specific shapes (a controlled post-entry pullback, and a
+controlled progress-threshold clearance) the way a purpose-built bar
+sequence does, and building a live-process variant of the same proof
+would exercise identical code to what these wiring tests already do
+end-to-end. Building the swing-low wiring test itself is what
+surfaced the `_phase1_anchor` clamp bug above — the first attempt used
+a swing low ABOVE `entry_price`, silently clamped to `entry_price` by
+the (correct) new logic, numerically indistinguishable from the
+untouched fallback until the fixture was corrected to a genuine
+below-entry pullback.
+
+### 13. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,

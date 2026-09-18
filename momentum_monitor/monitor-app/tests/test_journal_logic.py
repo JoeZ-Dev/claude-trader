@@ -97,7 +97,7 @@ def test_should_enter_when_volume_is_exactly_at_threshold():
     ) is True
 
 
-# -- should_enter: session-level volume gate, specs.md section 13 ----------
+# -- should_enter: session-level volume gate, specs.md section 12 ----------
 # (separate from, and stacking with, the bar-level relative_volume gate
 # above -- every test here uses HIGH_VOLUME/VOLUME_CONFIRM_THRESHOLD so
 # that gate always passes, isolating what's actually under test.)
@@ -114,7 +114,7 @@ def test_should_enter_default_kwargs_skip_the_session_volume_gate():
 
 def test_should_enter_skips_the_gate_when_avg_daily_volume_is_none():
     # The real value whenever historical data couldn't be fetched
-    # (specs.md section 13's explicit "skip, don't block" choice) --
+    # (specs.md section 12's explicit "skip, don't block" choice) --
     # even a tiny session_cumulative_volume doesn't block entry.
     assert should_enter(
         newly_confirmed_type="resistance_breakout", relative_volume=HIGH_VOLUME,
@@ -247,7 +247,7 @@ def test_apply_bar_to_open_position_defaults_to_trailing_phase_unaffected_by_fea
     # A position built without opting into the two-phase feature (every
     # test above this line, and a resumed pre-migration open position,
     # see journal_store.py) must ratchet EXACTLY as always -- exit_phase
-    # defaults to "trailing", not "swing_low" (specs.md section 13).
+    # defaults to "trailing", not "swing_low" (specs.md section 12).
     pos = OpenPosition(id=None, symbol="X", entry_ts=0, entry_price=100.0,
                        high_water_mark=100.0, stop_level=95.0)
     assert pos.exit_phase == "trailing"
@@ -256,7 +256,7 @@ def test_apply_bar_to_open_position_defaults_to_trailing_phase_unaffected_by_fea
     assert updated.exit_phase == "trailing"
 
 
-# -- apply_bar_to_open_position: two-phase exit, specs.md section 13 -------
+# -- apply_bar_to_open_position: two-phase exit, specs.md section 12 -------
 
 def _swing_low_position(*, entry_price=10.0, trigger_price=9.5,
                         trail_pct=TRAIL_PCT, buffer_pct=SWING_LOW_BUFFER_PCT,
@@ -436,7 +436,7 @@ def test_advance_journal_opens_a_new_position_on_fresh_confirmation():
     assert tick.opened.entry_price == 10.2
     assert tick.opened.entry_ts == 100
     assert tick.opened.high_water_mark == 10.2
-    # Phase 1 (specs.md section 13): anchored to the entry-trigger level
+    # Phase 1 (specs.md section 12): anchored to the entry-trigger level
     # (_setup's default trigger_price=10.5), buffered -- NOT
     # entry_price*(1-trail_pct) anymore, that's phase 2's formula only.
     # Clamped to entry_price (10.2 < trigger_price 10.5, see
@@ -558,7 +558,7 @@ def test_advance_journal_exit_is_never_gated_by_volume():
 
 
 # -- session-level volume gate, wired through advance_journal (specs.md
-# section 13) ----------------------------------------------------------
+# section 12) ----------------------------------------------------------
 
 def test_advance_journal_blocks_entry_when_session_volume_gate_fails():
     tick = _advance(
@@ -627,7 +627,7 @@ def test_advance_journal_records_setup_type_and_merged_factors_on_entry():
 def test_new_entry_uses_the_current_trail_pct_and_locks_it_onto_the_position():
     # trail_pct is locked onto the position at entry regardless -- it's
     # simply not what PRICES the entry-time stop_level anymore (that's
-    # phase 1's swing-low/trigger-price anchor, specs.md section 13);
+    # phase 1's swing-low/trigger-price anchor, specs.md section 12);
     # trail_pct only takes over once the position transitions to phase 2.
     tick = _advance(
         new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
@@ -749,7 +749,7 @@ def test_open_positions_ratcheting_does_not_touch_sizing_fields():
     assert tick.updated.risk_amount_used == 19.89
 
 
-# -- two-phase exit snapshot at entry, specs.md section 13 -----------------
+# -- two-phase exit snapshot at entry, specs.md section 12 -----------------
 
 def test_new_entry_starts_in_swing_low_phase_with_thresholds_locked_in():
     tick = _advance(

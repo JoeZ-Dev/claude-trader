@@ -95,7 +95,7 @@ an explicit reset to base_equity, an explicit manual override) that
 must stay distinguishable later, not just old-value/new-value pairs
 with no indication of WHICH path produced them.
 
-Also (added 2026-09-18, specs.md section 13): `trades` gains
+Also (added 2026-09-18, specs.md section 12): `trades` gains
 `exit_phase`/`swing_low_buffer_pct_used`/
 `pattern_progress_threshold_pct_used`/`phase_transitioned_ts` for the
 two-phase exit (see journal_logic.py's OpenPosition). Unlike every
@@ -226,7 +226,7 @@ MAX_WATCH_NOTE_LENGTH = 500
 # (50%) as a ceiling mirrors trail_pct's own reasoning exactly: already
 # far more than this strategy would ever plausibly risk on one trade,
 # chosen as a sanity ceiling, not a validated "correct" number.
-# swing_low_buffer_pct (specs.md section 13) is a small cushion below
+# swing_low_buffer_pct (specs.md section 12) is a small cushion below
 # whatever anchor (a confirmed swing low, or the entry-trigger level)
 # governs phase 1's stop -- 0.005 (0.5%) is the chosen default: enough
 # to absorb a typical wick-through-the-exact-low without meaningfully
@@ -242,7 +242,7 @@ MAX_WATCH_NOTE_LENGTH = 500
 # phase 2 (the point of having one at all); 1.0 (100%) as a ceiling
 # reflects how volatile these candidates genuinely are, not an absurd
 # extreme for this project's own trading range.
-# session_volume_multiple (specs.md section 13) is how many multiples of
+# session_volume_multiple (specs.md section 12) is how many multiples of
 # a symbol's typical daily volume today's cumulative session volume
 # must clear to allow an entry -- 3.0 is the user's own stated
 # criterion, not a guess; 50.0 as a ceiling mirrors volume_confirm_
@@ -622,7 +622,7 @@ class JournalStore:
 
     def update_trailing(self, position: OpenPosition) -> None:
         # exit_phase/phase_transitioned_ts persist here too (specs.md
-        # section 13) -- the ONE-WAY swing_low -> trailing transition
+        # section 12) -- the ONE-WAY swing_low -> trailing transition
         # happens mid-trade, on a ratchet, not at create()/close_position()
         # time, so it needs to survive a restart the same way high_water_
         # mark/stop_level already do.

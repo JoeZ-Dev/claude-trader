@@ -983,7 +983,7 @@ def test_equity_state_and_history_tables_exist_on_a_db_that_predates_them(tmp_pa
     assert store.current_equity() == 2010.0
 
 
-# -- two-phase exit + session-level volume gate (specs.md section 13) -----
+# -- two-phase exit + session-level volume gate (specs.md section 12) -----
 
 def test_swing_low_buffer_pattern_progress_and_session_volume_multiple_are_recognized_params(tmp_path):
     store = JournalStore(tmp_path / "journal.db")

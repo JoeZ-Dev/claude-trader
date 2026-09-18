@@ -51,7 +51,7 @@ def test_relative_volume_hand_computed():
     assert abs(result[20] - 5.0) < 1e-9
 
 
-# -- confirmed_swing_lows (specs.md section 13's early-phase exit) --------
+# -- confirmed_swing_lows (specs.md section 12's early-phase exit) --------
 
 def test_confirmed_swing_lows_finds_a_clean_v_shape():
     # window=3 needs 3 bars on EACH side of the candidate -- exactly 7

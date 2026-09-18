@@ -143,7 +143,7 @@ from journal_store import (MAX_WATCH_NOTE_LENGTH, InvalidEquityOverrideError,
 from state import build_state
 
 # Same sys.path setup as state.py's own CORE_PATH -- app.py reaches into
-# core/levels.py directly for confirmed_swing_lows (specs.md section 13's
+# core/levels.py directly for confirmed_swing_lows (specs.md section 12's
 # early-phase exit), a journal-specific need state.build_state's output
 # has no reason to carry, unlike setups/relative_volume which the WHOLE
 # page displays. Explicit here rather than relying on the side effect of
@@ -184,7 +184,7 @@ DEFAULT_VOLUME_CONFIRM_THRESHOLD = 1.5
 # same fallback-vs-live-tunable split as DEFAULT_TRAIL_PCT above.
 DEFAULT_BASE_EQUITY = 2000.0
 DEFAULT_RISK_PCT_PER_TRADE = 0.01
-# Two-phase exit + session-level volume gate (specs.md section 13). See
+# Two-phase exit + session-level volume gate (specs.md section 12). See
 # journal_store.py's _PARAM_BOUNDS comment for the full reasoning behind
 # each default -- these are seed/fallback defaults ONLY, same
 # fallback-vs-live-tunable split as DEFAULT_TRAIL_PCT above.
@@ -238,7 +238,7 @@ class _SymbolSlot:
     poll_ok: bool = False
     journal_position: OpenPosition | None = None
     journal_confirmed_types: frozenset[str] = field(default_factory=frozenset)
-    # Fetched ONCE, when the symbol is first added (specs.md section 13's
+    # Fetched ONCE, when the symbol is first added (specs.md section 12's
     # session-level volume gate), never per-bar -- None if never fetched
     # yet, or if the fetch failed/returned nothing (too new a symbol, a
     # data gap), which SKIPS the gate for this symbol's entries rather
@@ -334,7 +334,7 @@ class Poller:
                                  if self._journal_store is not None else None)
         payload["reverse_splits"] = self.reverse_splits_for(symbol)
         # The session-level volume gate's cached baseline (specs.md
-        # section 13) -- None means "never fetched" or "fetch failed",
+        # section 12) -- None means "never fetched" or "fetch failed",
         # not zero; exposed here mainly so it's directly checkable via
         # GET /api/state, same as everything else on this page.
         payload["avg_daily_volume"] = slot.avg_daily_volume
@@ -507,7 +507,7 @@ class Poller:
             "shares": pos.shares,
             "unrealized_pnl_dollars": (round(unrealized_dollars, 2)
                                        if unrealized_dollars is not None else None),
-            # Two-phase exit (specs.md section 13) -- which mechanism
+            # Two-phase exit (specs.md section 12) -- which mechanism
             # currently governs this position's own stop_level above.
             "exit_phase": pos.exit_phase,
         }
@@ -564,7 +564,7 @@ class Poller:
         self._slots[symbol] = _SymbolSlot(symbol=symbol, state=build_state([], symbol))
         if self._fetch_daily_bars is not None:
             # Fetched ONCE per symbol, right here at add-time, never
-            # per-bar (specs.md section 13) -- a failure (too new a
+            # per-bar (specs.md section 12) -- a failure (too new a
             # symbol, a data gap) SKIPS the session-level volume gate for
             # this symbol rather than blocking the add or every future
             # entry, same non-fatal-backfill precedent as catch_up's own
@@ -854,7 +854,7 @@ class Poller:
         risk_pct_per_trade = self._journal_store.get_param(
             "risk_pct_per_trade", self._risk_pct_per_trade)
         current_equity = self._journal_store.current_equity()
-        # Two-phase exit (specs.md section 13): same live-lookup-then-lock
+        # Two-phase exit (specs.md section 12): same live-lookup-then-lock
         # discipline as every param above -- locked onto a BRAND NEW
         # entry only, never re-read for an already-open position.
         swing_low_buffer_pct = self._journal_store.get_param(
@@ -880,7 +880,7 @@ class Poller:
             confirmed = confirmed_swing_lows(bars_since_entry)
             if confirmed:
                 swing_low_anchor = min(c["price"] for c in confirmed)
-        # Session-level volume gate (specs.md section 13) -- separate
+        # Session-level volume gate (specs.md section 12) -- separate
         # from, and stacking with, relative_volume above. avg_daily_volume
         # is the ONE-TIME, add-time fetch cached on this slot (never
         # re-fetched per bar) -- None (skip the gate) if it was never

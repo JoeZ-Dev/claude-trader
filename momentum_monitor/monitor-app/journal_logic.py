@@ -40,7 +40,7 @@ does not fire, and does not get a second chance later while it stays
 confirmed (see `_first_newly_confirmed` below: the type is still marked
 "seen" whether or not the volume gate let it fire, since nothing about
 it has changed if it's still sitting at the same confirmed state next
-tick). Also gated (added 2026-09-18, specs.md section 13) by today's
+tick). Also gated (added 2026-09-18, specs.md section 12) by today's
 cumulative SESSION volume clearing `avg_daily_volume *
 session_volume_multiple` -- a separate, session-level check that STACKS
 with (never replaces) the bar-level relative_volume gate above; see
@@ -57,7 +57,7 @@ setup_types.py's own SetupCandidate.factors carries) are captured on
 the OpenPosition at the moment of entry, not re-derived later from
 whatever happens to be displayed at review time.
 
-Exit -- two-phase (added 2026-09-18, specs.md section 13; the ORIGINAL
+Exit -- two-phase (added 2026-09-18, specs.md section 12; the ORIGINAL
 single-phase mechanism below was the whole story before that). A bar's
 LOW crossing below the current stop_level exits immediately, no
 confirmation delay, in EITHER phase -- deliberately mirroring specs.md
@@ -157,7 +157,7 @@ class OpenPosition:
     account_size_used: float | None = None
     risk_pct_used: float | None = None
     risk_amount_used: float | None = None
-    # Two-phase exit (added 2026-09-18, specs.md section 13 -- the
+    # Two-phase exit (added 2026-09-18, specs.md section 12 -- the
     # "most recent confirmed higher-low" option sketched, and not
     # chosen, when the flat trailing stop was first designed, section
     # 6): "swing_low" anchors the stop to the lowest CONFIRMED swing low
@@ -255,7 +255,7 @@ def should_enter(*, newly_confirmed_type: str | None, relative_volume: float,
     """True when some setup type freshly transitioned to confirmed (any
     of the four -- generalized 2026-09-17, see module docstring),
     relative_volume clears volume_confirm_threshold at that same moment,
-    no position is already open, AND (2026-09-18, specs.md section 13's
+    no position is already open, AND (2026-09-18, specs.md section 12's
     session-level volume gate -- separate from, and stacking with, the
     bar-level relative_volume check above) today's cumulative session
     volume clears `avg_daily_volume * session_volume_multiple`. This is
@@ -267,7 +267,7 @@ def should_enter(*, newly_confirmed_type: str | None, relative_volume: float,
     symbol's historical daily volume couldn't be fetched -- too new, a
     data gap) SKIPS the session-level gate entirely rather than blocking
     every entry for exactly the newest, least-vetted candidates this
-    tool exists to watch (specs.md section 13's explicit, documented
+    tool exists to watch (specs.md section 12's explicit, documented
     choice) -- the bar-level relative_volume gate above still applies
     regardless. Existing callers that don't pass these three kwargs at
     all get this exact same skip-the-gate behavior automatically."""
@@ -292,7 +292,7 @@ def apply_bar_to_open_position(
     no exceptions." Returns the updated position and an ExitEvent if
     the stop was breached this bar, else None.
 
-    Two-phase stop (2026-09-18, specs.md section 13):
+    Two-phase stop (2026-09-18, specs.md section 12):
 
     Phase "trailing" (the ORIGINAL, unchanged mechanism, and this
     dataclass field's own default -- see OpenPosition.exit_phase for
@@ -411,7 +411,7 @@ def advance_journal(
     meaningful zero-effort default the way an optional watch_note does.
 
     `swing_low_buffer_pct`/`pattern_progress_threshold_pct` (2026-09-18,
-    specs.md section 13) are the CURRENT live strategy_params values,
+    specs.md section 12) are the CURRENT live strategy_params values,
     used ONLY to price a brand-new entry's two-phase exit and get locked
     onto it (OpenPosition.swing_low_buffer_pct_used/
     pattern_progress_threshold_pct_used) -- same required-no-default
@@ -424,7 +424,7 @@ def advance_journal(
     function's own docstring for the full two-phase mechanics.
 
     `session_cumulative_volume`/`avg_daily_volume`/`session_volume_multiple`
-    (2026-09-18, specs.md section 13's session-level volume gate) feed
+    (2026-09-18, specs.md section 12's session-level volume gate) feed
     should_enter's extra entry condition, stacking with (not replacing)
     the existing bar-level relative_volume gate -- see should_enter's own
     docstring for the avg_daily_volume=None skip-the-gate behavior.
@@ -515,7 +515,7 @@ def advance_journal(
             opened = OpenPosition(
                 id=None, symbol=symbol, entry_ts=entry_bar["ts"],
                 entry_price=entry_price, high_water_mark=entry_price,
-                # Phase 1 (specs.md section 13) starts anchored to the
+                # Phase 1 (specs.md section 12) starts anchored to the
                 # level actually broken to enter this trade -- no swing
                 # low can possibly be confirmed yet, this instant is
                 # entry itself -- buffered the same way a real confirmed

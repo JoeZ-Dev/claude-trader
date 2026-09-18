@@ -93,7 +93,7 @@ services:
       # redeploying.
       BASE_EQUITY: "${BASE_EQUITY:-2000}"
       RISK_PCT_PER_TRADE: "${RISK_PCT_PER_TRADE:-0.01}"
-      # Two-phase exit + session-level volume gate (specs.md section 13) --
+      # Two-phase exit + session-level volume gate (specs.md section 12) --
       # same seed-only treatment as the params above; tune live via POST
       # /api/strategy_params, not by editing these and redeploying.
       SWING_LOW_BUFFER_PCT: "${SWING_LOW_BUFFER_PCT:-0.005}"

@@ -89,7 +89,7 @@ def test_build_state_on_demo_session_is_sane():
 
 
 def test_build_state_exposes_session_cumulative_volume():
-    # specs.md section 13's session-level volume gate needs today's
+    # specs.md section 12's session-level volume gate needs today's
     # cumulative session volume -- the SAME session slice (session_bars_
     # for_vwap) VWAP already uses, not a separately-invented one.
     bars = _load_demo_session()

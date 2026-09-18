@@ -112,7 +112,7 @@ async def fetch_today_bars(client, symbol: str, *, now_fn=time.time) -> list[dic
 async def fetch_daily_history(client, symbol: str, *, lookback_days: int = 30,
                               now_fn=time.time) -> list[dict]:
     """Fetch up to `lookback_days` of DAILY candles for the session-level
-    volume gate's "typical daily volume" baseline (specs.md section 13) --
+    volume gate's "typical daily volume" baseline (specs.md section 12) --
     a longer, coarser lookback distinct from fetch_today_bars' same-day
     intraday backfill above, used to average a symbol's normal daily
     volume against today's in-progress cumulative volume.

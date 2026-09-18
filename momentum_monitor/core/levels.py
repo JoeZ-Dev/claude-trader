@@ -90,7 +90,7 @@ def confirmed_swing_lows(bars: list[dict], window: int = 3) -> list[dict]:
 
     Exposed as its own public function, separate from `detect_levels`'
     clustered/scored `Level` output, because the virtual journal's early-
-    phase exit (specs.md section 13, the swing-low-anchored stop) needs
+    phase exit (specs.md section 12, the swing-low-anchored stop) needs
     the raw sequence of confirmed lows -- including the SAME real
     confirmation delay `_swing_points` already imposes (a low isn't
     "confirmed" until `window` bars have printed after it) -- not a level

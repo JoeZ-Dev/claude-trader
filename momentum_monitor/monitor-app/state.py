@@ -150,7 +150,7 @@ def build_state(bars: list[dict], symbol: str | None = None) -> dict:
 
     session = session_bars_for_vwap(bars)
     vwap = session_vwap(session)[-1] if session else None
-    # today's cumulative session volume (specs.md section 13's session-
+    # today's cumulative session volume (specs.md section 12's session-
     # level volume gate) -- the SAME session slice VWAP already uses
     # above, not a separately-invented one.
     cumulative_volume = sum(b["volume"] for b in session)

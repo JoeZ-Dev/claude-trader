@@ -326,7 +326,7 @@ def create_app(*, store: BarStore, source_factory, replay: bool,
     @app.get("/daily_bars/{symbol}")
     async def get_daily_bars(symbol: str, lookback_days: int = 30):
         """On-demand REST pass-through for the session-level volume
-        gate's "typical daily volume" baseline (specs.md section 13) --
+        gate's "typical daily volume" baseline (specs.md section 12) --
         deliberately NOT tied to the watch/backfill lifecycle above (no
         BarStore involvement, no caching here): monitor-app calls this
         once per symbol per watch and caches the result itself, so this

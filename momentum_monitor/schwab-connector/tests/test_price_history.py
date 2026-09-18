@@ -146,7 +146,7 @@ def test_fetch_today_bars_returns_empty_for_empty_candles():
 
 
 # -- fetch_daily_history (session-level volume gate baseline, specs.md
-# section 13) ----------------------------------------------------------
+# section 12) ----------------------------------------------------------
 
 def test_fetch_daily_history_requests_explicit_daily_range_ending_yesterday():
     # Same "explicit start/end range, not period_type" discipline

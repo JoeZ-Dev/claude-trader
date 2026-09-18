@@ -392,7 +392,7 @@ def test_watch_backfill_failure_does_not_block_live_streaming(tmp_path):
 
 
 # -- GET /daily_bars/{symbol} (session-level volume gate, specs.md
-# section 13) -- an on-demand REST pass-through, not tied to watch/
+# section 12) -- an on-demand REST pass-through, not tied to watch/
 # backfill lifecycle at all ------------------------------------------------
 
 def test_daily_bars_calls_the_fetcher_and_returns_its_bars(tmp_path):

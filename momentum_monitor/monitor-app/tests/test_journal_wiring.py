@@ -68,14 +68,14 @@ def _ratchet_bars():
     care exactly which batch triggers an eventual close (they only check
     "did it eventually close with the right reason"); NOT safe against
     phase 1's own, deliberately tighter, early-phase stop (specs.md
-    section 13) -- see _phase1_safe_ratchet_bars for that."""
+    section 12) -- see _phase1_safe_ratchet_bars for that."""
     return [_bar(150, 9.15), _bar(160, 9.05)]
 
 
 def _phase1_safe_ratchet_bars():
     """Two bars that raise high_water_mark a little while staying safely
     above phase 1's OWN stop (initial_stop_level(9.1, SWING_LOW_BUFFER_
-    PCT) = 9.0545, see specs.md section 13) -- for tests that need the
+    PCT) = 9.0545, see specs.md section 12) -- for tests that need the
     position to survive a ratchet without closing, for reasons unrelated
     to the two-phase exit itself (duplicate-entry guarding, cross-symbol
     independence). Also stays BELOW the phase 2 progress threshold
@@ -172,7 +172,7 @@ def test_entry_fires_on_real_hold_confirmed_transition(tmp_path):
     assert pos.entry_price == 9.1
     assert pos.entry_ts == 140
     assert pos.high_water_mark == 9.1
-    # Phase 1's own anchor (specs.md section 13), not trail_pct-derived:
+    # Phase 1's own anchor (specs.md section 12), not trail_pct-derived:
     # round_number_reclaim's trigger_price here (9.25) exceeds entry_price
     # (9.1) -- confirmed directly against real setup_types output -- so
     # _phase1_anchor clamps the anchor to entry_price itself.
@@ -384,7 +384,7 @@ def test_changing_trail_pct_via_api_takes_effect_on_the_next_entry_no_restart(tm
         assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
         first = store.open_position_for("AEHL")
         assert first.trail_pct == 0.05
-        # Entry-time stop_level is phase 1's anchor (specs.md section 13),
+        # Entry-time stop_level is phase 1's anchor (specs.md section 12),
         # NOT trail_pct-derived anymore -- trail_pct is still locked onto
         # the position (checked above) for when phase 2 eventually takes
         # over, but doesn't drive the stop at entry itself.
@@ -409,7 +409,7 @@ def test_changing_trail_pct_via_api_takes_effect_on_the_next_entry_no_restart(tm
 
 def test_a_parameter_change_after_entry_does_not_affect_the_open_positions_ratchet(tmp_path):
     # trail_pct only governs the stop once phase 2 ("trailing") has taken
-    # over (specs.md section 13) -- so THIS test (trail_pct isolation)
+    # over (specs.md section 12) -- so THIS test (trail_pct isolation)
     # needs the position actually in phase 2 to mean anything; a
     # dedicated transition batch (high water mark clearing entry_price *
     # 1.03, the default pattern_progress_threshold_pct) does that first.
@@ -497,11 +497,11 @@ def test_a_closed_trades_note_snapshot_is_unaffected_by_a_later_note_change(tmp_
 # app.py's DEFAULT_RISK_PCT_PER_TRADE, since journal_store has no row for
 # it either): risk_amount = 2000*0.01 = 20.0; risk_per_share =
 # 9.1*TRAIL_PCT(0.05) = 0.455 (sizing always uses trail_pct, independent
-# of which phase actually prices the stop -- specs.md section 13); shares
+# of which phase actually prices the stop -- specs.md section 12); shares
 # = floor(20.0/0.455) = 43; risk_amount_used = 43*0.455 = 19.565.
 #
 # The breach itself, though, is now governed by PHASE 1's stop (specs.md
-# section 13), not the flat trail: round_number_reclaim's trigger_price
+# section 12), not the flat trail: round_number_reclaim's trigger_price
 # (9.25) exceeds entry_price (9.1) here -- confirmed directly against
 # real setup_types output -- so _phase1_anchor clamps the anchor to
 # entry_price itself. No swing low confirms and no ratchet/transition
@@ -633,7 +633,7 @@ def test_two_symbols_closing_in_the_same_resync_batch_compound_equity_sequential
 
 
 # -- swing-low-anchored early-phase stop, wired end to end (specs.md
-# section 13) -- proves core/levels.confirmed_swing_lows is correctly
+# section 12) -- proves core/levels.confirmed_swing_lows is correctly
 # called with the right bars (the position's own history since entry)
 # and its result correctly reprices the stop, through the REAL Poller
 # pipeline, not just journal_logic.py's own hand-crafted-position tests.
@@ -684,7 +684,7 @@ def test_a_real_confirmed_swing_low_reprices_the_phase1_stop(tmp_path):
     assert reanchored.stop_level != initial_stop_level(9.1, SWING_LOW_BUFFER_PCT)
 
 
-# -- session-level volume gate, wired end to end (specs.md section 13) ----
+# -- session-level volume gate, wired end to end (specs.md section 12) ----
 # _entry_bars() is 15 bars at 50_000 volume each (see _bar's default) --
 # session_cumulative_volume by entry time is a REAL, computed 750_000
 # (state.py's actual session slice, not simulated).
@@ -727,7 +727,7 @@ def test_session_volume_gate_allows_a_real_entry_when_session_volume_clears_it(t
 
     pos = store.open_position_for("AEHL")
     assert pos is not None
-    # Snapshotted at entry (specs.md section 13), same "why did this
+    # Snapshotted at entry (specs.md section 12), same "why did this
     # trade happen" discipline as relative_volume.
     assert pos.factors["avg_daily_volume"] == 100_000.0
     assert pos.factors["session_cumulative_volume"] == pytest.approx(750_000.0)

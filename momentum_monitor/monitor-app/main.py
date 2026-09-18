@@ -39,7 +39,7 @@ Environment:
                         used) -- same seed-only treatment  (default 0.01)
   SWING_LOW_BUFFER_PCT   cushion below whatever anchors phase 1's stop (a
                         confirmed swing low, or the entry-trigger level)
-                        (specs.md section 13) -- same seed-only treatment
+                        (specs.md section 12) -- same seed-only treatment
                         as TRAIL_PCT                     (default 0.005)
   PATTERN_PROGRESS_THRESHOLD_PCT  how far above entry (via high_water_mark)
                         price must climb before phase 1 hands off to
@@ -47,7 +47,7 @@ Environment:
                         treatment                          (default 0.03)
   SESSION_VOLUME_MULTIPLE  how many multiples of a symbol's typical daily
                         volume today's cumulative session volume must
-                        clear for an entry to fire (specs.md section 13,
+                        clear for an entry to fire (specs.md section 12,
                         stacking with VOLUME_CONFIRM_THRESHOLD above, not
                         replacing it) -- same seed-only treatment
                                                               (default 3.0)
@@ -111,7 +111,7 @@ async def announce_unwatch(symbol: str):
 
 async def fetch_daily_bars(symbol: str):
     # Session-level volume gate's "typical daily volume" baseline
-    # (specs.md section 13) -- called ONCE per symbol, at add-time
+    # (specs.md section 12) -- called ONCE per symbol, at add-time
     # (Poller.add_symbol), never per-bar. A non-2xx or network failure
     # propagates (add_symbol catches it, logs, and leaves avg_daily_
     # volume None -- skip the gate for that symbol, never a crash).
