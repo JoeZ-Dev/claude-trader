@@ -28,7 +28,7 @@ import os
 
 from app import create_app
 from events import log_event
-from price_history import fetch_today_bars
+from price_history import fetch_daily_history, fetch_today_bars
 from reconnect import ReconnectingStreamSource
 from store import BarStore
 from stream import ReplayStreamSource, SchwabStreamSource
@@ -51,6 +51,7 @@ if STREAM_SOURCE == "replay":
         return ReplayStreamSource(REPLAY_PATH, watched_symbols=watched_symbols, pace=True)
     _replay = True
     _history_fetcher = None  # replay fixtures are hand-crafted; no session to backfill
+    _daily_history_fetcher = None  # same -- no real daily-volume history to fetch
 else:
     def _build_client(schwab_token: dict):
         # companion-auth vends access-token-only responses, so schwab-py's own
@@ -92,5 +93,21 @@ else:
         client = _build_client(token_source.as_schwab_token())
         return await fetch_today_bars(client, symbol)
 
+    async def _daily_history_fetcher(symbol: str, *, lookback_days: int):
+        # Same one-shot token+client pattern as _history_fetcher above --
+        # a separate closure (not a shared helper) because the two exist
+        # for genuinely different callers (automatic backfill-on-watch vs.
+        # monitor-app's on-demand GET /daily_bars/{symbol}) at different
+        # points in the symbol lifecycle; collapsing them would couple two
+        # things that only coincidentally share a few lines of auth setup.
+        if not AUTH_HELPER_URL:
+            raise RuntimeError(
+                "AUTH_HELPER_URL is not set; cannot reach companion-auth for a token")
+        token_source = AccessTokenSource(AUTH_HELPER_URL, shared_secret=INTERNAL_AUTH_SECRET)
+        await token_source.refresh_async()
+        client = _build_client(token_source.as_schwab_token())
+        return await fetch_daily_history(client, symbol, lookback_days=lookback_days)
+
 app = create_app(store=_store, source_factory=_source_factory, replay=_replay,
-                 history_fetcher=_history_fetcher)
+                 history_fetcher=_history_fetcher,
+                 daily_history_fetcher=_daily_history_fetcher)

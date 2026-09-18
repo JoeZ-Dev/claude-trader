@@ -38,7 +38,7 @@ def _replay_factory(fx):
     return lambda watched_symbols: ReplayStreamSource(fx, watched_symbols=watched_symbols)
 
 
-def _app(tmp_path, *, history_fetcher=None):
+def _app(tmp_path, *, history_fetcher=None, daily_history_fetcher=None):
     fx = _fixture(tmp_path)
     store = BarStore(tmp_path / "bars")
     return create_app(
@@ -47,6 +47,7 @@ def _app(tmp_path, *, history_fetcher=None):
         replay=True,
         now_fn=lambda: RTH_1030 + 30,
         history_fetcher=history_fetcher,
+        daily_history_fetcher=daily_history_fetcher,
     ), store
 
 
@@ -388,6 +389,60 @@ def test_watch_backfill_failure_does_not_block_live_streaming(tmp_path):
         c.post("/watch", json={"symbol": "AEHL"})
         bars = _wait_for_bars(c, "AEHL", want=3)
         assert [b["ts"] for b in bars] == [b["ts"] for b in FIXTURE_BARS]
+
+
+# -- GET /daily_bars/{symbol} (session-level volume gate, specs.md
+# section 13) -- an on-demand REST pass-through, not tied to watch/
+# backfill lifecycle at all ------------------------------------------------
+
+def test_daily_bars_calls_the_fetcher_and_returns_its_bars(tmp_path):
+    daily_bars = [_backfill_bar(RTH_1030 - 86400 * i, 9.0 + i) for i in range(5)]
+    calls = []
+
+    async def daily_history_fetcher(symbol, *, lookback_days):
+        calls.append((symbol, lookback_days))
+        return daily_bars
+
+    app, _ = _app(tmp_path, daily_history_fetcher=daily_history_fetcher)
+    with TestClient(app) as c:
+        r = c.get("/daily_bars/AEHL", params={"lookback_days": 20})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["symbol"] == "AEHL"
+        assert body["bars"] == daily_bars
+        assert calls == [("AEHL", 20)]
+
+
+def test_daily_bars_defaults_lookback_days_when_omitted(tmp_path):
+    calls = []
+
+    async def daily_history_fetcher(symbol, *, lookback_days):
+        calls.append(lookback_days)
+        return []
+
+    app, _ = _app(tmp_path, daily_history_fetcher=daily_history_fetcher)
+    with TestClient(app) as c:
+        c.get("/daily_bars/AEHL")
+        assert calls == [30]  # the documented default
+
+
+def test_daily_bars_returns_503_when_no_fetcher_configured(tmp_path):
+    app, _ = _app(tmp_path)  # daily_history_fetcher=None
+    with TestClient(app) as c:
+        r = c.get("/daily_bars/AEHL")
+        assert r.status_code == 503
+        assert r.json()["bars"] == []
+
+
+def test_daily_bars_returns_502_on_fetcher_failure_not_a_crash(tmp_path):
+    async def failing_fetcher(symbol, *, lookback_days):
+        raise RuntimeError("companion-auth unreachable")
+
+    app, _ = _app(tmp_path, daily_history_fetcher=failing_fetcher)
+    with TestClient(app) as c:
+        r = c.get("/daily_bars/AEHL")
+        assert r.status_code == 502
+        assert r.json()["bars"] == []
 
 
 # -- push (leg 1 of the poll -> push replacement, see specs.md) ----------

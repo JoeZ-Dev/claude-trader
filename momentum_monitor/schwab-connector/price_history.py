@@ -46,7 +46,7 @@ period-based default entirely and is unambiguous about what "today" means.
 from __future__ import annotations
 
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aggregator import is_extended_hours
@@ -107,3 +107,43 @@ async def fetch_today_bars(client, symbol: str, *, now_fn=time.time) -> list[dic
     resp.raise_for_status()
     payload = resp.json()
     return candles_to_bars(payload.get("candles", []))
+
+
+async def fetch_daily_history(client, symbol: str, *, lookback_days: int = 30,
+                              now_fn=time.time) -> list[dict]:
+    """Fetch up to `lookback_days` of DAILY candles for the session-level
+    volume gate's "typical daily volume" baseline (specs.md section 13) --
+    a longer, coarser lookback distinct from fetch_today_bars' same-day
+    intraday backfill above, used to average a symbol's normal daily
+    volume against today's in-progress cumulative volume.
+
+    Same explicit start_datetime/end_datetime discipline as
+    fetch_today_bars, for the same reason (see that function's docstring
+    on why period_type=DAY silently returns the wrong range) --
+    end_datetime is today's own NY midnight, EXCLUSIVE of today, so a
+    still-forming partial session never drags the average down.
+    start_datetime requests a calendar window generously larger than
+    `lookback_days` (weekends/holidays mean calendar days always
+    outnumber trading days) -- 2x plus a 10-day pad is comfortable
+    without over-fetching. Returns at most the `lookback_days` MOST
+    RECENT candles actually returned, oldest-first (candles_to_bars'
+    own sort order) -- a symbol with less than `lookback_days` of real
+    trading history simply returns fewer, never padded or invented.
+
+    Raises on any non-2xx response or network failure, same as
+    fetch_today_bars -- callers decide whether that's fatal."""
+    now = datetime.fromtimestamp(now_fn(), _NY)
+    end = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start = end - timedelta(days=lookback_days * 2 + 10)
+    resp = await client.get_price_history(
+        symbol,
+        frequency_type=client.PriceHistory.FrequencyType.DAILY,
+        frequency=client.PriceHistory.Frequency.DAILY,
+        start_datetime=start,
+        end_datetime=end,
+        need_extended_hours_data=False,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    bars = candles_to_bars(payload.get("candles", []))
+    return bars[-lookback_days:]

@@ -32,7 +32,7 @@ from contextlib import asynccontextmanager
 import json
 
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from aggregator import BUCKET_SECONDS, BarAggregator
@@ -290,6 +290,7 @@ class Connector:
 
 def create_app(*, store: BarStore, source_factory, replay: bool,
                now_fn=time.time, history_fetcher=None,
+               daily_history_fetcher=None,
                flush_interval: float = FLUSH_INTERVAL_SECONDS,
                heartbeat_flush_cycles: int = HEARTBEAT_FLUSH_CYCLES,
                subscriber_maxsize: int = SUBSCRIBER_QUEUE_MAXSIZE) -> FastAPI:
@@ -321,6 +322,34 @@ def create_app(*, store: BarStore, source_factory, replay: bool,
     @app.get("/bars/{symbol}")
     async def get_bars(symbol: str, since_ts: float = 0.0):
         return connector.bars(symbol, since_ts)
+
+    @app.get("/daily_bars/{symbol}")
+    async def get_daily_bars(symbol: str, lookback_days: int = 30):
+        """On-demand REST pass-through for the session-level volume
+        gate's "typical daily volume" baseline (specs.md section 13) --
+        deliberately NOT tied to the watch/backfill lifecycle above (no
+        BarStore involvement, no caching here): monitor-app calls this
+        once per symbol per watch and caches the result itself, so this
+        route stays a thin fetch-and-serve proxy, same division of
+        labor as GET /bars/{symbol}. `daily_history_fetcher` is an
+        `async def (symbol, *, lookback_days) -> list[dict]` (see
+        price_history.fetch_daily_history); unconfigured (None) returns
+        503, and a fetch failure returns 502 -- either way, never a
+        silent crash the caller has to guess about."""
+        if daily_history_fetcher is None:
+            return JSONResponse(
+                {"symbol": symbol, "bars": [],
+                 "error": "daily history fetcher not configured"},
+                status_code=503,
+            )
+        try:
+            bars = await daily_history_fetcher(symbol, lookback_days=lookback_days)
+        except Exception as exc:
+            return JSONResponse(
+                {"symbol": symbol, "bars": [], "error": str(exc)},
+                status_code=502,
+            )
+        return {"symbol": symbol, "bars": bars}
 
     @app.get("/health")
     async def health():
