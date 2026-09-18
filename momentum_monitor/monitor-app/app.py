@@ -135,7 +135,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from journal_logic import ExitEvent, OpenPosition, advance_journal
-from journal_store import MAX_WATCH_NOTE_LENGTH, InvalidParamError, InvalidWatchNoteError
+from journal_store import (MAX_WATCH_NOTE_LENGTH, InvalidParamError,
+                           InvalidReverseSplitError, InvalidWatchNoteError)
 from state import build_state
 
 # Same exchange-local timezone state.py already anchors session VWAP to
@@ -276,7 +277,40 @@ class Poller:
         payload["journal"] = {"open": self._journal_open_for(slot)}
         payload["watch_note"] = (self._journal_store.current_note_for(symbol)
                                  if self._journal_store is not None else None)
+        payload["reverse_splits"] = self.reverse_splits_for(symbol)
         return payload
+
+    def reverse_splits_for(self, symbol: str) -> list[dict]:
+        """Every recorded reverse split for `symbol`, most recent first --
+        [] if journaling is disabled or none were ever recorded. Works for
+        a symbol not currently watched too (specs.md section 7: checkable
+        BEFORE deciding to watch something, not only after)."""
+        if self._journal_store is None:
+            return []
+        return self._journal_store.reverse_splits_for(symbol)
+
+    def add_reverse_split(self, symbol: str, split_date: str, ratio: str,
+                          note: str | None = None) -> tuple[bool, str]:
+        """Records a reverse-split event for `symbol` (specs.md section 7)
+        -- a curated, manually-entered flag, not sourced live from Schwab
+        (no such data is available there). Does NOT require `symbol` to be
+        currently watched. Returns (False, reason) for a blank symbol or
+        journaling disabled, or (propagated from journal_store)
+        InvalidReverseSplitError's message for a blank/non-ISO split_date,
+        blank ratio, or over-length note -- same 409 convention as every
+        other validation failure in this app."""
+        symbol = symbol.strip().upper()
+        if not symbol:
+            return False, "symbol is required"
+        if self._journal_store is None:
+            return False, "journaling is disabled"
+        try:
+            self._journal_store.add_reverse_split(symbol, split_date, ratio, note)
+        except InvalidReverseSplitError as exc:
+            return False, str(exc)
+        if symbol in self._slots:
+            self._broadcast_state()
+        return True, ""
 
     def all_full_states(self) -> dict[str, dict]:
         return {sym: self.full_state_for(sym) for sym in self._slots}
@@ -948,6 +982,24 @@ def _watch_note_html(note: str | None) -> str:
     return f"<p class='{cls}'>{text}</p>"
 
 
+def _reverse_splits_html(splits: list[dict] | None) -> str:
+    # Quiet unless there's something to flag -- unlike watch_note (which
+    # always renders, since "no note" needs to read differently from
+    # "hasn't loaded yet"), reverse_splits_for always resolves instantly
+    # and definitively (specs.md section 7), so an empty result has no
+    # such ambiguity to guard against; showing "no known reverse splits"
+    # on every panel (the common case for most tickers) would be pure
+    # noise for what's meant to read as a warning banner.
+    if not splits:
+        return ""
+    items = "; ".join(
+        html.escape(s["ratio"]) + " on " + html.escape(s["split_date"])
+        + (f" ({html.escape(s['note'])})" if s.get("note") else "")
+        for s in splits
+    )
+    return f"<p class='reverse-split-flag'>⚠ Reverse-split history: {items}</p>"
+
+
 def _symbol_card_html(symbol: str, state: dict) -> str:
     """One grid panel per watched symbol: the same per-block renderers
     phase 1's single-symbol page used, plus a remove control scoped to
@@ -955,12 +1007,14 @@ def _symbol_card_html(symbol: str, state: dict) -> str:
     #symbols in _SCRIPT -- see refresh())."""
     sym = html.escape(symbol)
     note_html = _watch_note_html(state.get("watch_note"))
+    split_html = _reverse_splits_html(state.get("reverse_splits"))
     if state.get("status") != "ok":
         msg = (f"Warming up — waiting for bars for {sym}." if state.get("symbol")
               else "No data yet.")
         return (f"<section class='card' data-symbol='{sym}'>"
                 f"<div class='hero'><h2>{sym}</h2>{_remove_button_html(symbol)}</div>"
                 f"{note_html}"
+                f"{split_html}"
                 f"<p class='muted'>{html.escape(msg)}</p></section>")
 
     s = state["session"]
@@ -977,6 +1031,7 @@ def _symbol_card_html(symbol: str, state: dict) -> str:
     {_remove_button_html(symbol)}
   </div>
   {note_html}
+  {split_html}
   <table class="detail">
     <tr><th>Bars</th><td>{state['bar_count']}</td></tr>
     <tr><th>Last bar extended-hours</th><td>{"yes" if state["last_bar_is_extended"] else "no"}</td></tr>
@@ -1231,13 +1286,24 @@ function watchNoteHtml(note) {
   const cls = note ? 'watch-note' : 'watch-note muted';
   return '<p class="' + cls + '">' + text + '</p>';
 }
+function reverseSplitsHtml(splits) {
+  // Mirrors _reverse_splits_html (Python side) -- quiet unless there's
+  // something to flag, see that function's comment for why.
+  if (!splits || !splits.length) return '';
+  const items = splits.map(function (s) {
+    const note = s.note ? ' (' + esc(s.note) + ')' : '';
+    return esc(s.ratio) + ' on ' + esc(s.split_date) + note;
+  }).join('; ');
+  return '<p class="reverse-split-flag">\\u26a0 Reverse-split history: ' + items + '</p>';
+}
 function symbolCardHtml(symbol, state) {
   const sym = esc(symbol);
   const noteHtml = watchNoteHtml(state.watch_note);
+  const splitHtml = reverseSplitsHtml(state.reverse_splits);
   if (state.status !== 'ok') {
     return '<section class="card" data-symbol="' + sym + '">' +
       '<div class="hero"><h2>' + sym + '</h2>' + removeButtonHtml(symbol) + '</div>' +
-      noteHtml +
+      noteHtml + splitHtml +
       '<p class="muted">Warming up \\u2014 waiting for bars.</p></section>';
   }
   const s = state.session;
@@ -1251,7 +1317,7 @@ function symbolCardHtml(symbol, state) {
     '<div class="hero"><div class="hero-symbol">' + sym + '</div>' +
     '<div class="hero-price ' + priceCls + '">' + fmt(state.last_price, 2) + '</div>' +
     removeButtonHtml(symbol) + '</div>' +
-    noteHtml +
+    noteHtml + splitHtml +
     '<table class="detail">' +
     '<tr><th>Bars</th><td>' + state.bar_count + '</td></tr>' +
     '<tr><th>Last bar extended-hours</th><td>' + (state.last_bar_is_extended ? 'yes' : 'no') + '</td></tr>' +
@@ -1587,6 +1653,7 @@ table.detail th{color:var(--muted);font-weight:500;width:45%}
 .pos{color:var(--pos);font-weight:600}
 .neg{color:var(--neg);font-weight:600}
 .muted{color:var(--muted)}
+.reverse-split-flag{color:var(--pending);font-weight:600;font-size:.82rem;margin:.15rem 0}
 .badge{display:inline-block;padding:.1rem .5rem;border-radius:1rem;
   font-size:.72rem;font-weight:600}
 .badge-confirmed{background:rgba(62,207,126,.18);color:var(--pos)}
@@ -1714,6 +1781,28 @@ def create_app(*, fetch_bars, watch_symbol=None,
         symbol = body.get("symbol") or ""
         note = body.get("note") or ""
         ok, reason = poller.update_watch_note(symbol, note)
+        return JSONResponse({"ok": ok, "reason": reason}, status_code=200 if ok else 409)
+
+    @app.get("/api/reverse_splits")
+    async def api_reverse_splits_get(symbol: str):
+        # Checkable for ANY symbol, watched or not (specs.md section 7) --
+        # the flag's main value is informing the decision to watch
+        # something in the first place.
+        return JSONResponse({"symbol": symbol.strip().upper(),
+                             "splits": poller.reverse_splits_for(symbol)})
+
+    @app.post("/api/reverse_splits")
+    async def api_reverse_splits_post(request: Request):
+        # {"symbol", "split_date", "ratio", "note"} -- JSON body, like
+        # /api/watch_note, not tied to a plain HTML form. A curated,
+        # manually-entered flag (specs.md section 7): no live data source
+        # for reverse-split history exists via Schwab.
+        body = await request.json()
+        symbol = body.get("symbol") or ""
+        split_date = body.get("split_date") or ""
+        ratio = body.get("ratio") or ""
+        note = body.get("note") or None
+        ok, reason = poller.add_reverse_split(symbol, split_date, ratio, note)
         return JSONResponse({"ok": ok, "reason": reason}, status_code=200 if ok else 409)
 
     @app.post("/api/unwatch")

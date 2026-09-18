@@ -348,6 +348,89 @@ def test_post_watch_note_rejects_an_over_length_note(tmp_path):
         assert store.current_note_for("AEHL") is None
 
 
+# -- reverse-split history flag, specs.md section 7 -----------------------
+
+def test_reverse_splits_is_empty_list_when_none_recorded(tmp_path):
+    c, store = _client_with_real_store_for_notes(FakeFetch({"AEHL": [_bars(3)]}), tmp_path)
+    with c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        assert _sym_state(c, "AEHL")["reverse_splits"] == []
+
+
+def test_post_reverse_split_then_state_and_page_reflect_it(tmp_path):
+    c, store = _client_with_real_store_for_notes(FakeFetch({"AEHL": [_bars(3)]}), tmp_path)
+    with c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        r = c.post("/api/reverse_splits", json={
+            "symbol": "AEHL", "split_date": "2024-05-02", "ratio": "1:10",
+            "note": "pre-earnings reverse split"})
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+
+        splits = _sym_state(c, "AEHL")["reverse_splits"]
+        assert len(splits) == 1
+        assert splits[0]["ratio"] == "1:10"
+
+        page = c.get("/").text
+        assert "1:10" in page
+        assert "2024-05-02" in page
+
+
+def test_reverse_split_flag_not_shown_when_none_recorded(tmp_path):
+    c, store = _client_with_real_store_for_notes(FakeFetch({"AEHL": [_bars(3)]}), tmp_path)
+    with c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        page = c.get("/").text
+        # Only the server-rendered markup matters here -- the trailing
+        # <script> block's JS mirror (reverseSplitsHtml) legitimately
+        # contains this string as a template literal regardless of state.
+        rendered = page.split("<script>")[0]
+        assert "Reverse-split history" not in rendered
+
+
+def test_post_reverse_split_works_for_a_symbol_not_currently_watched(tmp_path):
+    # The whole point of the flag: checkable BEFORE deciding to watch a
+    # symbol, not only after.
+    c, store = _client_with_real_store_for_notes(FakeFetch({}), tmp_path, symbol=None)
+    with c:
+        r = c.post("/api/reverse_splits", json={
+            "symbol": "BIAF", "split_date": "2024-05-02", "ratio": "1:10"})
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+        assert store.reverse_splits_for("BIAF")[0]["ratio"] == "1:10"
+
+
+def test_get_reverse_splits_returns_recorded_splits(tmp_path):
+    c, store = _client_with_real_store_for_notes(FakeFetch({}), tmp_path, symbol=None)
+    with c:
+        store.add_reverse_split("BIAF", "2024-05-02", "1:10")
+        r = c.get("/api/reverse_splits", params={"symbol": "BIAF"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["symbol"] == "BIAF"
+        assert len(body["splits"]) == 1
+        assert body["splits"][0]["ratio"] == "1:10"
+
+
+def test_post_reverse_split_rejects_a_non_iso_split_date(tmp_path):
+    c, store = _client_with_real_store_for_notes(FakeFetch({}), tmp_path, symbol=None)
+    with c:
+        r = c.post("/api/reverse_splits", json={
+            "symbol": "BIAF", "split_date": "05/02/2024", "ratio": "1:10"})
+        assert r.status_code == 409
+        assert r.json()["ok"] is False
+        assert store.reverse_splits_for("BIAF") == []
+
+
+def test_post_reverse_split_rejects_a_blank_ratio(tmp_path):
+    c, store = _client_with_real_store_for_notes(FakeFetch({}), tmp_path, symbol=None)
+    with c:
+        r = c.post("/api/reverse_splits", json={
+            "symbol": "BIAF", "split_date": "2024-05-02", "ratio": ""})
+        assert r.status_code == 409
+        assert r.json()["ok"] is False
+
+
 def test_post_watch_at_capacity_evicts_the_oldest_symbol_not_a_rejection():
     unwatched = []
 
@@ -396,6 +479,9 @@ def test_post_watch_eviction_force_closes_the_evicted_symbols_open_position():
 
         def current_note_for(self, symbol):
             return None
+
+        def reverse_splits_for(self, symbol):
+            return []
 
     from journal_logic import OpenPosition
 
