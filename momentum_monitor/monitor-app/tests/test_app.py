@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(_APP_DIR), "core"))
 
 from fastapi.testclient import TestClient
 
-from app import _journal_closed_rows_html, create_app
+from app import _journal_closed_rows_html, _journal_open_html, create_app
 
 RTH = 1756909800  # 2025-09-03 10:30:00 ET
 
@@ -105,7 +105,8 @@ def _wait_until(pred, timeout=3.0):
 def _client(fetch, *, symbol="AEHL", announce=None, unwatch=None,
             announce_retry_attempts=5, announce_retry_base_delay=0.02,
             announce_retry_max_delay=0.02, journal_store=None,
-            trail_pct=0.05, max_symbols=4, stream_events=None):
+            trail_pct=0.05, max_symbols=4, stream_events=None,
+            fetch_daily_bars=None):
     app = create_app(fetch_bars=fetch, watch_symbol=symbol,
                      announce_watch=announce,
                      announce_unwatch=unwatch,
@@ -113,7 +114,8 @@ def _client(fetch, *, symbol="AEHL", announce=None, unwatch=None,
                      announce_retry_base_delay=announce_retry_base_delay,
                      announce_retry_max_delay=announce_retry_max_delay,
                      journal_store=journal_store, trail_pct=trail_pct,
-                     max_symbols=max_symbols, stream_events=stream_events)
+                     max_symbols=max_symbols, stream_events=stream_events,
+                     fetch_daily_bars=fetch_daily_bars)
     return TestClient(app)
 
 
@@ -916,6 +918,87 @@ def test_root_page_displays_base_equity_and_risk_pct_alongside_strategy_params(t
         page = c.get("/").text
         assert "base_equity=2000.0000" in page
         assert "risk_pct_per_trade=0.0100" in page
+
+
+# -- two-phase exit + session-level volume gate, specs.md section 13 ------
+
+def test_root_page_displays_the_new_section_13_strategy_params(tmp_path):
+    c, store = _client_with_real_store(
+        FakeFetch({"AEHL": [_bars(3)]}), tmp_path,
+        default_params={"trail_pct": 0.05, "volume_confirm_threshold": 1.5,
+                        "swing_low_buffer_pct": 0.005,
+                        "pattern_progress_threshold_pct": 0.03,
+                        "session_volume_multiple": 3.0})
+    with c:
+        page = c.get("/").text
+        assert "swing_low_buffer_pct=0.0050" in page
+        assert "pattern_progress_threshold_pct=0.0300" in page
+        assert "session_volume_multiple=3.0000" in page
+
+
+def test_avg_daily_volume_is_none_when_no_fetcher_configured(tmp_path):
+    c, store = _client_with_real_store(FakeFetch({"AEHL": [_bars(3)]}), tmp_path)
+    with c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        assert _sym_state(c, "AEHL")["avg_daily_volume"] is None
+
+
+def test_add_symbol_fetches_daily_bars_once_and_caches_the_average(tmp_path):
+    calls = []
+
+    async def fetch_daily_bars(symbol):
+        calls.append(symbol)
+        return [{"ts": i, "volume": v, "open": 1, "high": 1, "low": 1,
+                 "close": 1, "is_extended": False}
+                for i, v in enumerate([100_000.0, 200_000.0, 300_000.0])]
+
+    c = _client(FakeFetch({"AEHL": [_bars(3)]}), symbol="AEHL",
+               fetch_daily_bars=fetch_daily_bars)
+    with c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        assert calls == ["AEHL"]
+        assert _sym_state(c, "AEHL")["avg_daily_volume"] == 200_000.0
+
+        # Never re-fetched on ordinary bar pushes/resyncs, only at add-time.
+        c.post("/api/polling", json={"enabled": False})
+        c.post("/api/polling", json={"enabled": True})
+        assert calls == ["AEHL"]
+
+
+def test_add_symbol_leaves_avg_daily_volume_none_when_fetch_fails(tmp_path):
+    async def failing_fetch_daily_bars(symbol):
+        raise RuntimeError("companion-auth unreachable")
+
+    c = _client(FakeFetch({"AEHL": [_bars(3)]}), symbol="AEHL",
+               fetch_daily_bars=failing_fetch_daily_bars)
+    with c:
+        # The add itself must not fail/block just because the daily-
+        # history fetch did.
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        assert _sym_state(c, "AEHL")["avg_daily_volume"] is None
+
+
+def test_add_symbol_leaves_avg_daily_volume_none_when_fetch_returns_empty(tmp_path):
+    async def empty_fetch_daily_bars(symbol):
+        return []
+
+    c = _client(FakeFetch({"AEHL": [_bars(3)]}), symbol="AEHL",
+               fetch_daily_bars=empty_fetch_daily_bars)
+    with c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        assert _sym_state(c, "AEHL")["avg_daily_volume"] is None
+
+
+def test_open_position_panel_shows_the_current_stop_phase():
+    open_block = {"symbol": "AEHL", "entry_price": 10.0, "stop_level": 9.5,
+                 "unrealized_pnl_pct": 0.0, "shares": 10,
+                 "unrealized_pnl_dollars": 0.0, "exit_phase": "swing_low"}
+    html_out = _journal_open_html(open_block)
+    assert "swing-low anchored" in html_out
+
+    open_block["exit_phase"] = "trailing"
+    html_out = _journal_open_html(open_block)
+    assert "flat trailing" in html_out
 
 
 def test_apply_bar_push_reaches_state_the_instant_its_awaited():

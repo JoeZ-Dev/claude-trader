@@ -112,7 +112,7 @@ class FakeFetch:
 
 def _client(fetch, *, journal_store, symbol="AEHL", trail_pct=TRAIL_PCT,
            announce=None, unwatch=None, now_fn=time.time,
-           volume_confirm_threshold=0.0):
+           volume_confirm_threshold=0.0, fetch_daily_bars=None):
     # Threshold defaults to 0.0 (always clears) -- this file proves the
     # Poller<->journal_logic<->journal_store WIRING against real bar-
     # driven hold_confirmed transitions, not the volume gate itself
@@ -120,12 +120,14 @@ def _client(fetch, *, journal_store, symbol="AEHL", trail_pct=TRAIL_PCT,
     # fixtures' flat per-bar volume produces relative_volume ~= 1.0,
     # which is a real "no genuine spike" reading, not a fixture bug --
     # gating it off here keeps that concern out of the wiring tests it
-    # would otherwise silently couple to).
+    # would otherwise silently couple to). fetch_daily_bars defaults to
+    # None, same "skip the session-level volume gate" treatment.
     app = create_app(fetch_bars=fetch, watch_symbol=symbol,
                      announce_watch=announce, announce_unwatch=unwatch,
                      announce_retry_attempts=1,
                      journal_store=journal_store, trail_pct=trail_pct,
                      volume_confirm_threshold=volume_confirm_threshold,
+                     fetch_daily_bars=fetch_daily_bars,
                      now_fn=now_fn)
     return TestClient(app)
 
@@ -628,3 +630,105 @@ def test_two_symbols_closing_in_the_same_resync_batch_compound_equity_sequential
     assert history[0]["new_value"] == pytest.approx(2000.0 + 2 * _EXPECTED_LOSS_DOLLARS)
     assert history[1]["old_value"] == pytest.approx(2000.0)
     assert history[1]["new_value"] == pytest.approx(2000.0 + _EXPECTED_LOSS_DOLLARS)
+
+
+# -- swing-low-anchored early-phase stop, wired end to end (specs.md
+# section 13) -- proves core/levels.confirmed_swing_lows is correctly
+# called with the right bars (the position's own history since entry)
+# and its result correctly reprices the stop, through the REAL Poller
+# pipeline, not just journal_logic.py's own hand-crafted-position tests.
+
+def _post_entry_swing_low_bars():
+    """7 bars after a real entry at 9.1 (round_number_reclaim, see
+    _entry_bars) forming a clean V dipping BELOW entry_price -- a
+    genuine pullback-then-recovery, verified by direct experiment
+    against core/levels.confirmed_swing_lows: a confirmed swing low at
+    price 9.07 (the low of the center bar, ts=180). Deliberately below
+    entry_price (9.1), not above it: a candidate low ABOVE entry_price
+    gets clamped back down to entry_price by _phase1_anchor (found
+    while writing this very test -- the clamp working exactly as
+    designed, not a bug, but it means an above-entry swing low is
+    numerically indistinguishable from the entry-trigger fallback, so
+    it can't prove the anchor actually changed). 9.07 stays safely
+    above the entry-time phase-1 stop (initial_stop_level(9.1,
+    0.005)=9.0545) so the position survives the whole batch, and highs
+    stay under entry_price*1.03=9.373 so phase 2's progress threshold
+    never fires -- isolating the swing-low-anchor mechanism from the
+    phase transition, which test_a_parameter_change_after_entry_does_
+    not_affect_the_open_positions_ratchet already covers separately."""
+    return [_bar(150, 9.20), _bar(160, 9.17), _bar(170, 9.14), _bar(180, 9.12),
+           _bar(190, 9.14), _bar(200, 9.17), _bar(210, 9.20)]
+
+
+def test_a_real_confirmed_swing_low_reprices_the_phase1_stop(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": [_entry_bars(), _post_entry_swing_low_bars()]})
+
+    with _client(fetch, journal_store=store) as c:
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        entered = store.open_position_for("AEHL")
+        assert entered.exit_phase == "swing_low"
+        assert entered.stop_level == initial_stop_level(9.1, SWING_LOW_BUFFER_PCT)
+
+        _resync(c)  # the 7-bar V -- a real swing low confirms within it
+        assert _sym(c, "AEHL")["bar_count"] == 22
+
+    reanchored = store.open_position_for("AEHL")
+    assert reanchored is not None      # survived the whole batch, no breach
+    assert reanchored.id == entered.id
+    assert reanchored.exit_phase == "swing_low"  # still phase 1
+    # Reflects the REAL confirmed swing low (9.07), not the entry-time
+    # trigger-price fallback (9.1) anymore.
+    assert reanchored.stop_level == pytest.approx(
+        initial_stop_level(9.07, SWING_LOW_BUFFER_PCT))
+    assert reanchored.stop_level != initial_stop_level(9.1, SWING_LOW_BUFFER_PCT)
+
+
+# -- session-level volume gate, wired end to end (specs.md section 13) ----
+# _entry_bars() is 15 bars at 50_000 volume each (see _bar's default) --
+# session_cumulative_volume by entry time is a REAL, computed 750_000
+# (state.py's actual session slice, not simulated).
+
+def _daily_bars_fetcher(avg_volume):
+    async def fetch_daily_bars(symbol):
+        return [{"ts": i, "volume": avg_volume, "open": 1, "high": 1,
+                 "low": 1, "close": 1, "is_extended": False} for i in range(5)]
+    return fetch_daily_bars
+
+
+def test_session_volume_gate_blocks_a_real_entry_when_avg_daily_volume_too_high(tmp_path):
+    # avg_daily_volume=1_000_000 needs session_cumulative_volume >=
+    # 3_000_000 (the default session_volume_multiple=3.0) to pass --
+    # 750_000 falls far short, so the real hold_confirmed transition
+    # fires but the entry itself is blocked, same as a failed bar-level
+    # volume_confirm_threshold check.
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": [_entry_bars()]})
+
+    with _client(fetch, journal_store=store,
+                fetch_daily_bars=_daily_bars_fetcher(1_000_000.0)) as c:
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        assert _sym(c, "AEHL").get("avg_daily_volume") == 1_000_000.0
+
+    assert store.open_position_for("AEHL") is None
+    assert store.recent_closed() == []
+
+
+def test_session_volume_gate_allows_a_real_entry_when_session_volume_clears_it(tmp_path):
+    # avg_daily_volume=100_000 needs session_cumulative_volume >= 300_000
+    # -- 750_000 clears it comfortably, so the real entry fires.
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": [_entry_bars()]})
+
+    with _client(fetch, journal_store=store,
+                fetch_daily_bars=_daily_bars_fetcher(100_000.0)) as c:
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        assert _wait_until(lambda: store.open_position_for("AEHL") is not None)
+
+    pos = store.open_position_for("AEHL")
+    assert pos is not None
+    # Snapshotted at entry (specs.md section 13), same "why did this
+    # trade happen" discipline as relative_volume.
+    assert pos.factors["avg_daily_volume"] == 100_000.0
+    assert pos.factors["session_cumulative_volume"] == pytest.approx(750_000.0)
+    assert pos.factors["session_volume_multiple_used"] == 3.0
