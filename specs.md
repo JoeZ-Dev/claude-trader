@@ -1283,10 +1283,32 @@ push same as everything else) — the adjustment mechanism is API-only
 (`curl`) for now; a proper settings UI is a natural, separate
 follow-up once this core mechanism is proven.
 
-Live verification pending deploy (this section will be updated with the
-real result, per this project's own "confirm live, don't just claim it"
-standard, not left describing an outcome that was never actually
-checked against the running system).
+**Verified live (2026-09-18), against a real running instance, both
+directions.** Deployed to production monitor-app (no open positions at
+the time, confirmed first — a safe restart, per this project's standing
+discipline). Changed `trail_pct` via a real `POST /api/strategy_params`
+call against the running production container: `0.05 -> 0.08`, took
+effect immediately (`GET /api/strategy_params` reflected it with no
+restart), and the change appeared correctly in `history` with the real
+old/new values and a timestamp matching the call's actual wall-clock
+time. Production has no live entries firing at this hour (market
+closed), so the "a subsequent trade uses the new value" half was
+verified fixture-driven against a SEPARATE, isolated instance of the
+same unmodified production code (schwab-connector in `STREAM_SOURCE=
+replay` mode + monitor-app, both real running processes, real HTTP API,
+real SQLite file — same methodology as section 6's earlier live proof,
+not a unit test): `POST /api/strategy_params {"trail_pct": 0.12}`
+first, then `POST /api/watch {"symbol": "AEHL"}` — the resulting entry's
+`stop_level` (8.008) was exactly `9.1 * (1 - 0.12)`, not `9.1 * (1 -
+0.05)` (8.645, what the seed default would have produced), confirmed
+both via the live API and a direct query against the real `trades` row
+(`trail_pct_used=0.12`, `volume_threshold_used=0.5`,
+`setup_type='round_number_reclaim'`). Then, with that position still
+open, `POST /api/strategy_params {"trail_pct": 0.30}` again — the
+open position's own `journal.open.stop_level` and the DB row's
+`trail_pct_used` both stayed unchanged at the 0.12 value locked in at
+its own entry, confirming the "not affected by subsequent parameter
+changes" half live, not just at the unit-test level.
 
 ### 9. Roadmap / phases
 
