@@ -1,6 +1,7 @@
 import math
 import os
 import sys
+from dataclasses import replace
 
 _APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _APP_DIR)
@@ -22,6 +23,14 @@ HIGH_VOLUME = 2.0   # clears the threshold
 LOW_VOLUME = 1.0    # does not
 CURRENT_EQUITY = 2000.0
 RISK_PCT_PER_TRADE = 0.01
+SWING_LOW_BUFFER_PCT = 0.005
+PATTERN_PROGRESS_THRESHOLD_PCT = 0.03
+SESSION_VOLUME_MULTIPLE = 3.0
+# session_cumulative_volume's default, paired with avg_daily_volume's own
+# advance_journal default of None below -- None already means "skip the
+# gate" (should_enter's documented behavior), so this value is inert
+# unless a test explicitly overrides avg_daily_volume too.
+SESSION_CUMULATIVE_VOLUME = 0.0
 
 
 def _bar(ts, *, high, low, close, open_=None):
@@ -85,6 +94,60 @@ def test_should_enter_when_volume_is_exactly_at_threshold():
         newly_confirmed_type="resistance_breakout",
         relative_volume=VOLUME_CONFIRM_THRESHOLD,
         volume_confirm_threshold=VOLUME_CONFIRM_THRESHOLD, position_open=False,
+    ) is True
+
+
+# -- should_enter: session-level volume gate, specs.md section 13 ----------
+# (separate from, and stacking with, the bar-level relative_volume gate
+# above -- every test here uses HIGH_VOLUME/VOLUME_CONFIRM_THRESHOLD so
+# that gate always passes, isolating what's actually under test.)
+
+def test_should_enter_default_kwargs_skip_the_session_volume_gate():
+    # Existing callers that don't pass the three new kwargs at all keep
+    # working exactly as before -- avg_daily_volume defaults to None,
+    # which skips this gate entirely.
+    assert should_enter(
+        newly_confirmed_type="resistance_breakout", relative_volume=HIGH_VOLUME,
+        volume_confirm_threshold=VOLUME_CONFIRM_THRESHOLD, position_open=False,
+    ) is True
+
+
+def test_should_enter_skips_the_gate_when_avg_daily_volume_is_none():
+    # The real value whenever historical data couldn't be fetched
+    # (specs.md section 13's explicit "skip, don't block" choice) --
+    # even a tiny session_cumulative_volume doesn't block entry.
+    assert should_enter(
+        newly_confirmed_type="resistance_breakout", relative_volume=HIGH_VOLUME,
+        volume_confirm_threshold=VOLUME_CONFIRM_THRESHOLD, position_open=False,
+        session_cumulative_volume=1.0, avg_daily_volume=None,
+        session_volume_multiple=3.0,
+    ) is True
+
+
+def test_should_enter_blocks_when_session_volume_below_the_multiple():
+    assert should_enter(
+        newly_confirmed_type="resistance_breakout", relative_volume=HIGH_VOLUME,
+        volume_confirm_threshold=VOLUME_CONFIRM_THRESHOLD, position_open=False,
+        session_cumulative_volume=100_000.0, avg_daily_volume=50_000.0,
+        session_volume_multiple=3.0,  # needs >= 150_000
+    ) is False
+
+
+def test_should_enter_allows_when_session_volume_exactly_at_the_multiple():
+    assert should_enter(
+        newly_confirmed_type="resistance_breakout", relative_volume=HIGH_VOLUME,
+        volume_confirm_threshold=VOLUME_CONFIRM_THRESHOLD, position_open=False,
+        session_cumulative_volume=150_000.0, avg_daily_volume=50_000.0,
+        session_volume_multiple=3.0,
+    ) is True
+
+
+def test_should_enter_allows_when_session_volume_clears_the_multiple():
+    assert should_enter(
+        newly_confirmed_type="resistance_breakout", relative_volume=HIGH_VOLUME,
+        volume_confirm_threshold=VOLUME_CONFIRM_THRESHOLD, position_open=False,
+        session_cumulative_volume=9_000_000.0, avg_daily_volume=50_000.0,
+        session_volume_multiple=3.0,
     ) is True
 
 
@@ -180,6 +243,130 @@ def test_exit_price_is_the_stop_level_not_the_bar_low():
     assert exit_event.exit_price == 95.0
 
 
+def test_apply_bar_to_open_position_defaults_to_trailing_phase_unaffected_by_feature():
+    # A position built without opting into the two-phase feature (every
+    # test above this line, and a resumed pre-migration open position,
+    # see journal_store.py) must ratchet EXACTLY as always -- exit_phase
+    # defaults to "trailing", not "swing_low" (specs.md section 13).
+    pos = OpenPosition(id=None, symbol="X", entry_ts=0, entry_price=100.0,
+                       high_water_mark=100.0, stop_level=95.0)
+    assert pos.exit_phase == "trailing"
+    updated, _ = apply_bar_to_open_position(pos, _bar(10, high=110.0, low=105.0, close=108.0))
+    assert updated.stop_level == 110.0 * (1 - TRAIL_PCT)
+    assert updated.exit_phase == "trailing"
+
+
+# -- apply_bar_to_open_position: two-phase exit, specs.md section 13 -------
+
+def _swing_low_position(*, entry_price=10.0, trigger_price=9.5,
+                        trail_pct=TRAIL_PCT, buffer_pct=SWING_LOW_BUFFER_PCT,
+                        progress_pct=PATTERN_PROGRESS_THRESHOLD_PCT,
+                        high_water_mark=None):
+    hwm = high_water_mark if high_water_mark is not None else entry_price
+    return OpenPosition(
+        id=1, symbol="AEHL", entry_ts=0, entry_price=entry_price,
+        high_water_mark=hwm,
+        stop_level=initial_stop_level(trigger_price, buffer_pct),
+        factors={"trigger_price": trigger_price},
+        trail_pct=trail_pct, exit_phase="swing_low",
+        swing_low_buffer_pct_used=buffer_pct,
+        pattern_progress_threshold_pct_used=progress_pct,
+    )
+
+
+def test_swing_low_phase_uses_trigger_price_fallback_when_no_swing_low_confirmed():
+    pos = _swing_low_position(entry_price=10.0, trigger_price=9.5)
+    updated, exit_event = apply_bar_to_open_position(
+        pos, _bar(10, high=10.1, low=9.9, close=10.0), swing_low_anchor=None)
+    assert updated.stop_level == initial_stop_level(9.5, SWING_LOW_BUFFER_PCT)
+    assert exit_event is None
+    assert updated.exit_phase == "swing_low"
+
+
+def test_swing_low_phase_anchors_to_the_confirmed_swing_low_when_present():
+    pos = _swing_low_position(entry_price=10.0, trigger_price=9.5)
+    updated, _ = apply_bar_to_open_position(
+        pos, _bar(10, high=10.1, low=9.9, close=10.0), swing_low_anchor=9.8)
+    assert updated.stop_level == initial_stop_level(9.8, SWING_LOW_BUFFER_PCT)
+
+
+def test_swing_low_phase_a_lower_confirmed_swing_low_lowers_the_stop():
+    pos = _swing_low_position(entry_price=10.0, trigger_price=9.5)
+    updated, _ = apply_bar_to_open_position(
+        pos, _bar(10, high=10.1, low=9.9, close=10.0), swing_low_anchor=9.2)
+    assert updated.stop_level == initial_stop_level(9.2, SWING_LOW_BUFFER_PCT)
+    assert updated.stop_level < initial_stop_level(9.5, SWING_LOW_BUFFER_PCT)
+
+
+def test_swing_low_phase_high_water_mark_still_ratchets_even_though_stop_ignores_it():
+    # hwm keeps tracking the true peak throughout phase 1 -- needed the
+    # moment phase 2 begins, and is how "real progress" is measured.
+    pos = _swing_low_position(entry_price=10.0, trigger_price=9.5)
+    updated, _ = apply_bar_to_open_position(
+        pos, _bar(10, high=10.2, low=10.0, close=10.15), swing_low_anchor=None)
+    assert updated.high_water_mark == 10.2
+    # stop is still the trigger-price anchor, NOT hwm-derived
+    assert updated.stop_level == initial_stop_level(9.5, SWING_LOW_BUFFER_PCT)
+
+
+def test_swing_low_phase_exit_still_fires_immediately_on_breach():
+    pos = _swing_low_position(entry_price=10.0, trigger_price=9.5)
+    updated, exit_event = apply_bar_to_open_position(
+        pos, _bar(10, high=10.1, low=9.4, close=9.45), swing_low_anchor=None)
+    assert exit_event is not None
+    assert exit_event.exit_reason == "trailing_stop"
+    assert exit_event.exit_price == initial_stop_level(9.5, SWING_LOW_BUFFER_PCT)
+
+
+def test_phase_transitions_to_trailing_once_progress_threshold_cleared():
+    # entry_price=10.0, progress_pct=0.03 -> clears at hwm >= 10.30
+    pos = _swing_low_position(entry_price=10.0, trigger_price=9.5, progress_pct=0.03)
+    updated, _ = apply_bar_to_open_position(
+        pos, _bar(10, high=10.35, low=10.2, close=10.3), swing_low_anchor=None)
+    assert updated.exit_phase == "trailing"
+    assert updated.phase_transitioned_ts == 10
+    # from the moment of transition, the stop is flat-trail-from-hwm
+    assert updated.stop_level == 10.35 * (1 - TRAIL_PCT)
+
+
+def test_phase_stays_swing_low_when_progress_threshold_not_yet_cleared():
+    pos = _swing_low_position(entry_price=10.0, trigger_price=9.5, progress_pct=0.03)
+    updated, _ = apply_bar_to_open_position(
+        pos, _bar(10, high=10.2, low=10.1, close=10.15), swing_low_anchor=None)  # +2%, short of 3%
+    assert updated.exit_phase == "swing_low"
+    assert updated.phase_transitioned_ts is None
+
+
+def test_phase_transition_is_one_way_a_later_pullback_does_not_revert_it():
+    pos = _swing_low_position(entry_price=10.0, trigger_price=9.5, progress_pct=0.03,
+                              high_water_mark=10.5)
+    pos = replace(pos, exit_phase="trailing", phase_transitioned_ts=5,
+                 stop_level=initial_stop_level(10.5, TRAIL_PCT))
+    # A pullback bar -- new high is LOWER than the existing hwm, well
+    # below the progress threshold if it were being re-evaluated from
+    # here, but the phase must never revert.
+    updated, _ = apply_bar_to_open_position(
+        pos, _bar(20, high=10.3, low=10.1, close=10.2), swing_low_anchor=8.0)
+    assert updated.exit_phase == "trailing"
+    assert updated.phase_transitioned_ts == 5  # unchanged, not re-stamped
+    # still flat-trail math, completely ignoring the (lower) swing_low_anchor
+    assert updated.stop_level == 10.5 * (1 - TRAIL_PCT)
+
+
+def test_swing_low_phase_falls_back_to_entry_price_when_factors_missing():
+    # Defensive: a hand-built position with no factors at all (should
+    # never happen via the real entry path, but must not crash).
+    pos = OpenPosition(id=1, symbol="AEHL", entry_ts=0, entry_price=10.0,
+                       high_water_mark=10.0,
+                       stop_level=initial_stop_level(10.0, SWING_LOW_BUFFER_PCT),
+                       factors=None, trail_pct=TRAIL_PCT, exit_phase="swing_low",
+                       swing_low_buffer_pct_used=SWING_LOW_BUFFER_PCT,
+                       pattern_progress_threshold_pct_used=PATTERN_PROGRESS_THRESHOLD_PCT)
+    updated, _ = apply_bar_to_open_position(
+        pos, _bar(10, high=10.1, low=9.99, close=10.05), swing_low_anchor=None)
+    assert updated.stop_level == initial_stop_level(10.0, SWING_LOW_BUFFER_PCT)
+
+
 # -- advance_journal: the per-poll orchestration function -------------------
 
 _ALL_FOUR_TYPES = ("resistance_breakout", "micro_breakout",
@@ -190,13 +377,25 @@ def _advance(*, position=None, new_bars, setups, was_confirmed_types=frozenset()
             relative_volume=HIGH_VOLUME,
             volume_confirm_threshold=VOLUME_CONFIRM_THRESHOLD, symbol="AEHL",
             trail_pct=TRAIL_PCT, watch_note=None,
-            current_equity=CURRENT_EQUITY, risk_pct_per_trade=RISK_PCT_PER_TRADE):
+            current_equity=CURRENT_EQUITY, risk_pct_per_trade=RISK_PCT_PER_TRADE,
+            swing_low_buffer_pct=SWING_LOW_BUFFER_PCT,
+            pattern_progress_threshold_pct=PATTERN_PROGRESS_THRESHOLD_PCT,
+            swing_low_anchor=None,
+            session_cumulative_volume=SESSION_CUMULATIVE_VOLUME,
+            avg_daily_volume=None,
+            session_volume_multiple=SESSION_VOLUME_MULTIPLE):
     return advance_journal(
         position=position, new_bars=new_bars, setups=setups,
         was_confirmed_types=was_confirmed_types, relative_volume=relative_volume,
         volume_confirm_threshold=volume_confirm_threshold,
         trail_pct=trail_pct, symbol=symbol, watch_note=watch_note,
         current_equity=current_equity, risk_pct_per_trade=risk_pct_per_trade,
+        swing_low_buffer_pct=swing_low_buffer_pct,
+        pattern_progress_threshold_pct=pattern_progress_threshold_pct,
+        swing_low_anchor=swing_low_anchor,
+        session_cumulative_volume=session_cumulative_volume,
+        avg_daily_volume=avg_daily_volume,
+        session_volume_multiple=session_volume_multiple,
     )
 
 
@@ -209,7 +408,11 @@ def test_advance_journal_opens_a_new_position_on_fresh_confirmation():
     assert tick.opened.entry_price == 10.2
     assert tick.opened.entry_ts == 100
     assert tick.opened.high_water_mark == 10.2
-    assert tick.opened.stop_level == 10.2 * (1 - TRAIL_PCT)
+    # Phase 1 (specs.md section 13): anchored to the entry-trigger level
+    # (_setup's default trigger_price=10.5), buffered -- NOT
+    # entry_price*(1-trail_pct) anymore, that's phase 2's formula only.
+    assert tick.opened.stop_level == 10.5 * (1 - SWING_LOW_BUFFER_PCT)
+    assert tick.opened.exit_phase == "swing_low"
     assert tick.closed is None
     assert tick.confirmed_types_after == {"resistance_breakout"}
 
@@ -324,6 +527,54 @@ def test_advance_journal_exit_is_never_gated_by_volume():
     assert tick.closed[1].exit_reason == "trailing_stop"
 
 
+# -- session-level volume gate, wired through advance_journal (specs.md
+# section 13) ----------------------------------------------------------
+
+def test_advance_journal_blocks_entry_when_session_volume_gate_fails():
+    tick = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[_setup("resistance_breakout", confirmed=True)],
+        session_cumulative_volume=1_000.0, avg_daily_volume=1_000_000.0,
+        session_volume_multiple=3.0,
+    )
+    assert tick.opened is None
+    # still marked "seen" -- same "doesn't get a second chance while it
+    # stays confirmed" treatment as the bar-level volume gate.
+    assert tick.confirmed_types_after == {"resistance_breakout"}
+
+
+def test_advance_journal_allows_entry_when_session_volume_gate_passes():
+    tick = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[_setup("resistance_breakout", confirmed=True)],
+        session_cumulative_volume=5_000_000.0, avg_daily_volume=1_000_000.0,
+        session_volume_multiple=3.0,
+    )
+    assert tick.opened is not None
+
+
+def test_new_entry_snapshots_session_volume_gate_context():
+    tick = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[_setup("resistance_breakout", confirmed=True)],
+        session_cumulative_volume=5_000_000.0, avg_daily_volume=1_000_000.0,
+        session_volume_multiple=3.0,
+    )
+    assert tick.opened.factors["session_cumulative_volume"] == 5_000_000.0
+    assert tick.opened.factors["avg_daily_volume"] == 1_000_000.0
+    assert tick.opened.factors["session_volume_multiple_used"] == 3.0
+
+
+def test_new_entry_snapshots_a_skipped_session_volume_gate_as_none_not_a_fake_pass():
+    tick = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[_setup("resistance_breakout", confirmed=True)],
+        avg_daily_volume=None,  # the "skip the gate" state
+    )
+    assert tick.opened is not None
+    assert tick.opened.factors["avg_daily_volume"] is None
+
+
 # -- Part C: setup_type / factors captured at the moment of entry ----------
 
 def test_advance_journal_records_setup_type_and_merged_factors_on_entry():
@@ -344,13 +595,17 @@ def test_advance_journal_records_setup_type_and_merged_factors_on_entry():
 # -- live-tunable strategy_params: locked in at entry, not re-read live ---
 
 def test_new_entry_uses_the_current_trail_pct_and_locks_it_onto_the_position():
+    # trail_pct is locked onto the position at entry regardless -- it's
+    # simply not what PRICES the entry-time stop_level anymore (that's
+    # phase 1's swing-low/trigger-price anchor, specs.md section 13);
+    # trail_pct only takes over once the position transitions to phase 2.
     tick = _advance(
         new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
         setups=[_setup("resistance_breakout", confirmed=True)],
         trail_pct=0.10,  # NOT the module TRAIL_PCT=0.05 default
     )
     assert tick.opened.trail_pct == 0.10
-    assert tick.opened.stop_level == 10.2 * (1 - 0.10)
+    assert tick.opened.stop_level == 10.5 * (1 - SWING_LOW_BUFFER_PCT)
     assert tick.opened.volume_threshold_used == VOLUME_CONFIRM_THRESHOLD
 
 
@@ -460,6 +715,20 @@ def test_open_positions_ratcheting_does_not_touch_sizing_fields():
     assert tick.updated.account_size_used == 2000.0
     assert tick.updated.risk_pct_used == 0.01
     assert tick.updated.risk_amount_used == 19.89
+
+
+# -- two-phase exit snapshot at entry, specs.md section 13 -----------------
+
+def test_new_entry_starts_in_swing_low_phase_with_thresholds_locked_in():
+    tick = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[_setup("resistance_breakout", confirmed=True)],
+        swing_low_buffer_pct=0.008, pattern_progress_threshold_pct=0.04,
+    )
+    assert tick.opened.exit_phase == "swing_low"
+    assert tick.opened.swing_low_buffer_pct_used == 0.008
+    assert tick.opened.pattern_progress_threshold_pct_used == 0.04
+    assert tick.opened.phase_transitioned_ts is None
 
 
 def test_advance_journal_updates_open_position_across_multiple_new_bars():

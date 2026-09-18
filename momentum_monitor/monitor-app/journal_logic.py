@@ -40,7 +40,13 @@ does not fire, and does not get a second chance later while it stays
 confirmed (see `_first_newly_confirmed` below: the type is still marked
 "seen" whether or not the volume gate let it fire, since nothing about
 it has changed if it's still sitting at the same confirmed state next
-tick). Still fires only when no position is already open for the
+tick). Also gated (added 2026-09-18, specs.md section 13) by today's
+cumulative SESSION volume clearing `avg_daily_volume *
+session_volume_multiple` -- a separate, session-level check that STACKS
+with (never replaces) the bar-level relative_volume gate above; see
+should_enter's own docstring for the avg_daily_volume=None skip-the-gate
+behavior when a symbol's historical daily volume isn't available. Still
+fires only when no position is already open for the
 symbol. entry_price is the close of the bar the transition is observed
 at (the finest granularity available without re-running evaluate_hold
 per-bar inside a single poll cycle, which would be inventing new entry
@@ -51,20 +57,40 @@ setup_types.py's own SetupCandidate.factors carries) are captured on
 the OpenPosition at the moment of entry, not re-derived later from
 whatever happens to be displayed at review time.
 
-Exit: TRAIL_PCT (a starting point to tune against real logged data, not
-a validated number -- see main.py) below the running high_water_mark,
+Exit -- two-phase (added 2026-09-18, specs.md section 13; the ORIGINAL
+single-phase mechanism below was the whole story before that). A bar's
+LOW crossing below the current stop_level exits immediately, no
+confirmation delay, in EITHER phase -- deliberately mirroring specs.md
+section 3's existing asymmetry, not a new invention. Exits are
+deliberately NOT volume-gated in either phase -- that asymmetry (entries
+need sustained confirmation and real volume; stops fire fast and
+unconditionally, no exceptions) has been the rule since core/ was first
+built. A fixed R:R target was explicitly rejected for this project (it
+capped winners in the EOD swing bot and contributed to that strategy's
+edge not holding up under testing) -- there is no target anywhere in
+this module, by design, not by omission, in either phase.
+
+Phase 1, "swing_low" (the phase a brand-new real entry actually starts
+in): stop anchors to the LOWEST confirmed swing low since entry (reusing
+core/levels.confirmed_swing_lows, not reimplementing swing-point
+detection), buffered by swing_low_buffer_pct -- or, before any swing low
+has confirmed, the entry-trigger level actually broken to enter, same
+buffer. This is the SAME "most recent confirmed higher-low" anchor
+option originally sketched, and not chosen, when the flat trailing stop
+(phase 2 below) was first designed for the phase-4 journal (specs.md
+section 6) -- now built, scoped specifically to this early phase.
+
+Phase 2, "trailing" (also this module's original, single-phase design,
+and OpenPosition.exit_phase's own default -- see that field for why):
+TRAIL_PCT (a starting point to tune against real logged data, not a
+validated number -- see main.py) below the running high_water_mark,
 which only ever ratchets up (from each bar's HIGH, never its close) and
-never moves down. A bar's LOW crossing below the current stop_level
-exits immediately, no confirmation delay -- deliberately mirroring
-specs.md section 3's existing asymmetry, not a new invention. Exits are
-deliberately NOT volume-gated -- that asymmetry (entries need sustained
-confirmation and, now, real volume; stops fire fast and unconditionally,
-no exceptions) has been the rule since core/ was first built, and
-applies here too, not just to hold-confirmation. A fixed R:R target was
-explicitly rejected for this project (it capped winners in the EOD swing
-bot and contributed to that strategy's edge not holding up under
-testing) -- there is no target anywhere in this module, by design, not
-by omission.
+never moves down.
+
+Transition is ONE-WAY, swing_low -> trailing only, once high_water_mark
+clears pattern_progress_threshold_pct above entry -- never reverts, even
+on a later pullback. See apply_bar_to_open_position for the full
+mechanics of both phases and the transition check.
 """
 from __future__ import annotations
 
@@ -131,6 +157,35 @@ class OpenPosition:
     account_size_used: float | None = None
     risk_pct_used: float | None = None
     risk_amount_used: float | None = None
+    # Two-phase exit (added 2026-09-18, specs.md section 13 -- the
+    # "most recent confirmed higher-low" option sketched, and not
+    # chosen, when the flat trailing stop was first designed, section
+    # 6): "swing_low" anchors the stop to the lowest CONFIRMED swing low
+    # since entry (or the entry-trigger level, before any swing low
+    # confirms), buffered by swing_low_buffer_pct_used; "trailing" is
+    # the ORIGINAL, unchanged flat trail_pct-from-high-water-mark
+    # mechanism. Transition is ONE-WAY (swing_low -> trailing only, see
+    # apply_bar_to_open_position) once high_water_mark clears
+    # pattern_progress_threshold_pct_used above entry_price.
+    #
+    # Defaults to "trailing" -- the ORIGINAL, single-phase behavior --
+    # deliberately, not "swing_low": a position built without opting
+    # into this feature (every existing test fixture, and a resumed
+    # pre-migration open position, see journal_store.py) must ratchet
+    # EXACTLY as it always has, unaffected by this feature's existence.
+    # Only advance_journal's own real entry-construction path below
+    # explicitly sets "swing_low" for a genuinely NEW trade -- the same
+    # "safe default vs. real opt-in path" split trail_pct/shares/etc.
+    # already use.
+    exit_phase: str = "trailing"
+    swing_low_buffer_pct_used: float | None = None
+    pattern_progress_threshold_pct_used: float | None = None
+    # ts of the bar at which exit_phase transitioned swing_low ->
+    # trailing -- None while still in the early phase (or for a
+    # position that was never in it), so "don't lose the reasoning"
+    # (same discipline as trail_pct_used/watch_note) extends to WHEN a
+    # trade's own stop logic changed, not just what it changed to.
+    phase_transitioned_ts: int | None = None
 
 
 @dataclass(frozen=True)
@@ -174,41 +229,120 @@ def _first_newly_confirmed(setups: list[dict],
 
 
 def should_enter(*, newly_confirmed_type: str | None, relative_volume: float,
-                 volume_confirm_threshold: float, position_open: bool) -> bool:
+                 volume_confirm_threshold: float, position_open: bool,
+                 session_cumulative_volume: float = 0.0,
+                 avg_daily_volume: float | None = None,
+                 session_volume_multiple: float = 3.0) -> bool:
     """True when some setup type freshly transitioned to confirmed (any
     of the four -- generalized 2026-09-17, see module docstring),
     relative_volume clears volume_confirm_threshold at that same moment,
-    and no position is already open. This is the entire entry rule --
-    exits (apply_bar_to_open_position) are deliberately NOT volume-gated,
-    the same entry/exit asymmetry core/ has always used."""
+    no position is already open, AND (2026-09-18, specs.md section 13's
+    session-level volume gate -- separate from, and stacking with, the
+    bar-level relative_volume check above) today's cumulative session
+    volume clears `avg_daily_volume * session_volume_multiple`. This is
+    the entire entry rule -- exits (apply_bar_to_open_position) are
+    deliberately NOT volume-gated by either check, the same entry/exit
+    asymmetry core/ has always used.
+
+    `avg_daily_volume=None` (the default, and the real value whenever a
+    symbol's historical daily volume couldn't be fetched -- too new, a
+    data gap) SKIPS the session-level gate entirely rather than blocking
+    every entry for exactly the newest, least-vetted candidates this
+    tool exists to watch (specs.md section 13's explicit, documented
+    choice) -- the bar-level relative_volume gate above still applies
+    regardless. Existing callers that don't pass these three kwargs at
+    all get this exact same skip-the-gate behavior automatically."""
+    session_volume_ok = (avg_daily_volume is None or
+                         session_cumulative_volume >= avg_daily_volume * session_volume_multiple)
     return (newly_confirmed_type is not None and not position_open
-            and relative_volume >= volume_confirm_threshold)
+            and relative_volume >= volume_confirm_threshold
+            and session_volume_ok)
 
 
 def apply_bar_to_open_position(
-    position: OpenPosition, bar: dict,
+    position: OpenPosition, bar: dict, *, swing_low_anchor: float | None = None,
 ) -> tuple[OpenPosition, ExitEvent | None]:
-    """Ratchet high_water_mark up from this bar's high (never down), then
-    check this bar's low against the freshly-ratcheted stop_level --
-    checking the RATCHETED value, not the pre-bar one, is deliberate: OHLC
-    bars don't record whether the high or the low happened first, so the
-    worse-case-for-the-position ordering is assumed, consistent with
-    "stops fire fast, no exceptions." Returns the updated position and an
-    ExitEvent if the stop was breached this bar, else None.
+    """Ratchet high_water_mark up from this bar's high (never down) --
+    unconditionally, regardless of exit_phase, since it's needed the
+    moment phase 2 begins (see below) and is also how "real progress"
+    itself is measured. Then compute this bar's stop and check the
+    bar's low against it -- checking the FRESHLY-ratcheted/recomputed
+    stop, not the pre-bar one, is deliberate: OHLC bars don't record
+    whether the high or the low happened first, so the worse-case-for-
+    the-position ordering is assumed, consistent with "stops fire fast,
+    no exceptions." Returns the updated position and an ExitEvent if
+    the stop was breached this bar, else None.
 
-    Always uses `position.trail_pct` -- the value locked in at THIS
-    position's own entry (2026-09-18: strategy_params is live-tunable,
-    but an open position's trail_pct is deliberately NOT re-read from the
-    current global on every bar, so a parameter change mid-trade can
-    never move an already-open position's stop math; see specs.md
-    section 8) -- never a separately-passed value.
+    Two-phase stop (2026-09-18, specs.md section 13):
+
+    Phase "trailing" (the ORIGINAL, unchanged mechanism, and this
+    dataclass field's own default -- see OpenPosition.exit_phase for
+    why): stop = high_water_mark * (1 - position.trail_pct), the value
+    LOCKED IN at this position's own entry (2026-09-18: strategy_params
+    is live-tunable, but an open position's trail_pct is deliberately
+    NOT re-read from the current global on every bar, so a parameter
+    change mid-trade can never move an already-open position's stop
+    math; see specs.md section 8) -- never a separately-passed value.
+
+    Phase "swing_low" (the early/pattern-forming phase a brand-new real
+    entry actually starts in): stop = the LOWEST confirmed swing low
+    since entry, buffered down by swing_low_buffer_pct_used -- or, if
+    none has confirmed yet, the entry-trigger level that was actually
+    broken to enter this trade (position.factors["trigger_price"],
+    itself buffered the same way, an explicit non-arbitrary interim
+    anchor, never a raw crash or None). `swing_low_anchor` (the lowest
+    confirmed swing low since entry, or None) is precomputed by the
+    CALLER over the position's full bar history since entry (core/
+    levels.confirmed_swing_lows, reused not reimplemented) ONCE per
+    poll cycle, same batch-level granularity this codebase already
+    accepts for round_number_reclaim's own entry timing (see
+    advance_journal's docstring) -- not recomputed per individual bar
+    within a single batch. "Never moves up in this phase": taking the
+    MINIMUM confirmed swing low is what makes this true automatically
+    -- the set of confirmed lows only grows as more bars arrive, so its
+    minimum can only fall or stay put, never rise, with no separate
+    comparison-against-the-old-stop needed. The FIRST transition away
+    from the entry-trigger fallback, the moment any real swing low
+    confirms, is a one-time, unguarded jump (which can legitimately
+    move the stop UP, since the fallback is explicitly temporary, not a
+    floor to protect) -- "never moves up" describes movement AMONG
+    confirmed swing lows, not the fallback's own replacement.
+
+    One-way transition, checked here, per bar, using ONLY data already
+    on the position (entry_price, the freshly-ratcheted high_water_mark,
+    pattern_progress_threshold_pct_used) -- no swing-low data needed for
+    this half, so it's precise to the exact bar, unlike the swing-low
+    anchor's batch-level granularity above: once new_hwm clears
+    entry_price * (1 + pattern_progress_threshold_pct_used), exit_phase
+    becomes "trailing" and phase_transitioned_ts records this bar's ts
+    -- and never reverts, even on a later pullback (checked by never
+    testing `== "trailing"` -> `"swing_low"` anywhere in this function).
 
     exit_price on a breach is the stop_level itself, not the bar's low --
     a virtual/simulated-fill modeling choice (assume the stop fills at the
     stop price), not a claim about real fill behavior."""
     new_hwm = max(position.high_water_mark, bar["high"])
-    new_stop = initial_stop_level(new_hwm, position.trail_pct)
-    updated = replace(position, high_water_mark=new_hwm, stop_level=new_stop)
+
+    phase = position.exit_phase
+    phase_transitioned_ts = position.phase_transitioned_ts
+    if (phase == "swing_low"
+            and position.pattern_progress_threshold_pct_used is not None
+            and new_hwm >= position.entry_price *
+                (1 + position.pattern_progress_threshold_pct_used)):
+        phase = "trailing"
+        phase_transitioned_ts = bar["ts"]
+
+    if phase == "trailing":
+        new_stop = initial_stop_level(new_hwm, position.trail_pct)
+    else:
+        trigger_price = ((position.factors or {}).get("trigger_price")
+                         or position.entry_price)
+        anchor = swing_low_anchor if swing_low_anchor is not None else trigger_price
+        buffer_pct = position.swing_low_buffer_pct_used or 0.0
+        new_stop = initial_stop_level(anchor, buffer_pct)
+
+    updated = replace(position, high_water_mark=new_hwm, stop_level=new_stop,
+                      exit_phase=phase, phase_transitioned_ts=phase_transitioned_ts)
     if bar["low"] < new_stop:
         return updated, ExitEvent(exit_ts=bar["ts"], exit_price=new_stop,
                                   exit_reason="trailing_stop")
@@ -220,7 +354,10 @@ def advance_journal(
     setups: list[dict], was_confirmed_types: frozenset[str],
     relative_volume: float, volume_confirm_threshold: float,
     trail_pct: float, symbol: str, current_equity: float,
-    risk_pct_per_trade: float, watch_note: str | None = None,
+    risk_pct_per_trade: float, swing_low_buffer_pct: float,
+    pattern_progress_threshold_pct: float, session_cumulative_volume: float,
+    session_volume_multiple: float, watch_note: str | None = None,
+    swing_low_anchor: float | None = None, avg_daily_volume: float | None = None,
 ) -> JournalTick:
     """Run one poll cycle's newly-arrived bars (in order) through the
     journal: if a position is open, walk each new bar ratcheting the stop
@@ -252,6 +389,25 @@ def advance_journal(
     apply_bar_to_open_position takes neither). Required, not optional
     (no default), same treatment as trail_pct -- sizing math has no
     meaningful zero-effort default the way an optional watch_note does.
+
+    `swing_low_buffer_pct`/`pattern_progress_threshold_pct` (2026-09-18,
+    specs.md section 13) are the CURRENT live strategy_params values,
+    used ONLY to price a brand-new entry's two-phase exit and get locked
+    onto it (OpenPosition.swing_low_buffer_pct_used/
+    pattern_progress_threshold_pct_used) -- same required-no-default
+    treatment as trail_pct, for the same reason. `swing_low_anchor` (the
+    lowest confirmed swing low since the ALREADY-OPEN position's own
+    entry, precomputed by the caller over its full bar history via
+    core/levels.confirmed_swing_lows -- None if none confirmed yet, or
+    if no position is open) is passed straight through to
+    apply_bar_to_open_position for the ratchet loop below; see that
+    function's own docstring for the full two-phase mechanics.
+
+    `session_cumulative_volume`/`avg_daily_volume`/`session_volume_multiple`
+    (2026-09-18, specs.md section 13's session-level volume gate) feed
+    should_enter's extra entry condition, stacking with (not replacing)
+    the existing bar-level relative_volume gate -- see should_enter's own
+    docstring for the avg_daily_volume=None skip-the-gate behavior.
     """
     current = position
     updated = None
@@ -260,7 +416,8 @@ def advance_journal(
     for bar in new_bars:
         if current is None:
             break
-        current, exit_event = apply_bar_to_open_position(current, bar)
+        current, exit_event = apply_bar_to_open_position(
+            current, bar, swing_low_anchor=swing_low_anchor)
         if exit_event is not None:
             closed = (current, exit_event)
             current = None
@@ -287,9 +444,13 @@ def advance_journal(
             newly_confirmed_type=newly_type, relative_volume=relative_volume,
             volume_confirm_threshold=volume_confirm_threshold,
             position_open=False,
+            session_cumulative_volume=session_cumulative_volume,
+            avg_daily_volume=avg_daily_volume,
+            session_volume_multiple=session_volume_multiple,
         ):
             entry_bar = new_bars[-1]
             entry_price = entry_bar["close"]
+            trigger_price = candidate["trigger_price"]
             # effective_equity adjusts current_equity for THIS SAME
             # call's own close, if one just happened (`closed`, set
             # above) -- found live 2026-09-18 (see specs.md): the
@@ -334,19 +495,36 @@ def advance_journal(
             opened = OpenPosition(
                 id=None, symbol=symbol, entry_ts=entry_bar["ts"],
                 entry_price=entry_price, high_water_mark=entry_price,
-                stop_level=initial_stop_level(entry_price, trail_pct),
+                # Phase 1 (specs.md section 13) starts anchored to the
+                # level actually broken to enter this trade -- no swing
+                # low can possibly be confirmed yet, this instant is
+                # entry itself -- buffered the same way a real confirmed
+                # low would be, for the same noise-avoidance reason.
+                stop_level=initial_stop_level(trigger_price, swing_low_buffer_pct),
                 setup_type=candidate["setup_type"],
                 factors={
                     **candidate["factors"],
                     "distance": candidate["distance"],
-                    "trigger_price": candidate["trigger_price"],
+                    "trigger_price": trigger_price,
                     "relative_volume": relative_volume,
+                    # Volume-gate context snapshotted at entry (same "why
+                    # did this trade happen" discipline as relative_volume
+                    # above) -- avg_daily_volume=None here means the gate
+                    # was SKIPPED for this trade (no historical data),
+                    # distinct from a real ratio that happened to pass.
+                    "session_cumulative_volume": session_cumulative_volume,
+                    "avg_daily_volume": avg_daily_volume,
+                    "session_volume_multiple_used": session_volume_multiple,
                 },
                 trail_pct=trail_pct,
                 volume_threshold_used=volume_confirm_threshold,
                 watch_note=watch_note,
                 shares=shares, account_size_used=effective_equity,
                 risk_pct_used=risk_pct_per_trade, risk_amount_used=risk_amount_used,
+                exit_phase="swing_low",
+                swing_low_buffer_pct_used=swing_low_buffer_pct,
+                pattern_progress_threshold_pct_used=pattern_progress_threshold_pct,
+                phase_transitioned_ts=None,
             )
 
     return JournalTick(opened=opened, updated=updated, closed=closed,
