@@ -83,6 +83,16 @@ services:
       # at the moment a setup type confirms, for a virtual entry to fire --
       # same "starting point, not validated" treatment as TRAIL_PCT.
       VOLUME_CONFIRM_THRESHOLD: "${VOLUME_CONFIRM_THRESHOLD:-1.5}"
+      # Position sizing with compounding virtual equity (specs.md section
+      # 11) -- BASE_EQUITY seeds both the live-tunable base_equity param
+      # and current_equity's own starting value on the FIRST-EVER run
+      # against a given journal.db; RISK_PCT_PER_TRADE is the fraction of
+      # current_equity risked per entry. Both seed-only, same treatment as
+      # TRAIL_PCT above -- tune live via POST /api/strategy_params /
+      # POST /api/equity/reset|override, not by editing these and
+      # redeploying.
+      BASE_EQUITY: "${BASE_EQUITY:-2000}"
+      RISK_PCT_PER_TRADE: "${RISK_PCT_PER_TRADE:-0.01}"
     volumes:
       - ./monitor-app/data:/data
     depends_on:

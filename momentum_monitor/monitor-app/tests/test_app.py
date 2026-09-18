@@ -1182,6 +1182,29 @@ def test_closed_row_has_a_delete_button_scoped_to_its_own_trade_id():
     assert "class='remove-btn journal-delete-btn' data-trade-id='42'" in rows
 
 
+# -- real dollar P&L / zero-size flag display, specs.md section 7 ----------
+
+def test_closed_row_shows_real_dollar_pnl_alongside_percentage():
+    row = _closed_row("AEHL", "trailing_stop", pnl=2.5)
+    row["shares"] = 43
+    row["realized_pnl_dollars"] = 19.565
+    rows = _journal_closed_rows_html([row])
+    assert "$19.57" in rows or "$19.56" in rows  # float rounding, either is correct
+    assert ">43<" in rows
+
+
+def test_closed_row_flags_a_zero_share_trade_distinctly_from_unset(tmp_path):
+    zero_row = _closed_row("AEHL", "trailing_stop", trade_id=1)
+    zero_row["shares"] = 0
+    zero_row["realized_pnl_dollars"] = 0.0
+    unset_row = _closed_row("AEHL", "trailing_stop", trade_id=2)
+    unset_row["shares"] = None
+    unset_row["realized_pnl_dollars"] = None
+    rows = _journal_closed_rows_html([zero_row, unset_row])
+    assert "zero-size-flag" in rows
+    assert rows.count("zero-size-flag") == 1  # only the genuinely-zero row
+
+
 def test_root_page_has_a_bulk_clear_symbol_switched_button():
     with _client(FakeFetch({"AEHL": [_bars(3)]})) as c:
         page = c.get("/").text

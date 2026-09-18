@@ -1214,9 +1214,10 @@ about a trade or what the strategy itself accounts for, not yet closed.
   "worked by chance" after the fact.
 
 **Strategy gaps:**
-- Position sizing does not exist. The journal tracks entry/exit price
-  and percentage P&L only — no share count, no dollar risk, no
-  account-size concept.
+- ~~Position sizing does not exist.~~ **Built 2026-09-18 — see section
+  11.** The journal now tracks a real share count, real dollar P&L, and
+  a compounding virtual account balance — not just entry/exit price and
+  percentage.
 - No portfolio-level risk cap across the 4 concurrent symbol slots.
 - `TRAIL_PCT` was one global value despite volatility varying hugely
   across candidates — section 8 below is the first step toward fixing
@@ -1498,7 +1499,215 @@ direct query against the real SQLite file (not the API) confirmed both
 rows exactly as entered — real data, not simulated, same methodology
 as sections 6, 8, and 9's own live proofs.
 
-### 11. Roadmap / phases
+### 11. Position sizing with compounding virtual equity
+
+**The gap, closed 2026-09-18.** Section 7's remaining strategy gap: the
+journal tracked entry/exit price and percentage P&L only — no share
+count, no dollar risk, no account-size concept, so a winning or losing
+trade's real dollar significance (and whether a subsequent trade's size
+should reflect prior wins/losses at all) was unanswerable from the data.
+
+**Two new strategy_params, same mechanism as section 8, not a new
+one.** `base_equity` (default 2000, the dollar "reset target") and
+`risk_pct_per_trade` (default 0.01, the same 1%-of-account convention
+the EOD swing bot used) joined `trail_pct`/`volume_confirm_threshold`
+in the EXISTING `strategy_params` table — live-tunable via the same
+`GET`/`POST /api/strategy_params`, the same `(lower, upper]` bounds
+validation, the same append-only `strategy_params_history` trail. No
+new table needed for the params themselves; building a second
+parallel mechanism next to an already-proven one would have been
+solving a problem that doesn't exist.
+
+**`current_equity` is different in kind — a running value, not a
+simple param — and needed its own build.** Unlike `trail_pct`, nobody
+directly *sets* `current_equity` to whatever they want as the normal
+case; it's supposed to move on its own, compounding off real trade
+outcomes, with two DELIBERATE escape hatches for when a human needs to
+intervene. That distinction drove the whole design:
+
+1. **Trade close (automatic) — the ONLY path that moves it on its
+   own.** On every REAL trade exit, `journal_store.close_position`
+   computes `realized_pnl_dollars = shares * (exit_price -
+   entry_price)` from the position's OWN locked-in `shares` (below),
+   and — if that position ever had a real, computed share count —
+   `app.py`'s `_update_journal` calls `apply_realized_pnl(trade_id,
+   pnl_dollars)`, which reads `current_equity` fresh, adds the real
+   dollar P&L, writes the new value, and appends an `equity_history`
+   row with `reason = "trade_close:trade_id=<id>:pnl=<+/-X.XX>"`.
+   Deliberately excluded from this path: a `symbol_switched`
+   housekeeping force-close (`Poller.remove_symbol`, unwatching a
+   symbol with an open position) — that's ALREADY treated everywhere
+   else in this codebase as "watchlist housekeeping, not a trading
+   outcome" (muted display, excluded from win/loss coloring, section
+   6), and letting it silently move the virtual account balance based
+   on whatever price happened to be current at the moment of an
+   unrelated slot-management action would contradict that existing
+   rule, not extend it. `remove_symbol` still calls `close_position`
+   (the row still gets an honest `realized_pnl_dollars`, for the
+   record), it just never reaches `apply_realized_pnl`.
+2. **Reset (explicit action).** `POST /api/equity/reset` sets
+   `current_equity` to the LIVE `base_equity` param — not a frozen
+   2000 — logged as `"manual_reset"`, distinct from a trade-driven
+   change.
+3. **Manual override (explicit action, separate from reset).** `POST
+   /api/equity/override {"value": X}` sets `current_equity` directly to
+   any positive value, for correcting a mistake or deliberately
+   starting from a different number, WITHOUT changing what a FUTURE
+   reset targets (`base_equity` itself is untouched) — logged as
+   `"manual_override"`, distinct from `"manual_reset"`. A non-positive
+   value is rejected (`InvalidEquityOverrideError`, 409), changing
+   nothing.
+
+Storage: `equity_state` (a single row, `id` fixed at 1, the live value)
+and `equity_history` (id, old_value, new_value, `reason`, changed_at) —
+append-only like `strategy_params_history`, but with a `reason` field
+in place of a bare key, since three DIFFERENT kinds of action produce a
+change here and must stay distinguishable later, not just numbers with
+no indication of which path produced them. Every write to
+`equity_state` and its matching `equity_history` row happens inside one
+function (`JournalStore._write_equity`), called with an `old_value`
+read fresh, immediately beforehand, by the caller — structural, not
+conventional, protection against two updates in the same batch
+clobbering or double-counting each other (see "the concurrency proof"
+below). Seeded from `base_equity`'s own seed value on the FIRST-EVER
+run against a given `journal.db` only, same never-reset-on-a-later-
+restart precedent as `strategy_params` itself.
+
+**Explicit, load-bearing rule: `current_equity` is NEVER adjusted for
+unrealized/open positions.** Only realized closes (path 1 above) move
+it. Sizing a new entry while other positions remain open uses whatever
+`current_equity` was as of the last REALIZED close, full stop — an
+open position's paper gain or loss is not "spent" or "protected"
+before it actually closes.
+
+**Entry-time sizing.** `journal_logic.advance_journal` gained two
+required parameters, `current_equity`/`risk_pct_per_trade` — required,
+not defaulted, same treatment as `trail_pct`: sizing math has no
+meaningful zero-effort default the way an optional `watch_note` does.
+Both are read fresh by `app.py`'s `_update_journal` on EVERY journal
+decision (never cached), and used ONLY when a brand-new entry fires:
+`risk_amount = current_equity * risk_pct_per_trade`; `risk_per_share =
+entry_price * trail_pct` (the dollar distance from entry to the
+initial stop — algebraically the same distance `initial_stop_level`
+itself computes); `shares = floor(risk_amount / risk_per_share)` —
+rounded DOWN, never up, since overshooting the risk budget on a
+rounding technicality would defeat the purpose of sizing by risk at
+all. `risk_amount_used = shares * risk_per_share` is the REAL dollar
+amount that rounded share count risks, recorded instead of the
+theoretical `risk_amount` target, which it can differ slightly from.
+All four — `shares`, `account_size_used` (the `current_equity` reading
+itself), `risk_pct_used`, `risk_amount_used` — are LOCKED onto
+`OpenPosition` at the moment of entry, same snapshot-at-entry
+discipline as `trail_pct_used` (section 8): an already-open position's
+sizing is never recomputed on ratchet, and a LATER trade's sizing
+(reading a `current_equity` this one's own close may since have moved)
+can never retroactively change what a given trade's own record says it
+used.
+
+**The zero-share edge case is real, not hypothetical, and stays
+visible.** An expensive stock, a tight stop, or a small `current_equity`
+can legitimately round `shares` down to 0. The trade still enters and
+still logs — this journal's job is learning what signals look like,
+not just what's executable — but `shares=0` is never silently
+indistinguishable from a real position: both the open-position block
+and the closed-trades table render a `zero-size` flag next to it
+wherever it appears. Distinct, on purpose, from `shares=NULL` (a
+pre-migration position whose sizing was never computed at all, or a
+`symbol_switched` row's honest-but-`None` dollar figure when shares
+were never known) — 0 is a real, meaningful, computed value; `NULL`
+means "never computed." `close_position` reflects this exactly:
+`realized_pnl_dollars` is `0.0` (a real, well-defined, still-logged
+change) for a genuine zero-share trade, and `None` (never a fabricated
+number) only when `shares` itself was never known.
+
+**Real dollar P&L, now displayed.** With a real share count existing,
+both the open-position block (`unrealized P&L $`, alongside the
+existing `%`) and the closed-trades table (`P&L $`, a new column next
+to the existing `%`) show it — more honest for review than percentage
+alone once size is known. `current_equity` itself shows prominently
+above the existing strategy-params line (`#current-equity`, refreshed
+live on every push same as everything else), and `base_equity`/
+`risk_pct_per_trade` show alongside `trail_pct`/
+`volume_confirm_threshold` on that same existing line, automatically —
+no separate rendering code needed, since it already iterates every key
+`strategy_params` reports. API-only for the actual reset/override
+actions this pass (`POST /api/equity/reset`, `POST
+/api/equity/override`) — same minimal-first-pass precedent sections 8
+and 9 both used; a settings UI is a natural, separate follow-up.
+
+**Migration.** `trades` gained `shares` (INTEGER), `account_size_used`,
+`risk_pct_used`, `risk_amount_used`, and `realized_pnl_dollars` (all
+REAL), migrated in place via the same `_ADDED_COLUMNS` mechanism every
+prior schema addition this session used — an existing open position or
+closed trade from before this feature has `NULL` in all five, never an
+invented value. `equity_state`/`equity_history` are new tables
+(`CREATE TABLE IF NOT EXISTS`), proven explicitly against a database
+file that predates them entirely, same discipline as every prior
+schema addition.
+
+**The concurrency proof — specifically testing the same class of bug
+already found once in this project.** Part A of setup-type
+generalization (specs.md section 6's build) found a real bug where
+`app.py`'s `if`/`elif`/`elif` across opened/updated/closed silently
+dropped a `close_position()` write whenever a stop-out was immediately
+followed, within the same batch, by a fresh entry. `current_equity`'s
+own update path is a NEW place the same class of bug — a same-batch
+write silently lost or double-counted — could recur, so it was tested
+for directly, not just assumed fixed by the structural guard above. A
+test drives TWO DIFFERENT symbols' real trade closes through the SAME
+`resync_all()` call (this codebase's actual "same processing batch"
+shape: `resync_all()` awaits `catch_up()` for every watched symbol in
+turn, all before the caller sees a response) and confirms
+`current_equity` reflects the SUM of both realized P&L amounts,
+applied sequentially — the second close's own `equity_history` row
+shows `old_value` equal to what the FIRST close had already moved
+`current_equity` to, never the original starting value twice over, and
+never just one of the two losses alone. Passes at both the storage
+primitive itself (`JournalStore.apply_realized_pnl` called twice, back
+to back) and at the full Poller-wiring level (two real symbols, real
+`core/` hold-confirmation transitions, real SQLite file).
+
+**Verified live (2026-09-18), fixture-driven given after-hours, against
+a real running instance pair — production itself was not restarted.**
+Checked first: production had two real open virtual positions (AEMD,
+AIFF) at verification time, so per this project's own standing
+discipline (confirmed in sections 8, 9, and 10) it was left running
+untouched. Verified instead against a separate, real, isolated pair of
+the same unmodified code — `schwab-connector` in `STREAM_SOURCE=replay`
+mode (the project's own existing `fixtures/replay_sample.jsonl`, the
+same AEHL fixture sections 6/8/9 already used, known to cascade through
+several real entry/exit cycles) + `monitor-app`, both real running
+processes, real HTTP API, real SQLite file, `BASE_EQUITY=2000`/
+`RISK_PCT_PER_TRADE=0.01`/`TRAIL_PCT=0.05`. The replay produced 3 real
+closed trades and left a 4th open, all against `AEHL`: `shares` of 54,
+54, 55, then 52 — DIFFERENT counts, because each entry's own
+`account_size_used` genuinely differed (2000.0, 2000.0, 1992.845,
+2047.52 respectively) — confirmed by direct query against the real
+`trades` rows that each one's `account_size_used` exactly equals
+`current_equity` as of THAT position's own entry moment, not some
+global constant. `current_equity` after all three closes was 2097.295
+— confirmed exactly equal to `2000 + (-7.155) + 54.675 + 49.775`, the
+real `realized_pnl_dollars` sum, via a direct query against
+`equity_state` AND independently via `GET /api/equity`. `equity_history`
+held exactly 3 rows, most-recent-first, each `old_value`/`new_value`
+pair chaining correctly to the next (1992.845 → 2047.52 → 2097.295),
+confirming the sequential-compounding requirement against real,
+non-contrived cascading data, not simulated. Then, live against that
+same running instance: `POST /api/strategy_params {"base_equity":
+5000}` followed by `POST /api/equity/reset` moved `current_equity` to
+exactly `5000.0` (the LIVE param, not the 2000 seed), logged
+`"manual_reset"`; `POST /api/equity/override {"value": 750}` moved it
+to `750.0`, logged `"manual_override"`, distinct from the reset;
+`POST /api/equity/override {"value": -5}` returned `409` and changed
+nothing, confirmed via a follow-up `GET /api/equity` still reading
+`750.0`. The rendered page (fetched live, not assumed from the
+template) showed `Current equity: $750.00`, `base_equity=5000.0000`
+and `risk_pct_per_trade=0.0100` on the strategy-params line, and each
+closed row's real `shares`/`P&L $` columns (`$49.77`, `$54.68`,
+`-$7.16`) alongside their existing percentages — confirmed in the
+server-rendered markup itself, not just the JSON API.
+
+### 12. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,
