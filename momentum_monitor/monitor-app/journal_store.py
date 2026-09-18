@@ -58,6 +58,18 @@ CREATE TABLE IF NOT EXISTS trades (
 """
 
 
+# Columns added after the table's original release -- CREATE TABLE IF NOT
+# EXISTS is a no-op against an already-existing file, so an existing
+# deployment's trades table needs each of these ADD COLUMN'd in explicitly
+# on connect, or every read of the new column raises IndexError against a
+# pre-migration row (found live 2026-09-17, deploying the setup_type/
+# factors columns against the actual running journal.db -- see specs.md).
+_ADDED_COLUMNS = [
+    ("setup_type", "TEXT"),
+    ("factors", "TEXT"),
+]
+
+
 class JournalStore:
     def __init__(self, db_path) -> None:
         # check_same_thread=False: an ASGI test client (and, in principle,
@@ -72,7 +84,14 @@ class JournalStore:
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(_SCHEMA)
+        self._migrate_added_columns()
         self._conn.commit()
+
+    def _migrate_added_columns(self) -> None:
+        existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(trades)")}
+        for name, sql_type in _ADDED_COLUMNS:
+            if name not in existing:
+                self._conn.execute(f"ALTER TABLE trades ADD COLUMN {name} {sql_type}")
 
     def open_position_for(self, symbol: str) -> OpenPosition | None:
         """The currently-open (exit_ts IS NULL) position for `symbol`, if

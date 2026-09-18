@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import sys
 
 _APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -6,6 +7,57 @@ sys.path.insert(0, _APP_DIR)
 
 from journal_logic import ExitEvent, OpenPosition
 from journal_store import JournalStore
+
+
+_PRE_MIGRATION_SCHEMA = """
+CREATE TABLE trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    entry_ts INTEGER NOT NULL,
+    entry_price REAL NOT NULL,
+    high_water_mark REAL NOT NULL,
+    stop_level REAL NOT NULL,
+    exit_ts INTEGER,
+    exit_price REAL,
+    exit_reason TEXT,
+    realized_pnl_pct REAL
+)
+"""
+
+
+def test_opens_a_pre_migration_db_missing_setup_type_and_factors_columns(tmp_path):
+    # Found live 2026-09-17: CREATE TABLE IF NOT EXISTS is a no-op against
+    # an already-existing file, so deploying the setup_type/factors
+    # columns against a running journal.db crashed every open_position_for
+    # call with IndexError the instant it read a pre-existing row. A
+    # JournalStore opening an old-schema file must migrate it in place,
+    # not just work against a fresh one.
+    db_path = tmp_path / "journal.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(_PRE_MIGRATION_SCHEMA)
+    conn.execute(
+        "INSERT INTO trades (symbol, entry_ts, entry_price, high_water_mark, "
+        "stop_level) VALUES ('AEHL', 100, 10.0, 10.0, 9.5)",
+    )
+    conn.commit()
+    conn.close()
+
+    store = JournalStore(db_path)  # must not raise
+    resumed = store.open_position_for("AEHL")
+    assert resumed is not None
+    assert resumed.entry_price == 10.0
+    assert resumed.setup_type is None    # pre-migration row has neither
+    assert resumed.factors is None
+
+    # And the migrated table actually accepts new rows using the new
+    # columns going forward, not just tolerating old ones.
+    created = store.create(OpenPosition(
+        id=None, symbol="MSFT", entry_ts=200, entry_price=20.0,
+        high_water_mark=20.0, stop_level=19.0,
+        setup_type="vwap_reclaim", factors={"vwap": 19.9},
+    ))
+    assert store.open_position_for("MSFT").setup_type == "vwap_reclaim"
+    assert created.factors == {"vwap": 19.9}
 
 
 def _position(symbol="AEHL", entry_ts=100, entry_price=10.0,
