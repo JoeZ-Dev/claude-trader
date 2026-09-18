@@ -1206,8 +1206,11 @@ about a trade or what the strategy itself accounts for, not yet closed.
 - ~~Reverse-split history flag.~~ **Built 2026-09-18 — see section 10.**
   Proposed early, never built until now. Public, checkable data; would
   have been directly relevant on BIAF, QCLS, and RETO.
-- Continuation-vs-fresh-day flag (Day 1 gap vs. Day 2+ runner) — also
-  proposed early, also never built.
+- ~~Continuation-vs-fresh-day flag (Day 1 gap vs. Day 2+ runner).~~
+  **Built 2026-09-18 — see section 13.** Also proposed early, also
+  never built until now — an informational flag, deliberately never a
+  gate, reusing the daily-bars data section 12's volume gate already
+  fetches rather than a second historical pull.
 - Market backdrop (broad-market direction that day) — no data pipeline
   exists for this at all yet.
 - Human review/labeling — no way to mark a trade as "real signal" vs.
@@ -1996,7 +1999,114 @@ the (correct) new logic, numerically indistinguishable from the
 untouched fallback until the fixture was corrected to a genuine
 below-entry pullback.
 
-### 13. Roadmap / phases
+### 13. Continuation-vs-fresh-day flag
+
+**The gap, closed 2026-09-18.** Section 7's remaining data-collection
+gap: no way to tell, at a glance, whether a candidate is a genuine Day
+1 (fresh) setup or already several days into a run — real examples
+from this project's own candidates (RETO, QCLS, DLXY) moved 100%+ on
+their actual runner days, and whether today's setup is the FIRST such
+move or a later continuation of one is exactly the kind of context
+that shaped the original journal design's intent but never survived
+into a built feature.
+
+**Reuse, not a second fetch — checked first, not assumed.** Section
+12's session-level volume gate already fetches a symbol's daily-bar
+history once, at watch-time, to compute `avg_daily_volume`. Before
+building anything new, confirmed directly (not assumed) that only the
+COMPUTED AVERAGE survived that call — the raw daily bars were fetched,
+used, and discarded. `_SymbolSlot.daily_bars` now retains that raw
+series (added to `add_symbol`'s existing fetch, not a second one), so
+this flag is pure computation over data already in hand — zero new
+network calls, confirmed live via a call-count assertion (below), not
+just working code.
+
+**Design: informational, never a gate — the opposite treatment from
+section 12's volume requirement.** `journal_logic.should_enter`/
+`advance_journal` take NO continuation-related parameter at all — not
+"a parameter that happens to always pass," genuinely absent from the
+function signatures, so there is no code path through which this flag
+could ever block or influence an entry, structurally, not just by
+convention. Same treatment as the reverse-split flag (section 10):
+context for a human to weigh, never baked into strategy logic.
+
+**Computation** (`core/indicators.continuation_days`, new, pure — no
+I/O, reused the same way `confirmed_swing_lows` reuses `_swing_points`
+rather than inventing a new detection primitive per feature). For each
+of the most recent `continuation_lookback_days` trading days, compares
+day-over-day % change (close vs. prior close, SIGNED — a big move
+either direction, not just up) against `continuation_threshold_pct`
+(a fraction, the same "_pct" convention every other strategy param in
+this project already uses). Both join the EXISTING `strategy_params`
+mechanism (section 8) — live-tunable, same validation/history
+discipline as every other threshold here; NEVER snapshotted onto
+`trades`, unlike every entry-time-locked value this project has built
+so far, since the flag is meant to always reflect the CURRENT live
+threshold whenever a symbol's panel is viewed, not a value frozen at
+some past moment.
+
+- `continuation_lookback_days` defaults to 7 (about a trading week):
+  long enough that a runner day's immediate aftermath — the "Day 2,
+  Day 3..." continuation window this flag exists to distinguish from a
+  genuine Day 1 — is still caught, short enough that a move from weeks
+  ago has stopped being relevant context for TODAY's setup.
+- `continuation_threshold_pct` defaults to 0.5 (50%): the cited real
+  examples (RETO, QCLS, DLXY) moved 100%+ on their actual runner days,
+  but ordinary daily noise for a volatile small/micro cap can itself
+  run into the 10-30% range on an unremarkable day — 50% sits
+  meaningfully above that noise floor without requiring the most
+  extreme outcomes only to register as "not a normal day."
+
+**Three distinct states, not a binary flag.** `Poller.
+_continuation_status_for` returns `"unknown"` (`daily_bars` is empty —
+the fetch never happened, or failed), `"fresh"` (data exists, nothing
+in the window qualified), or `"continuation"` (one or more days did) —
+`"unknown"` is never conflated with `"fresh"` the way a bare boolean
+would collapse them into the same false signal. Recomputed fresh on
+every state read, not cached — cheap (a handful of comparisons over an
+already-in-memory list) and means a live threshold change is reflected
+immediately for every currently-watched symbol, with nothing to
+invalidate.
+
+**Display: the actual detail, not a bare flag, and ALWAYS rendered —
+the opposite of the reverse-split flag's "only when non-empty"
+treatment, and deliberately so.** "Day 1, fresh" is exactly as useful
+to see at a glance as "continuation, ran +112% on 9/16" — the absence
+of a flag is itself the answer, unlike a reverse split (rare, and
+noisy to show as "none" on every ordinary panel). Shows every
+qualifying day, most-recent-first inherited from bar order, each with
+its real signed magnitude and date (`_fmt_date`, date-only — a daily
+candle's time-of-day is noise a real entry/exit timestamp isn't).
+
+**Verified live (2026-09-18) — against a real isolated pair, checked
+against real API responses and a real call-count log, not simulated.
+Production was not restarted** (three real open positions — AEMD,
+AIFF, DTSS — at verification time; left running untouched, this
+project's own standing discipline, confirmed every time this session).
+Same real `schwab-connector` (`STREAM_SOURCE=replay`) as every prior
+live proof, with a small entry-point script identical to `main.py` in
+every other respect, `fetch_daily_bars` stubbed at the same seam as
+section 12's own verification (no real Schwab credentials for daily
+history in this dev environment) — with the stub logging its own call
+count this time, specifically to prove reuse.
+
+Two runs from fresh `journal.db` files: with daily closes producing a
+real +112.1% day, `GET /api/state` showed `{"status": "continuation",
+"days": [{"ts": 3, "pct_change": 1.121...}], ...}`, the rendered page
+showed `Continuation — +112.1% on 12/31`, and the fetch-call log
+showed exactly `call_count=1` for the symbol — the SAME single fetch
+that also populated `avg_daily_volume`. With ordinary-noise daily
+closes (no day exceeding 50%), `GET /api/state` showed `{"status":
+"fresh", "days": [], ...}`, the rendered page showed `Day 1 (fresh) —
+no moves over 50% in the past 7 trading days`, and the fetch-call log
+again showed exactly `call_count=1`. Both runs, against the SAME real
+cascading replay fixture, produced the identical real trade count (5,
+confirmed by direct query against each run's own `trades` table) —
+live, direct proof that continuation status never affects entry
+behavior, not merely that `should_enter`'s signature has no parameter
+for it.
+
+### 14. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,
