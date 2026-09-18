@@ -1,7 +1,9 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from indicators import session_vwap, ema, macd, relative_volume
+import pytest
+
+from indicators import continuation_days, session_vwap, ema, macd, relative_volume
 from levels import confirmed_swing_lows, detect_levels, evaluate_hold
 
 
@@ -86,6 +88,59 @@ def test_confirmed_swing_lows_returns_multiple_in_bar_order():
     result = confirmed_swing_lows(bars, window=3)
     assert [r["price"] for r in result] == [4, 3]
     assert [r["ts"] for r in result] == [3, 9]
+
+
+# -- continuation_days (specs.md section 7's continuation-vs-fresh-day gap) -
+
+def _daily_bar(ts, close):
+    return bar(ts, close, close, close, close, 1_000_000.0)
+
+
+def test_continuation_days_finds_a_real_runner_day():
+    # A clean +103.8% day (10.3 -> 21.0) well within a 7-day lookback.
+    closes = [10.0, 10.2, 10.1, 10.3, 21.0, 20.5, 20.0, 19.8]
+    bars = [_daily_bar(i, c) for i, c in enumerate(closes)]
+    days = continuation_days(bars, lookback_days=7, threshold_pct=0.5)
+    assert len(days) == 1
+    assert days[0]["ts"] == 4
+    assert days[0]["pct_change"] == pytest.approx((21.0 - 10.3) / 10.3)
+
+
+def test_continuation_days_empty_for_a_genuinely_fresh_symbol():
+    # Ordinary day-to-day noise, nothing near the 50% threshold.
+    closes = [10.0, 10.3, 9.9, 10.2, 10.1, 9.8, 10.0, 10.15]
+    bars = [_daily_bar(i, c) for i, c in enumerate(closes)]
+    assert continuation_days(bars, lookback_days=7, threshold_pct=0.5) == []
+
+
+def test_continuation_days_ignores_a_move_outside_the_lookback_window():
+    # The +103.8% day sits 9 bars back from the end -- outside a 7-day
+    # (8-bar) lookback window -- so must NOT be flagged; the noise inside
+    # the window has nothing near threshold.
+    closes = [10.3, 21.0] + [20.0, 20.1, 19.9, 20.2, 20.0, 19.95, 20.05, 20.1]
+    bars = [_daily_bar(i, c) for i, c in enumerate(closes)]
+    assert continuation_days(bars, lookback_days=7, threshold_pct=0.5) == []
+
+
+def test_continuation_days_detects_a_large_down_day_too_signed_correctly():
+    closes = [10.0, 10.1, 4.8, 4.7, 4.75]  # -52.5% day
+    bars = [_daily_bar(i, c) for i, c in enumerate(closes)]
+    days = continuation_days(bars, lookback_days=7, threshold_pct=0.5)
+    assert len(days) == 1
+    assert days[0]["pct_change"] < 0
+    assert days[0]["pct_change"] == pytest.approx((4.8 - 10.1) / 10.1)
+
+
+def test_continuation_days_returns_multiple_qualifying_days_in_order():
+    closes = [10.0, 21.0, 20.0, 9.0, 9.2]  # +110% then -55%
+    bars = [_daily_bar(i, c) for i, c in enumerate(closes)]
+    days = continuation_days(bars, lookback_days=7, threshold_pct=0.5)
+    assert [d["ts"] for d in days] == [1, 3]
+
+
+def test_continuation_days_empty_list_for_no_or_insufficient_data():
+    assert continuation_days([], lookback_days=7, threshold_pct=0.5) == []
+    assert continuation_days([_daily_bar(0, 10.0)], lookback_days=7, threshold_pct=0.5) == []
 
 
 def test_detect_levels_finds_double_top_with_higher_strength_than_single_touch():

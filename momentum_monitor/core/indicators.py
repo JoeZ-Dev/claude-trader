@@ -73,3 +73,34 @@ def relative_volume(bars: list[dict], lookback: int = 20) -> list[float]:
         avg = sum(w["volume"] for w in window) / lookback
         out.append(b["volume"] / avg if avg > 0 else 1.0)
     return out
+
+
+def continuation_days(daily_bars: list[dict], *, lookback_days: int,
+                      threshold_pct: float) -> list[dict]:
+    """Days, within the most recent `lookback_days` of `daily_bars`, whose
+    day-over-day % change (close vs. prior close, SIGNED -- a big move
+    either direction, not just up) exceeds `threshold_pct` in magnitude --
+    {"ts", "pct_change"} dicts, oldest first. `threshold_pct` is a
+    FRACTION (0.5 = 50%), the same convention every other "_pct" strategy
+    parameter in this project uses.
+
+    A day needs a PRIOR close to compute a % change from, so the window
+    actually spans `lookback_days` + 1 bars of raw daily history; fewer
+    bars than that (a symbol too new to have full history, or `daily_bars`
+    empty/missing entirely) simply yields fewer comparisons, never a
+    crash -- this function has no concept of "data unavailable" on its
+    own, that distinction belongs to whoever calls it with real vs. empty
+    input (specs.md section 7's continuation-vs-fresh-day gap: "unknown,
+    no data" must never be confused with "checked, and it's fresh")."""
+    if len(daily_bars) < 2:
+        return []
+    recent = daily_bars[-(lookback_days + 1):]
+    out = []
+    for i in range(1, len(recent)):
+        prev_close = recent[i - 1]["close"]
+        if prev_close == 0:
+            continue
+        pct_change = (recent[i]["close"] - prev_close) / prev_close
+        if abs(pct_change) > threshold_pct:
+            out.append({"ts": recent[i]["ts"], "pct_change": pct_change})
+    return out
