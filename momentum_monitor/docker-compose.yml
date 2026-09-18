@@ -99,6 +99,11 @@ services:
       SWING_LOW_BUFFER_PCT: "${SWING_LOW_BUFFER_PCT:-0.005}"
       PATTERN_PROGRESS_THRESHOLD_PCT: "${PATTERN_PROGRESS_THRESHOLD_PCT:-0.03}"
       SESSION_VOLUME_MULTIPLE: "${SESSION_VOLUME_MULTIPLE:-3.0}"
+      # Continuation-vs-fresh-day flag (specs.md section 7) --
+      # INFORMATIONAL only, never gates an entry; same seed-only
+      # treatment as the params above.
+      CONTINUATION_LOOKBACK_DAYS: "${CONTINUATION_LOOKBACK_DAYS:-7}"
+      CONTINUATION_THRESHOLD_PCT: "${CONTINUATION_THRESHOLD_PCT:-0.5}"
     volumes:
       - ./monitor-app/data:/data
     depends_on:

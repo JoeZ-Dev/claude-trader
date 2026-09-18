@@ -51,6 +51,14 @@ Environment:
                         stacking with VOLUME_CONFIRM_THRESHOLD above, not
                         replacing it) -- same seed-only treatment
                                                               (default 3.0)
+  CONTINUATION_LOOKBACK_DAYS  how many recent trading days the
+                        continuation-vs-fresh-day flag scans for a
+                        qualifying move (specs.md section 7) --
+                        INFORMATIONAL only, never gates an entry -- same
+                        seed-only treatment                    (default 7)
+  CONTINUATION_THRESHOLD_PCT  how large a single day's move (either
+                        direction) must be to flag that day -- same
+                        seed-only treatment                  (default 0.5)
 
 Run:  uvicorn main:app --host 0.0.0.0 --port 8012
 """
@@ -79,6 +87,8 @@ SWING_LOW_BUFFER_PCT = float(os.environ.get("SWING_LOW_BUFFER_PCT", "0.005"))
 PATTERN_PROGRESS_THRESHOLD_PCT = float(
     os.environ.get("PATTERN_PROGRESS_THRESHOLD_PCT", "0.03"))
 SESSION_VOLUME_MULTIPLE = float(os.environ.get("SESSION_VOLUME_MULTIPLE", "3.0"))
+CONTINUATION_LOOKBACK_DAYS = float(os.environ.get("CONTINUATION_LOOKBACK_DAYS", "7"))
+CONTINUATION_THRESHOLD_PCT = float(os.environ.get("CONTINUATION_THRESHOLD_PCT", "0.5"))
 
 _client = httpx.AsyncClient(timeout=10.0)
 _journal_store = JournalStore(JOURNAL_DB_PATH, default_params={
@@ -89,6 +99,8 @@ _journal_store = JournalStore(JOURNAL_DB_PATH, default_params={
     "swing_low_buffer_pct": SWING_LOW_BUFFER_PCT,
     "pattern_progress_threshold_pct": PATTERN_PROGRESS_THRESHOLD_PCT,
     "session_volume_multiple": SESSION_VOLUME_MULTIPLE,
+    "continuation_lookback_days": CONTINUATION_LOOKBACK_DAYS,
+    "continuation_threshold_pct": CONTINUATION_THRESHOLD_PCT,
 })
 
 
@@ -166,4 +178,6 @@ app = create_app(fetch_bars=fetch_bars, watch_symbol=WATCH_SYMBOL,
                  swing_low_buffer_pct=SWING_LOW_BUFFER_PCT,
                  pattern_progress_threshold_pct=PATTERN_PROGRESS_THRESHOLD_PCT,
                  session_volume_multiple=SESSION_VOLUME_MULTIPLE,
+                 continuation_lookback_days=CONTINUATION_LOOKBACK_DAYS,
+                 continuation_threshold_pct=CONTINUATION_THRESHOLD_PCT,
                  fetch_daily_bars=fetch_daily_bars)
