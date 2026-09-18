@@ -53,10 +53,27 @@ strategy_params_history). `trades.watch_note` (added the same day) is
 the SNAPSHOT of whatever was current for that symbol at the exact
 moment of entry -- not a live reference to this table, which can change
 after the fact.
+
+Also (added 2026-09-18, specs.md section 7's "reverse-split history
+flag" gap): `reverse_splits` (id, symbol, split_date, ratio, note,
+recorded_at) -- a curated, manually-entered list (per specs.md, chosen
+over an external corporate-actions API or a heuristic scan of Schwab
+price history: no such data is available live from Schwab, and a new
+external dependency/credential was a bigger decision than this pass
+warranted). A symbol can have more than one reverse split over its
+life -- the exact pattern this flag targets, low-float names that split
+repeatedly -- so this is a NEW row per event, never one mutable field,
+same append-only spirit as watch_notes. Deliberately NOT snapshotted
+onto `trades`: unlike watch_note/trail_pct_used, a reverse split is an
+immutable historical fact, not a live value that could drift out from
+under an already-open position -- there is nothing to lock in at entry
+that `reverse_splits_for(symbol)` doesn't already answer correctly at
+any later point in time.
 """
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from dataclasses import replace
@@ -96,6 +113,14 @@ CREATE TABLE IF NOT EXISTS watch_notes (
     symbol TEXT NOT NULL,
     note TEXT NOT NULL,
     created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reverse_splits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    split_date TEXT NOT NULL,
+    ratio TEXT NOT NULL,
+    note TEXT,
+    recorded_at INTEGER NOT NULL
 )
 """
 
@@ -142,6 +167,24 @@ class InvalidParamError(ValueError):
 
 class InvalidWatchNoteError(ValueError):
     """Raised by add_watch_note for a note over MAX_WATCH_NOTE_LENGTH."""
+
+
+# A note longer than this is rejected outright (409), same convention as
+# MAX_WATCH_NOTE_LENGTH above -- kept as its own constant rather than
+# reused so the two concerns (why-watching vs. reverse-split context)
+# stay independently validated, per specs.md section 8's "each validated
+# independently" precedent.
+MAX_REVERSE_SPLIT_NOTE_LENGTH = 500
+
+# split_date is stored as TEXT and reverse_splits_for sorts on it
+# lexicographically DESC -- only correct for ISO 8601 (YYYY-MM-DD), so
+# that's the only format add_reverse_split accepts.
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+class InvalidReverseSplitError(ValueError):
+    """Raised by add_reverse_split for a blank split_date/ratio, a
+    non-ISO split_date, or a note over MAX_REVERSE_SPLIT_NOTE_LENGTH."""
 
 
 class JournalStore:
@@ -293,6 +336,41 @@ class JournalStore:
         rows = self._conn.execute(
             "SELECT * FROM watch_notes WHERE symbol = ? ORDER BY id DESC LIMIT ?",
             (symbol.upper(), limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- reverse-split history flag (specs.md section 7) -------------------
+
+    def add_reverse_split(self, symbol: str, split_date: str, ratio: str,
+                          note: str | None = None) -> None:
+        """Appends a NEW row -- a symbol can have more than one reverse
+        split over its life (the exact low-float pattern this flag
+        targets), so a later split must never overwrite an earlier one.
+        Raises InvalidReverseSplitError (changing nothing) for a blank or
+        non-ISO split_date, a blank ratio, or an over-length note."""
+        if not split_date or not _ISO_DATE.match(split_date):
+            raise InvalidReverseSplitError(
+                f"split_date {split_date!r} must be an ISO date (YYYY-MM-DD)")
+        if not ratio or not ratio.strip():
+            raise InvalidReverseSplitError("ratio is required")
+        if note is not None and len(note) > MAX_REVERSE_SPLIT_NOTE_LENGTH:
+            raise InvalidReverseSplitError(
+                f"note is {len(note)} characters, over the "
+                f"{MAX_REVERSE_SPLIT_NOTE_LENGTH}-character limit")
+        self._conn.execute(
+            "INSERT INTO reverse_splits (symbol, split_date, ratio, note, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (symbol.strip().upper(), split_date, ratio.strip(), note, int(self._now_fn())),
+        )
+        self._conn.commit()
+
+    def reverse_splits_for(self, symbol: str) -> list[dict]:
+        """Every recorded reverse split for `symbol`, most recent
+        split_date first -- [] if none were ever recorded."""
+        rows = self._conn.execute(
+            "SELECT * FROM reverse_splits WHERE symbol = ? "
+            "ORDER BY split_date DESC, id DESC",
+            (symbol.strip().upper(),),
         ).fetchall()
         return [dict(r) for r in rows]
 

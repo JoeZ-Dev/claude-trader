@@ -572,6 +572,92 @@ def test_watch_note_snapshot_survives_a_later_note_change_on_the_symbol(tmp_path
     assert closed["watch_note"] == "original reason at entry"
 
 
+# -- reverse-split history flag (specs.md section 7's next gap) ----------
+
+def test_reverse_splits_for_is_empty_when_never_recorded(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    assert store.reverse_splits_for("BIAF") == []
+
+
+def test_add_reverse_split_then_reverse_splits_for_returns_it(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    store.add_reverse_split("BIAF", "2024-05-02", "1:10", "pre-earnings reverse split")
+    splits = store.reverse_splits_for("BIAF")
+    assert len(splits) == 1
+    assert splits[0]["split_date"] == "2024-05-02"
+    assert splits[0]["ratio"] == "1:10"
+    assert splits[0]["note"] == "pre-earnings reverse split"
+
+
+def test_add_reverse_split_is_case_insensitive_symbol_match(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    store.add_reverse_split("biaf", "2024-05-02", "1:10")
+    assert len(store.reverse_splits_for("BIAF")) == 1
+
+
+def test_add_reverse_split_note_is_optional(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    store.add_reverse_split("BIAF", "2024-05-02", "1:10")
+    assert store.reverse_splits_for("BIAF")[0]["note"] is None
+
+
+def test_reverse_splits_for_accumulates_multiple_events_most_recent_first(tmp_path):
+    # A symbol can have more than one reverse split over its life (common
+    # among the low-float names this flag targets) -- both must survive,
+    # never overwritten in place, same append-only spirit as watch_notes.
+    store = JournalStore(tmp_path / "journal.db")
+    store.add_reverse_split("QCLS", "2023-01-10", "1:4")
+    store.add_reverse_split("QCLS", "2024-05-02", "1:10")
+    splits = store.reverse_splits_for("QCLS")
+    assert [s["split_date"] for s in splits] == ["2024-05-02", "2023-01-10"]
+
+
+def test_reverse_splits_for_is_scoped_to_its_own_symbol(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    store.add_reverse_split("BIAF", "2024-05-02", "1:10")
+    assert store.reverse_splits_for("RETO") == []
+
+
+def test_add_reverse_split_rejects_a_blank_split_date(tmp_path):
+    import pytest
+    from journal_store import InvalidReverseSplitError
+    store = JournalStore(tmp_path / "journal.db")
+    with pytest.raises(InvalidReverseSplitError):
+        store.add_reverse_split("BIAF", "", "1:10")
+    assert store.reverse_splits_for("BIAF") == []
+
+
+def test_add_reverse_split_rejects_a_non_iso_split_date(tmp_path):
+    # split_date is stored as TEXT and sorted lexicographically DESC --
+    # that sort is only correct for ISO 8601 (YYYY-MM-DD), so a non-ISO
+    # date is rejected outright rather than silently corrupting ordering.
+    import pytest
+    from journal_store import InvalidReverseSplitError
+    store = JournalStore(tmp_path / "journal.db")
+    with pytest.raises(InvalidReverseSplitError):
+        store.add_reverse_split("BIAF", "05/02/2024", "1:10")
+    assert store.reverse_splits_for("BIAF") == []
+
+
+def test_add_reverse_split_rejects_a_blank_ratio(tmp_path):
+    import pytest
+    from journal_store import InvalidReverseSplitError
+    store = JournalStore(tmp_path / "journal.db")
+    with pytest.raises(InvalidReverseSplitError):
+        store.add_reverse_split("BIAF", "2024-05-02", "")
+    assert store.reverse_splits_for("BIAF") == []
+
+
+def test_add_reverse_split_rejects_an_over_length_note(tmp_path):
+    import pytest
+    from journal_store import InvalidReverseSplitError, MAX_REVERSE_SPLIT_NOTE_LENGTH
+    store = JournalStore(tmp_path / "journal.db")
+    with pytest.raises(InvalidReverseSplitError):
+        store.add_reverse_split("BIAF", "2024-05-02", "1:10",
+                                "x" * (MAX_REVERSE_SPLIT_NOTE_LENGTH + 1))
+    assert store.reverse_splits_for("BIAF") == []
+
+
 def test_watch_note_migrates_onto_an_existing_trades_table(tmp_path):
     db_path = tmp_path / "journal.db"
     conn = sqlite3.connect(str(db_path))
