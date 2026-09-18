@@ -37,6 +37,20 @@ Environment:
   RISK_PCT_PER_TRADE     fraction of current_equity risked on a single
                         entry (0.01 = 1%, same convention the EOD swing bot
                         used) -- same seed-only treatment  (default 0.01)
+  SWING_LOW_BUFFER_PCT   cushion below whatever anchors phase 1's stop (a
+                        confirmed swing low, or the entry-trigger level)
+                        (specs.md section 13) -- same seed-only treatment
+                        as TRAIL_PCT                     (default 0.005)
+  PATTERN_PROGRESS_THRESHOLD_PCT  how far above entry (via high_water_mark)
+                        price must climb before phase 1 hands off to
+                        phase 2's flat trailing stop -- same seed-only
+                        treatment                          (default 0.03)
+  SESSION_VOLUME_MULTIPLE  how many multiples of a symbol's typical daily
+                        volume today's cumulative session volume must
+                        clear for an entry to fire (specs.md section 13,
+                        stacking with VOLUME_CONFIRM_THRESHOLD above, not
+                        replacing it) -- same seed-only treatment
+                                                              (default 3.0)
 
 Run:  uvicorn main:app --host 0.0.0.0 --port 8012
 """
@@ -61,6 +75,10 @@ TRAIL_PCT = float(os.environ.get("TRAIL_PCT", "0.05"))
 VOLUME_CONFIRM_THRESHOLD = float(os.environ.get("VOLUME_CONFIRM_THRESHOLD", "1.5"))
 BASE_EQUITY = float(os.environ.get("BASE_EQUITY", "2000"))
 RISK_PCT_PER_TRADE = float(os.environ.get("RISK_PCT_PER_TRADE", "0.01"))
+SWING_LOW_BUFFER_PCT = float(os.environ.get("SWING_LOW_BUFFER_PCT", "0.005"))
+PATTERN_PROGRESS_THRESHOLD_PCT = float(
+    os.environ.get("PATTERN_PROGRESS_THRESHOLD_PCT", "0.03"))
+SESSION_VOLUME_MULTIPLE = float(os.environ.get("SESSION_VOLUME_MULTIPLE", "3.0"))
 
 _client = httpx.AsyncClient(timeout=10.0)
 _journal_store = JournalStore(JOURNAL_DB_PATH, default_params={
@@ -68,6 +86,9 @@ _journal_store = JournalStore(JOURNAL_DB_PATH, default_params={
     "volume_confirm_threshold": VOLUME_CONFIRM_THRESHOLD,
     "base_equity": BASE_EQUITY,
     "risk_pct_per_trade": RISK_PCT_PER_TRADE,
+    "swing_low_buffer_pct": SWING_LOW_BUFFER_PCT,
+    "pattern_progress_threshold_pct": PATTERN_PROGRESS_THRESHOLD_PCT,
+    "session_volume_multiple": SESSION_VOLUME_MULTIPLE,
 })
 
 
@@ -86,6 +107,17 @@ async def announce_watch(symbol: str):
 async def announce_unwatch(symbol: str):
     r = await _client.post(f"{CONNECTOR_URL}/unwatch", json={"symbol": symbol})
     r.raise_for_status()
+
+
+async def fetch_daily_bars(symbol: str):
+    # Session-level volume gate's "typical daily volume" baseline
+    # (specs.md section 13) -- called ONCE per symbol, at add-time
+    # (Poller.add_symbol), never per-bar. A non-2xx or network failure
+    # propagates (add_symbol catches it, logs, and leaves avg_daily_
+    # volume None -- skip the gate for that symbol, never a crash).
+    r = await _client.get(f"{CONNECTOR_URL}/daily_bars/{symbol}")
+    r.raise_for_status()
+    return r.json().get("bars", [])
 
 
 async def _consume_events_once(on_bar) -> None:
@@ -130,4 +162,8 @@ app = create_app(fetch_bars=fetch_bars, watch_symbol=WATCH_SYMBOL,
                  stream_events=stream_events,
                  journal_store=_journal_store, trail_pct=TRAIL_PCT,
                  volume_confirm_threshold=VOLUME_CONFIRM_THRESHOLD,
-                 base_equity=BASE_EQUITY, risk_pct_per_trade=RISK_PCT_PER_TRADE)
+                 base_equity=BASE_EQUITY, risk_pct_per_trade=RISK_PCT_PER_TRADE,
+                 swing_low_buffer_pct=SWING_LOW_BUFFER_PCT,
+                 pattern_progress_threshold_pct=PATTERN_PROGRESS_THRESHOLD_PCT,
+                 session_volume_multiple=SESSION_VOLUME_MULTIPLE,
+                 fetch_daily_bars=fetch_daily_bars)
