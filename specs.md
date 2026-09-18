@@ -1203,9 +1203,9 @@ about a trade or what the strategy itself accounts for, not yet closed.
   current web UI's plain "add symbol" box. This was the highest-priority
   gap: no trade record captured why a symbol was worth watching, only
   what happened technically.
-- Reverse-split history flag — proposed early, never built. Public,
-  checkable data; would have been directly relevant on BIAF, QCLS, and
-  RETO.
+- ~~Reverse-split history flag.~~ **Built 2026-09-18 — see section 10.**
+  Proposed early, never built until now. Public, checkable data; would
+  have been directly relevant on BIAF, QCLS, and RETO.
 - Continuation-vs-fresh-day flag (Day 1 gap vs. Day 2+ runner) — also
   proposed early, also never built.
 - Market backdrop (broad-market direction that day) — no data pipeline
@@ -1392,7 +1392,113 @@ real `trades` rows showed all 3 already-closed trades still reading
 their original snapshot, unaffected — the exact requirement, confirmed
 against real data, not simulated.
 
-### 10. Roadmap / phases
+### 10. Reverse-split history flag
+
+**The gap, closed 2026-09-18.** Section 7's next-priority data
+collection gap: no way to flag that a candidate symbol has a history of
+reverse splits — public, checkable information that would have been
+directly relevant on BIAF, QCLS, and RETO, all real symbols this
+project watched.
+
+**Data source, decided explicitly (not silently assumed).** Checked
+first, not assumed: Schwab's API (via `schwab-py`, already in use) has
+no split-history data anywhere — `Client.Instrument`'s `FUNDAMENTAL`
+projection covers PE ratios, market cap, volume averages, dividend
+data, etc., but nothing about corporate actions. So this data has to
+come from somewhere else, which is a real design decision, not an
+implementation detail — put to the human explicitly rather than picked
+silently, per this repo's own "when something is ambiguous" rule
+(AGENT_PROTOCOL.md). Three options were on the table: (1) a manually
+curated list, entered as splits are spotted; (2) a new external
+corporate-actions API, which would mean a new dependency and possibly a
+new credential to manage; (3) a heuristic scan of Schwab's own
+long-lookback daily price history for anomalous single-day jumps, which
+would be self-contained but imprecise and blind to anything outside the
+lookback window or already smoothed by split-adjusted data. **Decided:
+option (1), a manually curated list** — no new external dependency or
+credential, and precise (an entered split is a known fact, not a
+guess), at the cost of only covering what's actually been entered.
+
+**Storage.** New `reverse_splits` table (`journal_store.py`): `id`,
+`symbol`, `split_date`, `ratio`, `note`, `recorded_at`. A NEW row per
+split event, never one mutable field per symbol — the exact low-float
+names this flag targets (BIAF, QCLS, RETO) are also the names most
+likely to split more than once in their lifetime, so the history of
+past splits has to survive a later one being added, same append-only
+spirit as `watch_notes`/`strategy_params_history`. `split_date` is
+validated as ISO 8601 (`YYYY-MM-DD`) specifically because
+`reverse_splits_for` sorts on it lexicographically DESC — a non-ISO
+date would silently corrupt that ordering rather than just looking odd,
+so it's rejected outright (`InvalidReverseSplitError`) instead. `ratio`
+is free text (e.g. `"1:10"`) — real-world reverse splits get described
+in more than one notation, and this flag's job is informing a human,
+not feeding a calculation, so no calculator, no parsing, no bounds
+check).
+
+**Deliberately NOT snapshotted onto `trades`, unlike `watch_note` and
+`trail_pct_used`.** Those two are locked onto `OpenPosition` at entry
+because they're LIVE values that could drift out from under an
+already-open position before anyone reviews the trade. A reverse split
+is different in kind: it's an immutable historical fact about a
+symbol's past, not a value anyone tunes or updates in place.
+`reverse_splits_for(symbol)` answers "what splits happened before this
+symbol's current price" correctly at any later point in time without
+needing an entry-time lock-in — adding this snapshot field would have
+been building a mechanism this gap doesn't actually need, not filling
+one it does.
+
+**Checkable before watching, not only after.** The flag's real value is
+informing the decision to watch a symbol in the first place, not just
+annotating it afterward — so `POST /api/reverse_splits` and
+`GET /api/reverse_splits?symbol=...` both work for a symbol that isn't
+currently watched at all, unlike `POST /api/watch_note` (which requires
+an active watch, since it has nothing to attach an update to
+otherwise).
+
+**Display.** A warning line (`.reverse-split-flag`, styled with the
+same warning color as the page's existing `.banner`) on a watched
+symbol's panel, right under the watch-note line, in BOTH the
+warming-up and normal-data states — the flag doesn't depend on
+`core`'s analysis being ready, same reasoning as the watch-note's own
+placement (section 9). Unlike the watch-note, which is always rendered
+(even as "no note recorded") specifically because an empty note could
+otherwise be confused with "hasn't loaded yet" — `reverse_splits_for`
+has no such ambiguity: it resolves instantly and definitively, so an
+empty result is genuinely nothing to show. Rendering "no known reverse
+splits" on every panel, when most tickers never split, would be pure
+noise for what's meant to read as a warning banner, not routine status.
+Multiple splits for one symbol render together, most-recent-first, each
+with its optional note. No dedicated add-a-split UI widget this pass —
+API-only, same "natural, separate follow-up" precedent sections 8 and 9
+both used for their own settings/edit UI.
+
+**Verified live (2026-09-18), against a real running instance —
+production itself was not restarted for this.** Checked first: at
+verification time, production monitor-app had two real open virtual
+positions (AEMD, AIFF) — this project's own standing discipline
+(confirmed explicitly in sections 8 and 9) is to confirm NO open
+positions before any restart, so production was left running
+untouched. Verified instead against a separate, real, isolated
+instance of the same unmodified code: `uvicorn main:app` against a
+fresh `journal.db`, no `schwab-connector` needed (this feature has no
+dependency on bar/stream data at all). `POST /api/reverse_splits
+{"symbol": "QCLS", "split_date": "2023-01-10", "ratio": "1:4", "note":
+"low-float reverse split, pre-runner"}` against a symbol NOT yet
+watched, confirmed via `GET /api/reverse_splits?symbol=QCLS` before
+anything else touched QCLS. A second split added the same way
+(`"2024-05-02", "1:10"`, no note) — confirmed both survived as separate
+rows. `POST /api/reverse_splits` with a non-ISO date
+(`"05/02/2024"`) returned `409` with the real validation message and
+changed nothing. Then `POST /api/watch {"symbol": "QCLS"}` (still
+warming up, no bars) — the real rendered page already showed `⚠
+Reverse-split history: 1:10 on 2024-05-02; 1:4 on 2023-01-10 (low-float
+reverse split, pre-runner)`, most-recent-first, confirming the flag
+renders before `core`'s analysis is ready, not just after. Finally, a
+direct query against the real SQLite file (not the API) confirmed both
+rows exactly as entered — real data, not simulated, same methodology
+as sections 6, 8, and 9's own live proofs.
+
+### 11. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,
