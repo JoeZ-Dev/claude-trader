@@ -186,12 +186,12 @@ _ALL_FOUR_TYPES = ("resistance_breakout", "micro_breakout",
 def _advance(*, position=None, new_bars, setups, was_confirmed_types=frozenset(),
             relative_volume=HIGH_VOLUME,
             volume_confirm_threshold=VOLUME_CONFIRM_THRESHOLD, symbol="AEHL",
-            trail_pct=TRAIL_PCT):
+            trail_pct=TRAIL_PCT, watch_note=None):
     return advance_journal(
         position=position, new_bars=new_bars, setups=setups,
         was_confirmed_types=was_confirmed_types, relative_volume=relative_volume,
         volume_confirm_threshold=volume_confirm_threshold,
-        trail_pct=trail_pct, symbol=symbol,
+        trail_pct=trail_pct, symbol=symbol, watch_note=watch_note,
     )
 
 
@@ -365,6 +365,26 @@ def test_open_positions_ratchet_uses_its_own_locked_trail_pct_not_a_new_global()
     assert tick.updated.high_water_mark == 11.0
     assert tick.updated.stop_level == 11.0 * (1 - 0.05)  # locked 0.05, not 0.20
     assert tick.updated.trail_pct == 0.05
+
+
+# -- watch_note snapshot (specs.md section 7's highest-priority gap) -------
+
+def test_new_entry_snapshots_the_current_watch_note():
+    tick = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[_setup("resistance_breakout", confirmed=True)],
+        watch_note="halted then reopened on FDA news, watching for reclaim",
+    )
+    assert tick.opened.watch_note == "halted then reopened on FDA news, watching for reclaim"
+
+
+def test_new_entry_with_no_note_recorded_is_none_not_empty_string():
+    tick = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[_setup("resistance_breakout", confirmed=True)],
+        watch_note=None,
+    )
+    assert tick.opened.watch_note is None
 
 
 def test_advance_journal_updates_open_position_across_multiple_new_bars():

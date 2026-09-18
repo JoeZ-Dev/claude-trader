@@ -399,3 +399,46 @@ def test_a_parameter_change_after_entry_does_not_affect_the_open_positions_ratch
         # reflect the LOCKED 0.05, not the new global 0.50, or this
         # assertion would read 9.2*0.5=4.6 instead.
         assert ratcheted.stop_level == round(9.2 * (1 - 0.05), 10)
+
+
+# -- specs.md section 7: watch_note snapshotted onto the trade at entry ---
+
+def test_a_real_entry_snapshots_the_note_current_at_that_moment(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    store.add_watch_note("AEHL", "halted on FDA news, watching for reclaim")
+    fetch = FakeFetch({"AEHL": [_entry_bars()]})
+
+    with _client(fetch, journal_store=store) as c:
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        opened = store.open_position_for("AEHL")
+        assert opened.watch_note == "halted on FDA news, watching for reclaim"
+
+
+def test_a_closed_trades_note_snapshot_is_unaffected_by_a_later_note_change(tmp_path):
+    # The whole point of the feature: a trade's own row must answer "why
+    # was I watching this" without cross-referencing watch_notes, which
+    # can change (a re-watch, or an explicit update) after the fact.
+    store = JournalStore(tmp_path / "journal.db")
+    store.add_watch_note("AEHL", "original reason at entry")
+    fetch = FakeFetch({"AEHL": [_entry_bars(), _ratchet_bars(), _sharp_breach_bar()]})
+
+    with _client(fetch, journal_store=store) as c:
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        entered = store.open_position_for("AEHL")
+        assert entered.watch_note == "original reason at entry"
+
+        # The note changes WHILE this trade is still open.
+        r = c.post("/api/watch_note", json={"symbol": "AEHL",
+                                            "note": "a completely different later reason"})
+        assert r.status_code == 200
+        assert _sym(c, "AEHL").get("watch_note") == "a completely different later reason"
+
+        _resync(c)  # ratchet
+        _resync(c)  # sharp breach -- trailing stop trips, trade closes
+
+    (closed,) = store.recent_closed()
+    assert closed["id"] == entered.id
+    assert closed["exit_reason"] == "trailing_stop"
+    # the CLOSED trade's own snapshot is the ORIGINAL reason, untouched
+    # by the note change that happened while it was still open
+    assert closed["watch_note"] == "original reason at entry"

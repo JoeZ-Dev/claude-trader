@@ -42,6 +42,17 @@ journal decision instead of a frozen env-var constant, and
 an append-only log of every change, never an in-place overwrite with no
 trail. `trail_pct`/`volume_confirm_threshold` are the only two keys
 today; the schema doesn't assume that stays true.
+
+Also (added 2026-09-18, specs.md section 7's highest-priority gap):
+`watch_notes` (id, symbol, note, created_at) -- a NEW row every time a
+symbol is watched with a note or its note is explicitly updated, never
+a single mutable field per symbol, since a symbol's reason for being
+watched can genuinely differ across separate occasions and the history
+of past reasons has value too (same append-only spirit as
+strategy_params_history). `trades.watch_note` (added the same day) is
+the SNAPSHOT of whatever was current for that symbol at the exact
+moment of entry -- not a live reference to this table, which can change
+after the fact.
 """
 from __future__ import annotations
 
@@ -79,6 +90,12 @@ CREATE TABLE IF NOT EXISTS strategy_params_history (
     old_value REAL,
     new_value REAL NOT NULL,
     changed_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS watch_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    note TEXT NOT NULL,
+    created_at INTEGER NOT NULL
 )
 """
 
@@ -94,7 +111,13 @@ _ADDED_COLUMNS = [
     ("factors", "TEXT"),
     ("trail_pct_used", "REAL"),
     ("volume_threshold_used", "REAL"),
+    ("watch_note", "TEXT"),
 ]
+
+# A note longer than this is rejected outright (409), never silently
+# truncated -- specs.md section 7: "reasonable length cap, rejected
+# cleanly like any other validation in this app."
+MAX_WATCH_NOTE_LENGTH = 500
 
 # (lower, upper] bounds a set_param value must fall within -- "positive,
 # reasonable-range" per specs.md section 8. trail_pct is a fraction (0.05 =
@@ -115,6 +138,10 @@ _PARAM_BOUNDS = {
 class InvalidParamError(ValueError):
     """Raised by set_param for a value outside _PARAM_BOUNDS, or a key
     with no known bounds at all (a mistyped or unsupported key)."""
+
+
+class InvalidWatchNoteError(ValueError):
+    """Raised by add_watch_note for a note over MAX_WATCH_NOTE_LENGTH."""
 
 
 class JournalStore:
@@ -227,6 +254,48 @@ class JournalStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    # -- watch notes (specs.md section 7's highest-priority gap) ----------
+
+    def add_watch_note(self, symbol: str, note: str) -> None:
+        """Appends a NEW row -- never overwrites a prior note for this
+        symbol in place, since separate occasions of watching the same
+        symbol can genuinely have different reasons, and the history of
+        past reasons has value too (same spirit as strategy_params'
+        append-only history). Raises InvalidWatchNoteError (changing
+        nothing) for an over-length note -- validated here, the one
+        place both callers (POST /api/watch's optional note and POST
+        /api/watch_note) go through, so the length cap can't be
+        forgotten on one path and not the other."""
+        if len(note) > MAX_WATCH_NOTE_LENGTH:
+            raise InvalidWatchNoteError(
+                f"note is {len(note)} characters, over the "
+                f"{MAX_WATCH_NOTE_LENGTH}-character limit")
+        self._conn.execute(
+            "INSERT INTO watch_notes (symbol, note, created_at) VALUES (?, ?, ?)",
+            (symbol.upper(), note, int(self._now_fn())),
+        )
+        self._conn.commit()
+
+    def current_note_for(self, symbol: str) -> str | None:
+        """The most recently recorded note for `symbol`, or None if one
+        was never recorded (distinct from an explicitly-cleared note,
+        which IS a real row with note="")."""
+        row = self._conn.execute(
+            "SELECT note FROM watch_notes WHERE symbol = ? ORDER BY id DESC LIMIT 1",
+            (symbol.upper(),),
+        ).fetchone()
+        return row["note"] if row is not None else None
+
+    def watch_note_history(self, symbol: str, limit: int = 50) -> list[dict]:
+        """Every note ever recorded for `symbol`, most recent first --
+        the "history of past reasons has value too" this table exists
+        for."""
+        rows = self._conn.execute(
+            "SELECT * FROM watch_notes WHERE symbol = ? ORDER BY id DESC LIMIT ?",
+            (symbol.upper(), limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def open_position_for(self, symbol: str) -> OpenPosition | None:
         """The currently-open (exit_ts IS NULL) position for `symbol`, if
         any. Used both when starting to watch a symbol and to resume
@@ -243,12 +312,12 @@ class JournalStore:
         cur = self._conn.execute(
             "INSERT INTO trades (symbol, entry_ts, entry_price, "
             "high_water_mark, stop_level, setup_type, factors, "
-            "trail_pct_used, volume_threshold_used) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "trail_pct_used, volume_threshold_used, watch_note) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (position.symbol.upper(), position.entry_ts, position.entry_price,
              position.high_water_mark, position.stop_level, position.setup_type,
              json.dumps(position.factors) if position.factors is not None else None,
-             position.trail_pct, position.volume_threshold_used),
+             position.trail_pct, position.volume_threshold_used, position.watch_note),
         )
         self._conn.commit()
         return replace(position, id=cur.lastrowid)
@@ -322,6 +391,7 @@ def _row_to_position(row: sqlite3.Row) -> OpenPosition:
         trail_pct=(row["trail_pct_used"] if row["trail_pct_used"] is not None
                    else _DEFAULT_TRAIL_PCT),
         volume_threshold_used=row["volume_threshold_used"],
+        watch_note=row["watch_note"],
     )
 
 

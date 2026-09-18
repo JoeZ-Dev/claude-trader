@@ -1197,11 +1197,12 @@ existence — each is a real, named gap in either what gets recorded
 about a trade or what the strategy itself accounts for, not yet closed.
 
 **Data collection gaps:**
-- Catalyst/context note at add-time. The original recorder design
-  explicitly called this "impossible to reconstruct later" — it did not
-  survive into the current web UI's plain "add symbol" box. This is the
-  highest-priority gap: no trade record currently captures why a symbol
-  was worth watching, only what happened technically.
+- ~~Catalyst/context note at add-time.~~ **Built 2026-09-18 — see
+  section 9.** The original recorder design explicitly called this
+  "impossible to reconstruct later" — it did not survive into the
+  current web UI's plain "add symbol" box. This was the highest-priority
+  gap: no trade record captured why a symbol was worth watching, only
+  what happened technically.
 - Reverse-split history flag — proposed early, never built. Public,
   checkable data; would have been directly relevant on BIAF, QCLS, and
   RETO.
@@ -1310,7 +1311,70 @@ open position's own `journal.open.stop_level` and the DB row's
 its own entry, confirming the "not affected by subsequent parameter
 changes" half live, not just at the unit-test level.
 
-### 9. Roadmap / phases
+### 9. Catalyst/context notes at watch-time
+
+**The gap, closed 2026-09-18.** Section 7's highest-priority item: no
+trade record captured WHY a symbol was worth watching, only what
+happened technically afterward. The original recorder design had
+explicitly called this "impossible to reconstruct later," and it never
+survived into the current web UI's plain "add symbol" box.
+
+**Storage.** New `watch_notes` table (`journal_store.py`): `id`,
+`symbol`, `note`, `created_at`. A NEW row every time a symbol is added
+with a note or its note is explicitly updated — never a single mutable
+field per symbol, since the reason for watching something can genuinely
+differ across separate occasions and the history of past reasons has
+value too (same append-only spirit as `strategy_params_history`,
+section 8). `current_note_for(symbol)` returns the most recent row;
+`watch_note_history(symbol)` returns all of them.
+
+**Capture at add-time.** `POST /api/watch` gained an optional `note`
+field in the SAME request (the existing add-symbol form on the page
+gained a matching text input) — recording why is part of the same
+action as adding the symbol, not a second step. Empty/omitted is valid
+and normal, never blocks or slows the add; only an over-length note
+(> `MAX_WATCH_NOTE_LENGTH` = 500 characters) is rejected, cleanly (409,
+same convention as every other validation in this app), never silently
+truncated. A rejected note also rejects the whole add — the symbol is
+not watched with a note it was never given.
+
+**Updating an already-watched symbol's note.** A separate small
+endpoint, `POST /api/watch_note {"symbol", "note"}`, updates the note
+for a currently-watched symbol without removing/re-adding it — context
+often becomes clearer a minute or two after the initial add. Rejects an
+unwatched symbol (nothing to attach the note to) or an over-length note
+the same way. Same length limit, validated in `JournalStore.
+add_watch_note` itself (`InvalidWatchNoteError`) so both callers (the
+add-time path and this one) can never disagree about it.
+
+**Display.** The current (most recent) note shows prominently on each
+watched symbol's panel, right under the symbol/price header — in BOTH
+the warming-up and normal-data states, since the note doesn't depend on
+`core`'s analysis being ready. Plainly rendered as "no note recorded"
+when empty, never just omitted, so a missing note is never confused
+with "hasn't loaded yet." No dedicated edit-in-place UI widget this
+pass (matching section 8's "adjustment mechanism can be API-only for
+now" precedent) — updating an existing note is `POST /api/watch_note`
+via `curl`, a UI control is a natural, separate follow-up.
+
+**Snapshotted onto the trade at entry — the critical half, same
+principle as `trail_pct_used` (section 8).** `journal_logic.
+OpenPosition` gained a `watch_note` field, set ONCE from
+`current_note_for(symbol)` at the exact moment `advance_journal` fires
+a fresh entry, and never touched again — NOT a live reference to
+`watch_notes`, which could change (an explicit update, or a re-watch
+with different context) before anyone reviews this specific trade.
+`trades` gained a matching `watch_note` column, migrated in place via
+the same `_ADDED_COLUMNS` mechanism every prior schema addition this
+session used (checked explicitly against a non-empty table, never
+assumed fresh).
+
+Live verification pending deploy (this section will be updated with the
+real result, per this project's own "confirm live, don't just claim it"
+standard — see sections 6 and 8's own live-proof entries for the same
+discipline).
+
+### 10. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,

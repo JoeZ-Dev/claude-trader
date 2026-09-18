@@ -135,7 +135,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from journal_logic import ExitEvent, OpenPosition, advance_journal
-from journal_store import InvalidParamError
+from journal_store import MAX_WATCH_NOTE_LENGTH, InvalidParamError, InvalidWatchNoteError
 from state import build_state
 
 # Same exchange-local timezone state.py already anchors session VWAP to
@@ -264,13 +264,18 @@ class Poller:
 
     def full_state_for(self, symbol: str) -> dict | None:
         """state.build_state's output for `symbol`, plus that symbol's OWN
-        journal open-position block. Does NOT include recent_closed, which
-        is intentionally cross-symbol -- see recent_closed()."""
+        journal open-position block and current watch_note (specs.md
+        section 7 -- the live current reason, not a trade's own frozen
+        snapshot; see journal_logic.OpenPosition.watch_note for that).
+        Does NOT include recent_closed, which is intentionally
+        cross-symbol -- see recent_closed()."""
         slot = self._slots.get(symbol.upper())
         if slot is None:
             return None
         payload = dict(slot.state)
         payload["journal"] = {"open": self._journal_open_for(slot)}
+        payload["watch_note"] = (self._journal_store.current_note_for(symbol)
+                                 if self._journal_store is not None else None)
         return payload
 
     def all_full_states(self) -> dict[str, dict]:
@@ -364,14 +369,24 @@ class Poller:
         if self._initial_symbol is not None:
             await self.add_symbol(self._initial_symbol)
 
-    async def add_symbol(self, symbol: str) -> tuple[bool, str]:
+    async def add_symbol(self, symbol: str, watch_note: str | None = None) -> tuple[bool, str]:
         """Add a symbol to the watched set. Returns (True, note) on
         success -- `note` is "" normally, or a human-readable line saying
         what got evicted when the set was already full. Returns (False,
-        reason) on rejection -- an invalid symbol or one already watched,
-        each with its own clear reason. Never a silent failure (phase 1's
+        reason) on rejection -- an invalid symbol, one already watched,
+        or (added 2026-09-18) an over-length `watch_note` -- each with
+        its own clear reason. Never a silent failure (phase 1's
         switch_symbol silently replaced whatever was watched; phase 2
         never does that for an UNRELATED slot).
+
+        `watch_note` (specs.md section 7's highest-priority gap) is the
+        catalyst/context for watching this symbol NOW -- recording it is
+        part of the SAME action as adding the symbol, not a second step,
+        so it's accepted right here rather than requiring a follow-up
+        call. None/empty is valid and normal and never blocks or slows
+        down the add; only an over-length note is rejected (before
+        anything else happens -- validated up front, same as the symbol
+        itself, not after the slot's already been created).
 
         Adding at capacity does NOT reject anymore: it evicts the
         oldest-added symbol (FIFO -- self._slots is insertion-ordered,
@@ -384,6 +399,9 @@ class Poller:
             return False, f"{symbol!r} is not a valid ticker symbol"
         if symbol in self._slots:
             return False, f"{symbol} is already being watched"
+        if watch_note and len(watch_note) > MAX_WATCH_NOTE_LENGTH:
+            return False, (f"note is {len(watch_note)} characters, over the "
+                           f"{MAX_WATCH_NOTE_LENGTH}-character limit")
 
         note = ""
         if len(self._slots) >= self._max_symbols:
@@ -392,6 +410,8 @@ class Poller:
             note = f"dropped {oldest} (oldest) to make room for {symbol}"
 
         self._slots[symbol] = _SymbolSlot(symbol=symbol, state=build_state([], symbol))
+        if self._journal_store is not None and watch_note:
+            self._journal_store.add_watch_note(symbol, watch_note)
         if self._journal_store is not None:
             # Resume an already-open position for this symbol (a restart,
             # or re-adding something with a position still open) rather
@@ -455,6 +475,30 @@ class Poller:
                 )
         self._broadcast_state()
         return True
+
+    def update_watch_note(self, symbol: str, note: str) -> tuple[bool, str]:
+        """Updates the note for an ALREADY-watched symbol without
+        removing/re-adding it (specs.md section 7) -- context often
+        becomes clearer a minute or two after the initial add, and this
+        is how that gets recorded without losing watch state. Returns
+        (False, reason) if the symbol isn't currently watched (there's
+        nothing to attach the note to -- use POST /api/watch instead) or
+        journaling is disabled entirely; (False, reason) for an
+        over-length note, same limit and message as add_symbol's own
+        check. Appends a NEW watch_notes row (journal_store.
+        add_watch_note), same as at add-time -- never overwrites the
+        prior note in place."""
+        symbol = symbol.strip().upper()
+        if symbol not in self._slots:
+            return False, f"{symbol} is not currently watched"
+        if self._journal_store is None:
+            return False, "journaling is disabled"
+        try:
+            self._journal_store.add_watch_note(symbol, note)
+        except InvalidWatchNoteError as exc:
+            return False, str(exc)
+        self._broadcast_state()
+        return True, ""
 
     async def _announce_watch_with_retry(self, symbol: str) -> None:
         delay = self._announce_retry_base_delay
@@ -624,12 +668,18 @@ class Poller:
         trail_pct = self._journal_store.get_param("trail_pct", self._trail_pct)
         volume_confirm_threshold = self._journal_store.get_param(
             "volume_confirm_threshold", self._volume_confirm_threshold)
+        # specs.md section 7: whatever note is CURRENT for this symbol
+        # right now gets snapshotted onto a fresh entry (advance_journal
+        # only actually uses this when tick.opened fires) -- same
+        # live-lookup-then-lock pattern as trail_pct/volume_confirm_
+        # threshold above, not a live reference kept on the position.
+        watch_note = self._journal_store.current_note_for(symbol)
         tick = advance_journal(
             position=slot.journal_position, new_bars=new_bars,
             setups=setups, was_confirmed_types=slot.journal_confirmed_types,
             relative_volume=relative_volume,
             volume_confirm_threshold=volume_confirm_threshold,
-            trail_pct=trail_pct, symbol=symbol,
+            trail_pct=trail_pct, symbol=symbol, watch_note=watch_note,
         )
         # tick.closed applies independently of opened/updated -- a stop-out
         # can be immediately followed, within the SAME batch of new_bars,
@@ -884,17 +934,33 @@ def _remove_button_html(symbol: str) -> str:
     return f"<button type='button' class='remove-btn' data-symbol='{sym}'>remove</button>"
 
 
+def _watch_note_html(note: str | None) -> str:
+    # Prominent, near the symbol/price header -- specs.md section 7's
+    # highest-priority gap: "no trade record currently captures why a
+    # symbol was worth watching." Plainly shown when empty, not just
+    # omitted, so a missing note is never confused with "hasn't loaded
+    # yet". No special update wiring needed beyond this -- it's part of
+    # symbolCardHtml's own output, so it refreshes the same way the rest
+    # of the card does on every push (the whole card is replaced, not
+    # patched piecemeal).
+    text = html.escape(note) if note else "no note recorded"
+    cls = "watch-note muted" if not note else "watch-note"
+    return f"<p class='{cls}'>{text}</p>"
+
+
 def _symbol_card_html(symbol: str, state: dict) -> str:
     """One grid panel per watched symbol: the same per-block renderers
     phase 1's single-symbol page used, plus a remove control scoped to
     this panel's own symbol (data-symbol, wired via event delegation on
     #symbols in _SCRIPT -- see refresh())."""
     sym = html.escape(symbol)
+    note_html = _watch_note_html(state.get("watch_note"))
     if state.get("status") != "ok":
         msg = (f"Warming up — waiting for bars for {sym}." if state.get("symbol")
               else "No data yet.")
         return (f"<section class='card' data-symbol='{sym}'>"
                 f"<div class='hero'><h2>{sym}</h2>{_remove_button_html(symbol)}</div>"
+                f"{note_html}"
                 f"<p class='muted'>{html.escape(msg)}</p></section>")
 
     s = state["session"]
@@ -910,6 +976,7 @@ def _symbol_card_html(symbol: str, state: dict) -> str:
     <div class="hero-price {price_cls}">{_fmt(state['last_price'], 2)}</div>
     {_remove_button_html(symbol)}
   </div>
+  {note_html}
   <table class="detail">
     <tr><th>Bars</th><td>{state['bar_count']}</td></tr>
     <tr><th>Last bar extended-hours</th><td>{"yes" if state["last_bar_is_extended"] else "no"}</td></tr>
@@ -931,9 +998,16 @@ def _symbol_card_html(symbol: str, state: dict) -> str:
 
 
 def _watch_form_html(count: int, max_symbols: int) -> str:
+    # Recording why a symbol is worth watching is part of the SAME
+    # action as adding it, not a second step (specs.md section 7) --
+    # the note field sits right next to the symbol input, submitted in
+    # the same POST /api/watch call. maxlength here is a UX nicety, not
+    # the real validation -- that's the server's MAX_WATCH_NOTE_LENGTH
+    # check (a client-side-only limit could silently disagree with it).
     return f"""
 <form id="watch-form" class="watch-form">
   <input type="text" id="watch-input" placeholder="Add symbol (e.g. NVDA)" maxlength="10" autocomplete="off">
+  <input type="text" id="watch-note-input" placeholder="Why watching? (optional)" maxlength="500" autocomplete="off">
   <button type="submit">Add</button>
   <span id="slot-count" class="muted">{count} / {max_symbols} symbols watched</span>
   <span id="watch-status" class="muted"></span>
@@ -1150,11 +1224,20 @@ function setupChipsHtml(symbol, others) {
   out += '</div>';
   return out;
 }
+function watchNoteHtml(note) {
+  // Mirrors _watch_note_html (Python side) -- plainly shown when empty,
+  // not omitted, so it's never confused with "hasn't loaded yet."
+  const text = note ? esc(note) : 'no note recorded';
+  const cls = note ? 'watch-note' : 'watch-note muted';
+  return '<p class="' + cls + '">' + text + '</p>';
+}
 function symbolCardHtml(symbol, state) {
   const sym = esc(symbol);
+  const noteHtml = watchNoteHtml(state.watch_note);
   if (state.status !== 'ok') {
     return '<section class="card" data-symbol="' + sym + '">' +
       '<div class="hero"><h2>' + sym + '</h2>' + removeButtonHtml(symbol) + '</div>' +
+      noteHtml +
       '<p class="muted">Warming up \\u2014 waiting for bars.</p></section>';
   }
   const s = state.session;
@@ -1168,6 +1251,7 @@ function symbolCardHtml(symbol, state) {
     '<div class="hero"><div class="hero-symbol">' + sym + '</div>' +
     '<div class="hero-price ' + priceCls + '">' + fmt(state.last_price, 2) + '</div>' +
     removeButtonHtml(symbol) + '</div>' +
+    noteHtml +
     '<table class="detail">' +
     '<tr><th>Bars</th><td>' + state.bar_count + '</td></tr>' +
     '<tr><th>Last bar extended-hours</th><td>' + (state.last_bar_is_extended ? 'yes' : 'no') + '</td></tr>' +
@@ -1263,6 +1347,7 @@ async function refresh() {
 document.getElementById('watch-form').addEventListener('submit', async function (e) {
   e.preventDefault();
   const input = document.getElementById('watch-input');
+  const noteInput = document.getElementById('watch-note-input');
   const statusEl = document.getElementById('watch-status');
   const symbol = input.value.trim();
   if (!symbol) return;
@@ -1270,10 +1355,14 @@ document.getElementById('watch-form').addEventListener('submit', async function 
   statusEl.className = 'muted';
   let body;
   try {
+    // note is optional -- recording why is part of the SAME add action
+    // (specs.md section 7), submitted in this one request, never a
+    // second step or a reason to slow down/block adding the symbol.
     const r = await fetch('/api/watch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: 'symbol=' + encodeURIComponent(symbol),
+      body: 'symbol=' + encodeURIComponent(symbol) +
+        '&note=' + encodeURIComponent(noteInput.value.trim()),
     });
     body = await r.json();
   } catch (err) {
@@ -1283,6 +1372,7 @@ document.getElementById('watch-form').addEventListener('submit', async function 
   }
   if (body.ok) {
     input.value = '';
+    noteInput.value = '';
     statusEl.textContent = body.reason || '';
     statusEl.className = 'muted';
   } else {
@@ -1603,10 +1693,28 @@ def create_app(*, fetch_bars, watch_symbol=None,
         # POST (no file inputs) is application/x-www-form-urlencoded, which
         # Starlette/urllib can already parse without it.
         body = (await request.body()).decode()
-        symbol = (parse_qs(body).get("symbol") or [""])[0]
-        ok, reason = await poller.add_symbol(symbol)
+        parsed = parse_qs(body)
+        symbol = (parsed.get("symbol") or [""])[0]
+        # Optional "why watching" note in the SAME request (specs.md
+        # section 7) -- empty/omitted is valid and normal, never blocks
+        # the add. parse_qs drops a key entirely when its value is "",
+        # so an explicitly-empty note and an omitted one both come back
+        # as "" here -- both correctly mean "nothing to record."
+        watch_note = (parsed.get("note") or [""])[0] or None
+        ok, reason = await poller.add_symbol(symbol, watch_note)
         return JSONResponse({"ok": ok, "reason": reason, "symbols": poller.symbols},
                             status_code=200 if ok else 409)
+
+    @app.post("/api/watch_note")
+    async def api_watch_note(request: Request):
+        # Updates the note for an ALREADY-watched symbol without
+        # removing/re-adding it (specs.md section 7) -- JSON body, like
+        # /api/polling, not tied to a plain HTML form.
+        body = await request.json()
+        symbol = body.get("symbol") or ""
+        note = body.get("note") or ""
+        ok, reason = poller.update_watch_note(symbol, note)
+        return JSONResponse({"ok": ok, "reason": reason}, status_code=200 if ok else 409)
 
     @app.post("/api/unwatch")
     async def api_unwatch(request: Request):

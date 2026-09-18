@@ -96,6 +96,15 @@ class OpenPosition:
     # no ongoing use after entry -- captured for the trade record only).
     trail_pct: float = 0.05
     volume_threshold_used: float | None = None
+    # The watch_notes entry current for this symbol AT THE MOMENT of
+    # entry (added 2026-09-18, specs.md section 7's highest-priority
+    # gap) -- SNAPSHOTTED, same principle as trail_pct above, never a
+    # live reference to journal_store.current_note_for(). The symbol
+    # could be re-watched with different context, or the note updated
+    # again, before anyone reviews this trade; this field must keep
+    # answering "why was I watching this" regardless. None if no note
+    # was ever recorded for this symbol before this entry.
+    watch_note: str | None = None
 
 
 @dataclass(frozen=True)
@@ -184,7 +193,7 @@ def advance_journal(
     *, position: OpenPosition | None, new_bars: list[dict],
     setups: list[dict], was_confirmed_types: frozenset[str],
     relative_volume: float, volume_confirm_threshold: float,
-    trail_pct: float, symbol: str,
+    trail_pct: float, symbol: str, watch_note: str | None = None,
 ) -> JournalTick:
     """Run one poll cycle's newly-arrived bars (in order) through the
     journal: if a position is open, walk each new bar ratcheting the stop
@@ -259,6 +268,7 @@ def advance_journal(
                 },
                 trail_pct=trail_pct,
                 volume_threshold_used=volume_confirm_threshold,
+                watch_note=watch_note,
             )
 
     return JournalTick(opened=opened, updated=updated, closed=closed,

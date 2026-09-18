@@ -481,3 +481,110 @@ def test_a_rejected_set_param_does_not_change_the_live_value_or_history(tmp_path
         store.set_param("trail_pct", -1.0)
     assert store.get_param("trail_pct", default=0.99) == 0.05
     assert store.param_history() == []
+
+
+# -- watch notes (specs.md section 7's highest-priority gap) --------------
+
+def test_current_note_for_is_none_when_never_recorded(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    assert store.current_note_for("AEHL") is None
+
+
+def test_add_watch_note_then_current_note_for_returns_it(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    store.add_watch_note("AEHL", "halted on FDA news, watching for reclaim")
+    assert store.current_note_for("AEHL") == "halted on FDA news, watching for reclaim"
+
+
+def test_add_watch_note_is_case_insensitive_symbol_match(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    store.add_watch_note("aehl", "lowercase add")
+    assert store.current_note_for("AEHL") == "lowercase add"
+
+
+def test_add_watch_note_appends_a_new_row_rather_than_overwriting(tmp_path):
+    # Separate occasions of watching the same symbol can have different
+    # reasons -- the OLD note must still exist in history, not be lost.
+    store = JournalStore(tmp_path / "journal.db")
+    store.add_watch_note("AEHL", "first reason")
+    store.add_watch_note("AEHL", "second, different reason")
+    assert store.current_note_for("AEHL") == "second, different reason"
+    history = store.watch_note_history("AEHL")
+    assert [h["note"] for h in history] == ["second, different reason", "first reason"]
+
+
+def test_add_watch_note_rejects_an_over_length_note(tmp_path):
+    import pytest
+    from journal_store import InvalidWatchNoteError, MAX_WATCH_NOTE_LENGTH
+    store = JournalStore(tmp_path / "journal.db")
+    with pytest.raises(InvalidWatchNoteError):
+        store.add_watch_note("AEHL", "x" * (MAX_WATCH_NOTE_LENGTH + 1))
+    assert store.current_note_for("AEHL") is None  # rejected, nothing written
+
+
+def test_add_watch_note_accepts_exactly_the_max_length(tmp_path):
+    from journal_store import MAX_WATCH_NOTE_LENGTH
+    store = JournalStore(tmp_path / "journal.db")
+    note = "x" * MAX_WATCH_NOTE_LENGTH
+    store.add_watch_note("AEHL", note)
+    assert store.current_note_for("AEHL") == note
+
+
+def test_add_watch_note_accepts_an_explicit_empty_note_as_a_real_row(tmp_path):
+    # An explicit clear is a real, intentional action -- distinct from
+    # "never recorded" -- and gets its own history row.
+    store = JournalStore(tmp_path / "journal.db")
+    store.add_watch_note("AEHL", "a real reason")
+    store.add_watch_note("AEHL", "")
+    assert store.current_note_for("AEHL") == ""
+    assert len(store.watch_note_history("AEHL")) == 2
+
+
+def test_create_persists_watch_note_snapshot(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    pos = OpenPosition(id=None, symbol="AEHL", entry_ts=100, entry_price=10.0,
+                       high_water_mark=10.0, stop_level=9.5,
+                       watch_note="watching for a breakout reclaim")
+    created = store.create(pos)
+    assert created.watch_note == "watching for a breakout reclaim"
+
+    found = store.open_position_for("AEHL")
+    assert found.watch_note == "watching for a breakout reclaim"
+
+
+def test_watch_note_snapshot_survives_a_later_note_change_on_the_symbol(tmp_path):
+    # The whole point: a trade's own row must answer "why was I watching
+    # this" without cross-referencing watch_notes, which can change.
+    store = JournalStore(tmp_path / "journal.db")
+    pos = OpenPosition(id=None, symbol="AEHL", entry_ts=100, entry_price=10.0,
+                       high_water_mark=10.0, stop_level=9.5,
+                       watch_note="original reason at entry")
+    created = store.create(pos)
+    store.close_position(created, ExitEvent(exit_ts=200, exit_price=11.0,
+                                            exit_reason="trailing_stop"))
+
+    # The symbol gets a NEW note afterward (re-watched, or just updated).
+    store.add_watch_note("AEHL", "a completely different later reason")
+    assert store.current_note_for("AEHL") == "a completely different later reason"
+
+    # The closed trade's own snapshot is unaffected.
+    (closed,) = store.recent_closed()
+    assert closed["watch_note"] == "original reason at entry"
+
+
+def test_watch_note_migrates_onto_an_existing_trades_table(tmp_path):
+    db_path = tmp_path / "journal.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(_PARTS_A_D_SCHEMA)  # no watch_note column, no watch_notes table
+    conn.execute(
+        "INSERT INTO trades (symbol, entry_ts, entry_price, high_water_mark, "
+        "stop_level) VALUES ('AEHL', 100, 10.0, 10.0, 9.5)",
+    )
+    conn.commit()
+    conn.close()
+
+    store = JournalStore(db_path)  # must not raise
+    resumed = store.open_position_for("AEHL")
+    assert resumed.watch_note is None
+    store.add_watch_note("AEHL", "works after migration")
+    assert store.current_note_for("AEHL") == "works after migration"

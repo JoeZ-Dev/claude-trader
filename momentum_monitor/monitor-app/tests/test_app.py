@@ -266,6 +266,88 @@ def test_post_watch_rejects_blank_symbol():
         assert r.json()["ok"] is False
 
 
+# -- catalyst/context note at watch-time, specs.md section 7 --------------
+
+def _client_with_real_store_for_notes(fetch, tmp_path, *, symbol="AEHL"):
+    from journal_store import JournalStore
+    store = JournalStore(tmp_path / "journal.db")
+    return _client(fetch, symbol=symbol, journal_store=store), store
+
+
+def test_post_watch_with_a_note_stores_and_displays_it(tmp_path):
+    c, store = _client_with_real_store_for_notes(FakeFetch({"AEHL": [_bars(3)]}), tmp_path, symbol=None)
+    with c:
+        r = c.post("/api/watch", data={"symbol": "AEHL",
+                                       "note": "halted on FDA news, watching for reclaim"})
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+        assert store.current_note_for("AEHL") == "halted on FDA news, watching for reclaim"
+
+        state = _sym_state(c, "AEHL") or {}
+        assert state.get("watch_note") == "halted on FDA news, watching for reclaim"
+
+        page = c.get("/").text
+        assert "halted on FDA news, watching for reclaim" in page
+
+
+def test_post_watch_without_a_note_is_valid_and_does_not_block(tmp_path):
+    c, store = _client_with_real_store_for_notes(FakeFetch({"AEHL": [_bars(3)]}), tmp_path, symbol=None)
+    with c:
+        r = c.post("/api/watch", data={"symbol": "AEHL"})  # note omitted entirely
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+        assert store.current_note_for("AEHL") is None
+
+        page = c.get("/").text
+        assert "no note recorded" in page
+
+
+def test_post_watch_rejects_an_over_length_note(tmp_path):
+    c, store = _client_with_real_store_for_notes(FakeFetch({}), tmp_path, symbol=None)
+    with c:
+        r = c.post("/api/watch", data={"symbol": "AEHL", "note": "x" * 501})
+        assert r.status_code == 409
+        assert r.json()["ok"] is False
+        # rejected cleanly, not silently truncated -- AND the symbol
+        # itself was never added, since the note was invalid
+        assert store.current_note_for("AEHL") is None
+        assert "AEHL" not in c.get("/api/state").json()["symbols"]
+
+
+def test_post_watch_note_updates_without_disturbing_watch_state(tmp_path):
+    c, store = _client_with_real_store_for_notes(FakeFetch({"AEHL": [_bars(3)]}), tmp_path)
+    with c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        r = c.post("/api/watch_note", json={"symbol": "AEHL",
+                                            "note": "context added a minute later"})
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+
+        # still watched, still has its real bars -- untouched
+        assert (_sym_state(c, "AEHL") or {}).get("status") == "ok"
+        assert (_sym_state(c, "AEHL") or {}).get("bar_count") == 3
+        assert store.current_note_for("AEHL") == "context added a minute later"
+
+
+def test_post_watch_note_rejects_an_unwatched_symbol(tmp_path):
+    c, store = _client_with_real_store_for_notes(FakeFetch({}), tmp_path, symbol=None)
+    with c:
+        r = c.post("/api/watch_note", json={"symbol": "MSFT", "note": "anything"})
+        assert r.status_code == 409
+        assert r.json()["ok"] is False
+        assert store.current_note_for("MSFT") is None
+
+
+def test_post_watch_note_rejects_an_over_length_note(tmp_path):
+    c, store = _client_with_real_store_for_notes(FakeFetch({"AEHL": [_bars(3)]}), tmp_path)
+    with c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        r = c.post("/api/watch_note", json={"symbol": "AEHL", "note": "x" * 501})
+        assert r.status_code == 409
+        assert r.json()["ok"] is False
+        assert store.current_note_for("AEHL") is None
+
+
 def test_post_watch_at_capacity_evicts_the_oldest_symbol_not_a_rejection():
     unwatched = []
 
@@ -311,6 +393,9 @@ def test_post_watch_eviction_force_closes_the_evicted_symbols_open_position():
 
         def all_params(self):
             return {}
+
+        def current_note_for(self, symbol):
+            return None
 
     from journal_logic import OpenPosition
 
