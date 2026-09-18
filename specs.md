@@ -1369,10 +1369,28 @@ the same `_ADDED_COLUMNS` mechanism every prior schema addition this
 session used (checked explicitly against a non-empty table, never
 assumed fresh).
 
-Live verification pending deploy (this section will be updated with the
-real result, per this project's own "confirm live, don't just claim it"
-standard — see sections 6 and 8's own live-proof entries for the same
-discipline).
+**Verified live (2026-09-18), against the real running production
+container.** No open positions at deploy time (a safe restart). `POST
+/api/watch_note {"symbol": "AEMD", "note": "watching for a low-float
+reclaim above VWAP after the afternoon halt"}` against the real running
+container — confirmed on the real rendered page and via `GET
+/api/state` immediately. Updated it again (`"update: reclaim confirmed,
+volume picking up"`) — confirmed the page and API reflected the new
+text, with AEMD's `bar_count` (5246 and climbing) and watch status
+completely undisturbed. Market hours were closed by this point, so the
+trade-snapshot half was confirmed the same way as sections 6 and 8's:
+a separate, isolated instance of the same unmodified code,
+`STREAM_SOURCE=replay`. `POST /api/watch {"symbol": "AEHL", "note":
+"original reason at entry"}` — the fixture cascaded through 3 real
+entry/exit cycles (a genuine, not contrived, real-time replay outcome,
+same round_number_reclaim cascade behavior documented in section 6);
+all 3 closed trades' `watch_note` columns read `"original reason at
+entry"`. Only THEN was `POST /api/watch_note` called with `"a
+completely different later reason"` — confirmed live via the API that
+the CURRENT note genuinely changed, while a direct query against the
+real `trades` rows showed all 3 already-closed trades still reading
+their original snapshot, unaffected — the exact requirement, confirmed
+against real data, not simulated.
 
 ### 10. Roadmap / phases
 
