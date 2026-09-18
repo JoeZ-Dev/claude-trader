@@ -24,9 +24,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import create_app
+from journal_logic import initial_stop_level
 from journal_store import JournalStore
 
 TRAIL_PCT = 0.05
+SWING_LOW_BUFFER_PCT = 0.005  # app.py's DEFAULT_SWING_LOW_BUFFER_PCT
 
 
 def _bar(ts, price, *, high=None, low=None, vol=50_000.0):
@@ -61,10 +63,25 @@ def _entry_bars():
 
 def _ratchet_bars():
     """Two more bars, still near 9.1, that raise the high-water-mark a
-    little without breaching the stop or producing any new confirmation
-    -- verified the position simply ratchets (JournalTick.updated), no
-    duplicate entry."""
+    little without breaching the OLD flat-trail-only stop (8.645) or
+    producing any new confirmation. Still used below by tests that don't
+    care exactly which batch triggers an eventual close (they only check
+    "did it eventually close with the right reason"); NOT safe against
+    phase 1's own, deliberately tighter, early-phase stop (specs.md
+    section 13) -- see _phase1_safe_ratchet_bars for that."""
     return [_bar(150, 9.15), _bar(160, 9.05)]
+
+
+def _phase1_safe_ratchet_bars():
+    """Two bars that raise high_water_mark a little while staying safely
+    above phase 1's OWN stop (initial_stop_level(9.1, SWING_LOW_BUFFER_
+    PCT) = 9.0545, see specs.md section 13) -- for tests that need the
+    position to survive a ratchet without closing, for reasons unrelated
+    to the two-phase exit itself (duplicate-entry guarding, cross-symbol
+    independence). Also stays BELOW the phase 2 progress threshold
+    (9.1*1.03=9.373), so the position stays in phase 1 throughout, same
+    as _ratchet_bars() was meant to represent under the old design."""
+    return [_bar(150, 9.20), _bar(160, 9.25)]
 
 
 def _sharp_breach_bar():
@@ -153,18 +170,23 @@ def test_entry_fires_on_real_hold_confirmed_transition(tmp_path):
     assert pos.entry_price == 9.1
     assert pos.entry_ts == 140
     assert pos.high_water_mark == 9.1
-    assert pos.stop_level == round(9.1 * (1 - TRAIL_PCT), 10)
+    # Phase 1's own anchor (specs.md section 13), not trail_pct-derived:
+    # round_number_reclaim's trigger_price here (9.25) exceeds entry_price
+    # (9.1) -- confirmed directly against real setup_types output -- so
+    # _phase1_anchor clamps the anchor to entry_price itself.
+    assert pos.stop_level == initial_stop_level(9.1, SWING_LOW_BUFFER_PCT)
+    assert pos.exit_phase == "swing_low"
     assert pos.setup_type == "round_number_reclaim"
 
 
 def test_entry_does_not_duplicate_on_subsequent_confirmed_polls(tmp_path):
     store = JournalStore(tmp_path / "journal.db")
-    fetch = FakeFetch({"AEHL": [_entry_bars(), _ratchet_bars()]})
+    fetch = FakeFetch({"AEHL": [_entry_bars(), _phase1_safe_ratchet_bars()]})
 
     with _client(fetch, journal_store=store) as c:
         assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
         entered = store.open_position_for("AEHL")
-        _resync(c)  # _ratchet_bars -- make sure no second entry sneaks in
+        _resync(c)  # _phase1_safe_ratchet_bars -- make sure no second entry sneaks in
         assert _sym(c, "AEHL")["bar_count"] == 17
 
     assert store.recent_closed() == []
@@ -266,8 +288,8 @@ def test_two_symbols_journal_positions_are_fully_independent(tmp_path):
         # queued batch each, so giving MSFT nothing further to consume is
         # what actually proves it's undisturbed (a no-op catch_up, not
         # raced against AEHL's).
-        "AEHL": [_entry_bars(), _ratchet_bars(), _sharp_breach_bar()],
-        "MSFT": [_entry_bars(), _ratchet_bars()],
+        "AEHL": [_entry_bars(), _phase1_safe_ratchet_bars(), _sharp_breach_bar()],
+        "MSFT": [_entry_bars(), _phase1_safe_ratchet_bars()],
     })
 
     with _client(fetch, journal_store=store, symbol="AEHL") as c:
@@ -360,7 +382,11 @@ def test_changing_trail_pct_via_api_takes_effect_on_the_next_entry_no_restart(tm
         assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
         first = store.open_position_for("AEHL")
         assert first.trail_pct == 0.05
-        assert first.stop_level == round(9.1 * (1 - 0.05), 10)
+        # Entry-time stop_level is phase 1's anchor (specs.md section 13),
+        # NOT trail_pct-derived anymore -- trail_pct is still locked onto
+        # the position (checked above) for when phase 2 eventually takes
+        # over, but doesn't drive the stop at entry itself.
+        assert first.stop_level == initial_stop_level(9.1, SWING_LOW_BUFFER_PCT)
 
         # Change the LIVE value via the real API -- same process, no
         # restart -- then unwatch/re-watch to drive a second, independent
@@ -374,32 +400,48 @@ def test_changing_trail_pct_via_api_takes_effect_on_the_next_entry_no_restart(tm
             assert _wait_until(lambda: _sym(c2, "AEHL").get("bar_count") == 15)
             second = store.open_position_for("AEHL")
             assert second.trail_pct == 0.20            # picked up the new value
-            assert second.stop_level == round(9.1 * (1 - 0.20), 10)
+            # Still phase 1's formula (trail_pct doesn't govern entry
+            # stop_level either way) -- unaffected by the trail_pct change.
+            assert second.stop_level == initial_stop_level(9.1, SWING_LOW_BUFFER_PCT)
 
 
 def test_a_parameter_change_after_entry_does_not_affect_the_open_positions_ratchet(tmp_path):
+    # trail_pct only governs the stop once phase 2 ("trailing") has taken
+    # over (specs.md section 13) -- so THIS test (trail_pct isolation)
+    # needs the position actually in phase 2 to mean anything; a
+    # dedicated transition batch (high water mark clearing entry_price *
+    # 1.03, the default pattern_progress_threshold_pct) does that first.
     store = JournalStore(tmp_path / "journal.db",
                          default_params={"trail_pct": 0.05,
                                          "volume_confirm_threshold": 0.0})
-    fetch = FakeFetch({"AEHL": [_entry_bars(), _ratchet_bars()]})
+    transition_batch = [_bar(150, 9.50)]  # high=9.55 clears 9.1*1.03=9.373
+    post_change_batch = [_bar(160, 9.60)]  # a further, ordinary ratchet
+    fetch = FakeFetch({"AEHL": [_entry_bars(), transition_batch, post_change_batch]})
 
     with _client(fetch, journal_store=store) as c:
         assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
         opened = store.open_position_for("AEHL")
         assert opened.trail_pct == 0.05
+        assert opened.exit_phase == "swing_low"
 
-        # Change the live value WHILE this position is still open.
+        _resync(c)  # transition_batch -- pushes into phase 2
+        transitioned = store.open_position_for("AEHL")
+        assert transitioned is not None
+        assert transitioned.exit_phase == "trailing"
+
+        # Change the live value WHILE this position is still open, now
+        # that it's actually in the phase trail_pct governs.
         r = c.post("/api/strategy_params", json={"trail_pct": 0.50})
         assert r.status_code == 200
 
-        _resync(c)  # _ratchet_bars -- this position's own next decision
+        _resync(c)  # post_change_batch -- this position's own next decision
         ratcheted = store.open_position_for("AEHL")
         assert ratcheted.id == opened.id
         assert ratcheted.trail_pct == 0.05  # still the value locked in at ITS entry
-        # high after ratchet_bars is 9.2 (see _ratchet_bars) -- stop must
-        # reflect the LOCKED 0.05, not the new global 0.50, or this
-        # assertion would read 9.2*0.5=4.6 instead.
-        assert ratcheted.stop_level == round(9.2 * (1 - 0.05), 10)
+        # high after post_change_batch is 9.65 -- stop must reflect the
+        # LOCKED 0.05, not the new global 0.50, or this assertion would
+        # read 9.65*0.5=4.825 instead.
+        assert ratcheted.stop_level == round(9.65 * (1 - 0.05), 10)
 
 
 # -- specs.md section 7: watch_note snapshotted onto the trade at entry ---
@@ -452,14 +494,27 @@ def test_a_closed_trades_note_snapshot_is_unaffected_by_a_later_note_change(tmp_
 # default_params passed by _client below) and risk_pct_per_trade (0.01,
 # app.py's DEFAULT_RISK_PCT_PER_TRADE, since journal_store has no row for
 # it either): risk_amount = 2000*0.01 = 20.0; risk_per_share =
-# 9.1*TRAIL_PCT(0.05) = 0.455; shares = floor(20.0/0.455) = 43;
-# risk_amount_used = 43*0.455 = 19.565. The breach exits at the
-# unmoved initial stop (8.645 = 9.1*0.95, no ratchet step in these
-# fixtures) -- a FULL stop-out therefore loses exactly its own
-# risk_amount_used, dollar for dollar: 43*(8.645-9.1) = -19.565.
+# 9.1*TRAIL_PCT(0.05) = 0.455 (sizing always uses trail_pct, independent
+# of which phase actually prices the stop -- specs.md section 13); shares
+# = floor(20.0/0.455) = 43; risk_amount_used = 43*0.455 = 19.565.
+#
+# The breach itself, though, is now governed by PHASE 1's stop (specs.md
+# section 13), not the flat trail: round_number_reclaim's trigger_price
+# (9.25) exceeds entry_price (9.1) here -- confirmed directly against
+# real setup_types output -- so _phase1_anchor clamps the anchor to
+# entry_price itself. No swing low confirms and no ratchet/transition
+# happens before the sharp breach (only 1 bar arrives since entry, far
+# short of the window=3 confirmation minimum, and the breach bar's own
+# high (8.6) never clears entry_price), so the stop stays fixed at
+# initial_stop_level(9.1, app.py's DEFAULT_SWING_LOW_BUFFER_PCT=0.005) =
+# 9.1*0.995 = 9.0545 the whole time -- a much TIGHTER stop than the flat
+# trail's 8.645 would have been, by design (phase 1 exists to cut a
+# failing pattern early, not ride it down 5%). Loss: 43*(9.0545-9.1) =
+# -1.9565.
 _EXPECTED_SHARES = 43
 _EXPECTED_RISK_AMOUNT_USED = 43 * (9.1 * TRAIL_PCT)
-_EXPECTED_LOSS_DOLLARS = 43 * (8.645 - 9.1)
+_EXPECTED_PHASE1_STOP = initial_stop_level(9.1, SWING_LOW_BUFFER_PCT)
+_EXPECTED_LOSS_DOLLARS = 43 * (_EXPECTED_PHASE1_STOP - 9.1)
 
 
 def test_entry_sizing_is_computed_and_persisted_end_to_end(tmp_path):

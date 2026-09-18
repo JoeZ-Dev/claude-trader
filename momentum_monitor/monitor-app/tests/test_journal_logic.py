@@ -367,6 +367,34 @@ def test_swing_low_phase_falls_back_to_entry_price_when_factors_missing():
     assert updated.stop_level == initial_stop_level(10.0, SWING_LOW_BUFFER_PCT)
 
 
+def test_swing_low_phase_anchor_is_clamped_to_never_exceed_entry_price():
+    # Found live 2026-09-18 (see specs.md): round_number_reclaim's own
+    # trigger_price can legitimately sit ABOVE the confirming bar's own
+    # close (evaluate_hold never retroactively un-confirms on a later
+    # pullback) -- an unclamped anchor there would price phase 1's
+    # "protective" stop above the entry itself, a near-guaranteed
+    # immediate stop-out. entry_price=10.0, trigger_price=10.8 (ABOVE
+    # entry) -- the fallback anchor must clamp to entry_price, not 10.8.
+    pos = _swing_low_position(entry_price=10.0, trigger_price=10.8)
+    updated, exit_event = apply_bar_to_open_position(
+        pos, _bar(10, high=10.1, low=9.99, close=10.05), swing_low_anchor=None)
+    assert updated.stop_level == initial_stop_level(10.0, SWING_LOW_BUFFER_PCT)
+    assert updated.stop_level < 10.0  # a real, sane floor BELOW entry
+    assert exit_event is None
+
+
+def test_swing_low_phase_confirmed_anchor_above_entry_price_is_also_clamped():
+    # Same clamp, the confirmed-swing-low path this time (not just the
+    # trigger-price fallback) -- defensive-but-real: a confirmed swing
+    # low should rarely exceed entry_price in practice, but the
+    # invariant ("phase 1's stop is never above entry") must hold
+    # regardless of which anchor source produced the candidate.
+    pos = _swing_low_position(entry_price=10.0, trigger_price=9.5)
+    updated, _ = apply_bar_to_open_position(
+        pos, _bar(10, high=10.1, low=9.99, close=10.05), swing_low_anchor=10.5)
+    assert updated.stop_level == initial_stop_level(10.0, SWING_LOW_BUFFER_PCT)
+
+
 # -- advance_journal: the per-poll orchestration function -------------------
 
 _ALL_FOUR_TYPES = ("resistance_breakout", "micro_breakout",
@@ -411,7 +439,9 @@ def test_advance_journal_opens_a_new_position_on_fresh_confirmation():
     # Phase 1 (specs.md section 13): anchored to the entry-trigger level
     # (_setup's default trigger_price=10.5), buffered -- NOT
     # entry_price*(1-trail_pct) anymore, that's phase 2's formula only.
-    assert tick.opened.stop_level == 10.5 * (1 - SWING_LOW_BUFFER_PCT)
+    # Clamped to entry_price (10.2 < trigger_price 10.5, see
+    # _phase1_anchor) -- the anchor must never exceed entry_price.
+    assert tick.opened.stop_level == 10.2 * (1 - SWING_LOW_BUFFER_PCT)
     assert tick.opened.exit_phase == "swing_low"
     assert tick.closed is None
     assert tick.confirmed_types_after == {"resistance_breakout"}
@@ -605,7 +635,9 @@ def test_new_entry_uses_the_current_trail_pct_and_locks_it_onto_the_position():
         trail_pct=0.10,  # NOT the module TRAIL_PCT=0.05 default
     )
     assert tick.opened.trail_pct == 0.10
-    assert tick.opened.stop_level == 10.5 * (1 - SWING_LOW_BUFFER_PCT)
+    # Clamped to entry_price (10.2), same as above -- trigger_price (10.5)
+    # exceeds it.
+    assert tick.opened.stop_level == 10.2 * (1 - SWING_LOW_BUFFER_PCT)
     assert tick.opened.volume_threshold_used == VOLUME_CONFIRM_THRESHOLD
 
 
@@ -729,6 +761,21 @@ def test_new_entry_starts_in_swing_low_phase_with_thresholds_locked_in():
     assert tick.opened.swing_low_buffer_pct_used == 0.008
     assert tick.opened.pattern_progress_threshold_pct_used == 0.04
     assert tick.opened.phase_transitioned_ts is None
+
+
+def test_new_entry_stop_level_is_clamped_when_trigger_price_exceeds_entry_price():
+    # Same real scenario as test_swing_low_phase_anchor_is_clamped_..._
+    # entry_price, at entry-construction time this time -- confirmed
+    # directly against real setup_types.evaluate_setups output (see
+    # specs.md): round_number_reclaim can confirm with trigger_price
+    # above the confirming bar's own close.
+    tick = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=9.1)],
+        setups=[_setup("round_number_reclaim", confirmed=True, trigger_price=9.25)],
+    )
+    assert tick.opened.entry_price == 9.1
+    assert tick.opened.stop_level == initial_stop_level(9.1, SWING_LOW_BUFFER_PCT)
+    assert tick.opened.stop_level < tick.opened.entry_price
 
 
 def test_advance_journal_updates_open_position_across_multiple_new_bars():

@@ -123,7 +123,9 @@ import asyncio
 import html
 import json
 import logging
+import os
 import re
+import sys
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -139,6 +141,20 @@ from journal_store import (MAX_WATCH_NOTE_LENGTH, InvalidEquityOverrideError,
                            InvalidParamError, InvalidReverseSplitError,
                            InvalidWatchNoteError)
 from state import build_state
+
+# Same sys.path setup as state.py's own CORE_PATH -- app.py reaches into
+# core/levels.py directly for confirmed_swing_lows (specs.md section 13's
+# early-phase exit), a journal-specific need state.build_state's output
+# has no reason to carry, unlike setups/relative_volume which the WHOLE
+# page displays. Explicit here rather than relying on the side effect of
+# state.py's own sys.path insertion having already run by this point.
+_CORE = os.environ.get("CORE_PATH") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "core"
+)
+if _CORE not in sys.path:
+    sys.path.insert(0, _CORE)
+
+from levels import confirmed_swing_lows  # noqa: E402
 
 # Same exchange-local timezone state.py already anchors session VWAP to
 # (specs.md section 3) -- entry_ts/exit_ts are displayed in it too (Part D,
@@ -168,6 +184,17 @@ DEFAULT_VOLUME_CONFIRM_THRESHOLD = 1.5
 # same fallback-vs-live-tunable split as DEFAULT_TRAIL_PCT above.
 DEFAULT_BASE_EQUITY = 2000.0
 DEFAULT_RISK_PCT_PER_TRADE = 0.01
+# Two-phase exit + session-level volume gate (specs.md section 13). See
+# journal_store.py's _PARAM_BOUNDS comment for the full reasoning behind
+# each default -- these are seed/fallback defaults ONLY, same
+# fallback-vs-live-tunable split as DEFAULT_TRAIL_PCT above.
+DEFAULT_SWING_LOW_BUFFER_PCT = 0.005
+DEFAULT_PATTERN_PROGRESS_THRESHOLD_PCT = 0.03
+DEFAULT_SESSION_VOLUME_MULTIPLE = 3.0
+# How many trading days of daily history to fetch (once per symbol per
+# watch, cached on _SymbolSlot.avg_daily_volume, never per-bar) for the
+# session-level volume gate's baseline.
+DAILY_VOLUME_LOOKBACK_DAYS = 30
 MAX_SYMBOLS = 4
 
 # Real ticker symbols are short and plain (letters/digits, occasionally a
@@ -211,6 +238,13 @@ class _SymbolSlot:
     poll_ok: bool = False
     journal_position: OpenPosition | None = None
     journal_confirmed_types: frozenset[str] = field(default_factory=frozenset)
+    # Fetched ONCE, when the symbol is first added (specs.md section 13's
+    # session-level volume gate), never per-bar -- None if never fetched
+    # yet, or if the fetch failed/returned nothing (too new a symbol, a
+    # data gap), which SKIPS the gate for this symbol's entries rather
+    # than blocking them (see journal_logic.should_enter's documented
+    # choice), not a crash or a silently-wrong zero.
+    avg_daily_volume: float | None = None
 
 
 class Poller:
@@ -223,8 +257,13 @@ class Poller:
                  volume_confirm_threshold=DEFAULT_VOLUME_CONFIRM_THRESHOLD,
                  base_equity=DEFAULT_BASE_EQUITY,
                  risk_pct_per_trade=DEFAULT_RISK_PCT_PER_TRADE,
+                 swing_low_buffer_pct=DEFAULT_SWING_LOW_BUFFER_PCT,
+                 pattern_progress_threshold_pct=DEFAULT_PATTERN_PROGRESS_THRESHOLD_PCT,
+                 session_volume_multiple=DEFAULT_SESSION_VOLUME_MULTIPLE,
+                 fetch_daily_bars=None,
                  now_fn=time.time, max_symbols=MAX_SYMBOLS):
         self._fetch_bars = fetch_bars
+        self._fetch_daily_bars = fetch_daily_bars
         self._initial_symbol = watch_symbol.upper() if watch_symbol else None
         self._announce_watch = announce_watch
         self._announce_unwatch = announce_unwatch
@@ -236,6 +275,9 @@ class Poller:
         self._volume_confirm_threshold = volume_confirm_threshold
         self._base_equity = base_equity
         self._risk_pct_per_trade = risk_pct_per_trade
+        self._swing_low_buffer_pct = swing_low_buffer_pct
+        self._pattern_progress_threshold_pct = pattern_progress_threshold_pct
+        self._session_volume_multiple = session_volume_multiple
         self._now_fn = now_fn
         self._max_symbols = max_symbols
         self._slots: dict[str, _SymbolSlot] = {}
@@ -291,6 +333,11 @@ class Poller:
         payload["watch_note"] = (self._journal_store.current_note_for(symbol)
                                  if self._journal_store is not None else None)
         payload["reverse_splits"] = self.reverse_splits_for(symbol)
+        # The session-level volume gate's cached baseline (specs.md
+        # section 13) -- None means "never fetched" or "fetch failed",
+        # not zero; exposed here mainly so it's directly checkable via
+        # GET /api/state, same as everything else on this page.
+        payload["avg_daily_volume"] = slot.avg_daily_volume
         return payload
 
     def reverse_splits_for(self, symbol: str) -> list[dict]:
@@ -376,6 +423,12 @@ class Poller:
                 "base_equity": {"value": self._base_equity, "updated_at": None},
                 "risk_pct_per_trade": {
                     "value": self._risk_pct_per_trade, "updated_at": None},
+                "swing_low_buffer_pct": {
+                    "value": self._swing_low_buffer_pct, "updated_at": None},
+                "pattern_progress_threshold_pct": {
+                    "value": self._pattern_progress_threshold_pct, "updated_at": None},
+                "session_volume_multiple": {
+                    "value": self._session_volume_multiple, "updated_at": None},
             }
         return self._journal_store.all_params()
 
@@ -454,6 +507,9 @@ class Poller:
             "shares": pos.shares,
             "unrealized_pnl_dollars": (round(unrealized_dollars, 2)
                                        if unrealized_dollars is not None else None),
+            # Two-phase exit (specs.md section 13) -- which mechanism
+            # currently governs this position's own stop_level above.
+            "exit_phase": pos.exit_phase,
         }
 
     async def run(self) -> None:
@@ -506,6 +562,25 @@ class Poller:
             note = f"dropped {oldest} (oldest) to make room for {symbol}"
 
         self._slots[symbol] = _SymbolSlot(symbol=symbol, state=build_state([], symbol))
+        if self._fetch_daily_bars is not None:
+            # Fetched ONCE per symbol, right here at add-time, never
+            # per-bar (specs.md section 13) -- a failure (too new a
+            # symbol, a data gap) SKIPS the session-level volume gate for
+            # this symbol rather than blocking the add or every future
+            # entry, same non-fatal-backfill precedent as catch_up's own
+            # error handling below, never a silent crash.
+            try:
+                daily_bars = await self._fetch_daily_bars(symbol)
+            except Exception as exc:
+                logger.warning(
+                    "daily-volume-history fetch failed for %s; the session-"
+                    "level volume gate will be skipped for this symbol's "
+                    "entries: %s", symbol, exc,
+                )
+                daily_bars = []
+            if daily_bars:
+                self._slots[symbol].avg_daily_volume = (
+                    sum(b["volume"] for b in daily_bars) / len(daily_bars))
         if self._journal_store is not None and watch_note:
             self._journal_store.add_watch_note(symbol, watch_note)
         if self._journal_store is not None:
@@ -779,6 +854,42 @@ class Poller:
         risk_pct_per_trade = self._journal_store.get_param(
             "risk_pct_per_trade", self._risk_pct_per_trade)
         current_equity = self._journal_store.current_equity()
+        # Two-phase exit (specs.md section 13): same live-lookup-then-lock
+        # discipline as every param above -- locked onto a BRAND NEW
+        # entry only, never re-read for an already-open position.
+        swing_low_buffer_pct = self._journal_store.get_param(
+            "swing_low_buffer_pct", self._swing_low_buffer_pct)
+        pattern_progress_threshold_pct = self._journal_store.get_param(
+            "pattern_progress_threshold_pct", self._pattern_progress_threshold_pct)
+        # The swing-low anchor an ALREADY-OPEN position's own ratchet
+        # uses this cycle -- the LOWEST confirmed swing low across the
+        # position's full bar history since its own entry (core/levels.
+        # confirmed_swing_lows, reused not reimplemented; taking the
+        # running MINIMUM across a set that only grows is what makes
+        # "never moves up" true with no extra comparison needed, see
+        # journal_logic.apply_bar_to_open_position). Computed ONLY when
+        # still in phase 1 -- once transitioned to "trailing", this data
+        # is moot and not worth computing every cycle. None (falls back
+        # to the entry-trigger anchor inside journal_logic) until a
+        # first swing low actually confirms.
+        swing_low_anchor = None
+        if (slot.journal_position is not None
+                and slot.journal_position.exit_phase == "swing_low"):
+            bars_since_entry = [b for b in slot.bars
+                                if b["ts"] > slot.journal_position.entry_ts]
+            confirmed = confirmed_swing_lows(bars_since_entry)
+            if confirmed:
+                swing_low_anchor = min(c["price"] for c in confirmed)
+        # Session-level volume gate (specs.md section 13) -- separate
+        # from, and stacking with, relative_volume above. avg_daily_volume
+        # is the ONE-TIME, add-time fetch cached on this slot (never
+        # re-fetched per bar) -- None (skip the gate) if it was never
+        # fetched or the fetch failed, see add_symbol.
+        session_volume_multiple = self._journal_store.get_param(
+            "session_volume_multiple", self._session_volume_multiple)
+        session_cumulative_volume = slot.state.get("session", {}).get(
+            "cumulative_volume", 0.0)
+        avg_daily_volume = slot.avg_daily_volume
         tick = advance_journal(
             position=slot.journal_position, new_bars=new_bars,
             setups=setups, was_confirmed_types=slot.journal_confirmed_types,
@@ -786,6 +897,12 @@ class Poller:
             volume_confirm_threshold=volume_confirm_threshold,
             trail_pct=trail_pct, symbol=symbol, watch_note=watch_note,
             current_equity=current_equity, risk_pct_per_trade=risk_pct_per_trade,
+            swing_low_buffer_pct=swing_low_buffer_pct,
+            pattern_progress_threshold_pct=pattern_progress_threshold_pct,
+            swing_low_anchor=swing_low_anchor,
+            session_cumulative_volume=session_cumulative_volume,
+            avg_daily_volume=avg_daily_volume,
+            session_volume_multiple=session_volume_multiple,
         )
         # tick.closed applies independently of opened/updated -- a stop-out
         # can be immediately followed, within the SAME batch of new_bars,
@@ -1008,6 +1125,12 @@ def _level_chips_html(symbol: str, resistance: dict | None, support: dict | None
     )
 
 
+_EXIT_PHASE_LABELS = {
+    "swing_low": "swing-low anchored (early)",
+    "trailing": "flat trailing",
+}
+
+
 def _journal_open_html(open_block: dict | None) -> str:
     if open_block is None:
         return "<p class='muted'>No open virtual position.</p>"
@@ -1019,11 +1142,14 @@ def _journal_open_html(open_block: dict | None) -> str:
     # both a real share count and a pre-migration "never computed" dash.
     zero_flag = (" <span class='zero-size-flag'>zero-size — no real position</span>"
                 if shares == 0 else "")
+    phase = open_block.get("exit_phase")
+    phase_label = _EXIT_PHASE_LABELS.get(phase, phase)
     return (
         "<table class='detail'>"
         f"<tr><th>symbol</th><td>{html.escape(str(open_block['symbol']))}</td></tr>"
         f"<tr><th>entry price</th><td>{_fmt(open_block['entry_price'], 2)}</td></tr>"
         f"<tr><th>trailing stop</th><td>{_fmt(open_block['stop_level'], 2)}</td></tr>"
+        f"<tr><th>stop phase</th><td>{html.escape(str(phase_label))}</td></tr>"
         f"<tr><th>shares</th><td>{_fmt(shares)}{zero_flag}</td></tr>"
         f"<tr><th>unrealized P&amp;L %</th>"
         f"<td class='{cls}'>{_fmt(open_block['unrealized_pnl_pct'], 2)}%</td></tr>"
@@ -1322,15 +1448,21 @@ function levelChipsHtml(symbol, resistance, support) {
     levelBlockHtml(symbol, 'support', 'Support (nearest below)', support) +
     '</div>';
 }
+var EXIT_PHASE_LABELS = {
+  swing_low: 'swing-low anchored (early)',
+  trailing: 'flat trailing',
+};
 function journalOpenHtml(open) {
   if (!open) return '<p class="muted">No open virtual position.</p>';
   const cls = signClass(open.unrealized_pnl_pct);
   const zeroFlag = open.shares === 0
     ? ' <span class="zero-size-flag">zero-size \\u2014 no real position</span>' : '';
+  const phaseLabel = EXIT_PHASE_LABELS[open.exit_phase] || open.exit_phase;
   return '<table class="detail">' +
     '<tr><th>symbol</th><td>' + esc(open.symbol) + '</td></tr>' +
     '<tr><th>entry price</th><td>' + fmt(open.entry_price, 2) + '</td></tr>' +
     '<tr><th>trailing stop</th><td>' + fmt(open.stop_level, 2) + '</td></tr>' +
+    '<tr><th>stop phase</th><td>' + esc(phaseLabel) + '</td></tr>' +
     '<tr><th>shares</th><td>' + fmt(open.shares, 0) + zeroFlag + '</td></tr>' +
     '<tr><th>unrealized P&amp;L %</th><td class="' + cls + '">' + fmt(open.unrealized_pnl_pct, 2) + '%</td></tr>' +
     '<tr><th>unrealized P&amp;L $</th><td class="' + cls + '">' + fmtDollars(open.unrealized_pnl_dollars) + '</td></tr>' +
@@ -1834,6 +1966,10 @@ def create_app(*, fetch_bars, watch_symbol=None,
                volume_confirm_threshold=DEFAULT_VOLUME_CONFIRM_THRESHOLD,
                base_equity=DEFAULT_BASE_EQUITY,
                risk_pct_per_trade=DEFAULT_RISK_PCT_PER_TRADE,
+               swing_low_buffer_pct=DEFAULT_SWING_LOW_BUFFER_PCT,
+               pattern_progress_threshold_pct=DEFAULT_PATTERN_PROGRESS_THRESHOLD_PCT,
+               session_volume_multiple=DEFAULT_SESSION_VOLUME_MULTIPLE,
+               fetch_daily_bars=None,
                now_fn=time.time, max_symbols=MAX_SYMBOLS) -> FastAPI:
     poller = Poller(fetch_bars=fetch_bars, watch_symbol=watch_symbol,
                     announce_watch=announce_watch,
@@ -1844,6 +1980,10 @@ def create_app(*, fetch_bars, watch_symbol=None,
                     journal_store=journal_store, trail_pct=trail_pct,
                     volume_confirm_threshold=volume_confirm_threshold,
                     base_equity=base_equity, risk_pct_per_trade=risk_pct_per_trade,
+                    swing_low_buffer_pct=swing_low_buffer_pct,
+                    pattern_progress_threshold_pct=pattern_progress_threshold_pct,
+                    session_volume_multiple=session_volume_multiple,
+                    fetch_daily_bars=fetch_daily_bars,
                     now_fn=now_fn, max_symbols=max_symbols)
 
     @asynccontextmanager

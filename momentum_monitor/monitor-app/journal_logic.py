@@ -215,6 +215,25 @@ def initial_stop_level(entry_price: float, trail_pct: float) -> float:
     return entry_price * (1 - trail_pct)
 
 
+def _phase1_anchor(candidate_anchor: float, entry_price: float) -> float:
+    """Clamps a phase 1 (swing_low) stop anchor -- a confirmed swing low,
+    or the entry-trigger fallback -- to never exceed entry_price. Found
+    live 2026-09-18: entry_price is the CONFIRMING bar's own close (the
+    finest granularity available, see advance_journal's docstring), but
+    evaluate_hold's own "once confirmed, a single close back through
+    doesn't retroactively un-confirm history" rule (core/levels.py) means
+    the level that triggered confirmation can sit ABOVE the price the
+    position actually entered at by the time entry fires -- confirmed
+    directly against real setup_types.evaluate_setups output, not
+    inferred: round_number_reclaim confirmed with trigger_price=9.25
+    while the confirming bar's own close was 9.1. An unclamped anchor
+    there would price phase 1's "protective" stop ABOVE the entry itself
+    -- a virtually-guaranteed immediate stop-out, defeating the entire
+    point of a two-phase exit. Clamping to entry_price is what keeps this
+    a real, sane floor in every case, not just the common one."""
+    return min(candidate_anchor, entry_price)
+
+
 def _first_newly_confirmed(setups: list[dict],
                            was_confirmed_types: frozenset[str]) -> dict | None:
     """The first (closest -- setups is pre-sorted ascending by distance,
@@ -338,6 +357,7 @@ def apply_bar_to_open_position(
         trigger_price = ((position.factors or {}).get("trigger_price")
                          or position.entry_price)
         anchor = swing_low_anchor if swing_low_anchor is not None else trigger_price
+        anchor = _phase1_anchor(anchor, position.entry_price)
         buffer_pct = position.swing_low_buffer_pct_used or 0.0
         new_stop = initial_stop_level(anchor, buffer_pct)
 
@@ -500,7 +520,13 @@ def advance_journal(
                 # low can possibly be confirmed yet, this instant is
                 # entry itself -- buffered the same way a real confirmed
                 # low would be, for the same noise-avoidance reason.
-                stop_level=initial_stop_level(trigger_price, swing_low_buffer_pct),
+                # Clamped to entry_price (_phase1_anchor): trigger_price
+                # can sit ABOVE the confirming bar's own close (a real,
+                # confirmed case -- see that function's docstring), and
+                # an unclamped anchor there would price this "protective"
+                # stop above the entry itself.
+                stop_level=initial_stop_level(
+                    _phase1_anchor(trigger_price, entry_price), swing_low_buffer_pct),
                 setup_type=candidate["setup_type"],
                 factors={
                     **candidate["factors"],
