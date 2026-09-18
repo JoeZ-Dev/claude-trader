@@ -290,6 +290,33 @@ def advance_journal(
         ):
             entry_bar = new_bars[-1]
             entry_price = entry_bar["close"]
+            # effective_equity adjusts current_equity for THIS SAME
+            # call's own close, if one just happened (`closed`, set
+            # above) -- found live 2026-09-18 (see specs.md): the
+            # caller (app.py's _update_journal) reads current_equity
+            # ONCE, before calling this function, but a close and a
+            # fresh reopen can both fire in the SAME call (a stop-out
+            # immediately followed by round_number_reclaim re-
+            # confirming, see test_advance_journal_can_both_close_and_
+            # reopen_within_one_batch) -- the close's real dollar P&L
+            # only reaches current_equity in STORAGE after this
+            # function returns (the caller applies it in its own
+            # tick.closed handling), so sizing a same-batch reopen off
+            # the raw current_equity parameter silently uses a value
+            # one close stale. No I/O needed to correct for this: the
+            # just-closed position's own shares/entry_price and the
+            # exit event's exit_price are already fully known here, the
+            # exact same arithmetic close_position itself uses. A
+            # closing position whose shares were never computed (a
+            # pre-migration position) contributes no adjustment, same
+            # "None means skip, never invent a number" convention used
+            # everywhere else this session.
+            effective_equity = current_equity
+            if closed is not None:
+                closed_position, exit_event = closed
+                if closed_position.shares is not None:
+                    effective_equity += closed_position.shares * (
+                        exit_event.exit_price - closed_position.entry_price)
             # risk_per_share is the dollar distance from entry to the
             # initial stop (entry_price * trail_pct, algebraically the
             # same distance initial_stop_level computes below) -- shares
@@ -300,7 +327,7 @@ def advance_journal(
             # REAL amount the rounded share count risks, which can differ
             # slightly from the theoretical risk_amount target above --
             # the real number is what gets recorded.
-            risk_amount = current_equity * risk_pct_per_trade
+            risk_amount = effective_equity * risk_pct_per_trade
             risk_per_share = entry_price * trail_pct
             shares = math.floor(risk_amount / risk_per_share) if risk_per_share > 0 else 0
             risk_amount_used = shares * risk_per_share
@@ -318,7 +345,7 @@ def advance_journal(
                 trail_pct=trail_pct,
                 volume_threshold_used=volume_confirm_threshold,
                 watch_note=watch_note,
-                shares=shares, account_size_used=current_equity,
+                shares=shares, account_size_used=effective_equity,
                 risk_pct_used=risk_pct_per_trade, risk_amount_used=risk_amount_used,
             )
 

@@ -1667,45 +1667,91 @@ primitive itself (`JournalStore.apply_realized_pnl` called twice, back
 to back) and at the full Poller-wiring level (two real symbols, real
 `core/` hold-confirmation transitions, real SQLite file).
 
-**Verified live (2026-09-18), fixture-driven given after-hours, against
-a real running instance pair — production itself was not restarted.**
-Checked first: production had two real open virtual positions (AEMD,
-AIFF) at verification time, so per this project's own standing
-discipline (confirmed in sections 8, 9, and 10) it was left running
-untouched. Verified instead against a separate, real, isolated pair of
-the same unmodified code — `schwab-connector` in `STREAM_SOURCE=replay`
-mode (the project's own existing `fixtures/replay_sample.jsonl`, the
-same AEHL fixture sections 6/8/9 already used, known to cascade through
-several real entry/exit cycles) + `monitor-app`, both real running
-processes, real HTTP API, real SQLite file, `BASE_EQUITY=2000`/
-`RISK_PCT_PER_TRADE=0.01`/`TRAIL_PCT=0.05`. The replay produced 3 real
-closed trades and left a 4th open, all against `AEHL`: `shares` of 54,
-54, 55, then 52 — DIFFERENT counts, because each entry's own
-`account_size_used` genuinely differed (2000.0, 2000.0, 1992.845,
-2047.52 respectively) — confirmed by direct query against the real
-`trades` rows that each one's `account_size_used` exactly equals
-`current_equity` as of THAT position's own entry moment, not some
-global constant. `current_equity` after all three closes was 2097.295
-— confirmed exactly equal to `2000 + (-7.155) + 54.675 + 49.775`, the
-real `realized_pnl_dollars` sum, via a direct query against
-`equity_state` AND independently via `GET /api/equity`. `equity_history`
-held exactly 3 rows, most-recent-first, each `old_value`/`new_value`
-pair chaining correctly to the next (1992.845 → 2047.52 → 2097.295),
-confirming the sequential-compounding requirement against real,
-non-contrived cascading data, not simulated. Then, live against that
-same running instance: `POST /api/strategy_params {"base_equity":
-5000}` followed by `POST /api/equity/reset` moved `current_equity` to
-exactly `5000.0` (the LIVE param, not the 2000 seed), logged
-`"manual_reset"`; `POST /api/equity/override {"value": 750}` moved it
-to `750.0`, logged `"manual_override"`, distinct from the reset;
-`POST /api/equity/override {"value": -5}` returned `409` and changed
-nothing, confirmed via a follow-up `GET /api/equity` still reading
-`750.0`. The rendered page (fetched live, not assumed from the
-template) showed `Current equity: $750.00`, `base_equity=5000.0000`
-and `risk_pct_per_trade=0.0100` on the strategy-params line, and each
-closed row's real `shares`/`P&L $` columns (`$49.77`, `$54.68`,
-`-$7.16`) alongside their existing percentages — confirmed in the
-server-rendered markup itself, not just the JSON API.
+**Incident (2026-09-18, found and fixed same-day): a one-close lag in
+same-batch reopen sizing.** The FIRST live verification pass (below)
+reported `account_size_used` of 2000.0, 2000.0, 1992.845, 2047.52 for
+the 3 closed + 1 open `AEHL` trades, and was initially written up as
+correct. It wasn't: caught by independent arithmetic cross-check
+against the `equity_history` chain (2000.0 → 1992.845 → 2047.52 →
+2097.295) — given the single-position-per-symbol guard forces strict
+entry→close→entry ordering, every entry AFTER the first should have
+shown the equity level as of ITS OWN entry, not the PRIOR entry's
+level. A one-close lag, not random error — exactly the shape of a
+caching/staleness bug, not a one-off arithmetic mistake.
+
+**Root cause, confirmed with fresh instrumented evidence, not
+inferred.** `app.py`'s `_update_journal` read `current_equity` ONCE,
+before calling `advance_journal` — but that SAME call can both close
+the existing position and size a fresh reopen in one shot (a stop-out
+immediately followed by `round_number_reclaim` re-confirming, the
+exact shape `test_advance_journal_can_both_close_and_reopen_within_
+one_batch` already covered for entry mechanics, but never for
+sizing). The close's real dollar P&L only reached `current_equity` in
+storage AFTER `advance_journal` returned (`_update_journal`'s own
+`tick.closed` handling, which runs after `tick.opened`'s sizing was
+already computed and frozen). Confirmed live, not just by re-reading
+the code: temporary instrumentation logged `account_size_used_baked_in`
+against `live_equity_right_now` at the exact instant of each same-batch
+reopen, re-run against the same real replay fixture —
+`account_size_used_baked_in=2000.0` vs. `live_equity_right_now=
+1992.845` for the second entry, `1992.845` vs. `2047.52` for the third,
+`2047.52` vs. `2097.295` for the fourth — caught in the act, three for
+three, then reverted (this was a diagnostic, not a fix).
+
+**The fix.** `journal_logic.advance_journal` now computes an
+`effective_equity` for sizing a same-batch reopen: `current_equity`
+adjusted for the JUST-closed position's own realized P&L
+(`closed_position.shares * (exit_event.exit_price -
+closed_position.entry_price)`), using data already fully available in
+that same call — no I/O needed, since it's the identical arithmetic
+`journal_store.close_position` itself uses. A closing position whose
+`shares` was never computed (a pre-migration position) contributes no
+adjustment, same "`None` means skip, never invent a number" convention
+used everywhere else in this feature. A new regression test
+(`test_advance_journal_reopen_in_the_same_batch_sizes_off_post_close_
+equity`) locks this in at the pure-logic level, independent of the
+live replay.
+
+**Verified live again (2026-09-18), against a fresh replay run, with
+the fix in place — production still not restarted (same two open
+positions as before).** Same real isolated `schwab-connector`
+(`STREAM_SOURCE=replay`) + `monitor-app` pair, same
+`fixtures/replay_sample.jsonl`. The replay produced 3 real closed
+trades and left a 4th open, all against `AEHL`: `shares` of 54, 54,
+57, then 53 (note: 57/53 differ from the pre-fix run's 55/52 — the fix
+changes the ACTUAL sizing, not just its bookkeeping, since a
+same-batch reopen's real risk budget changes too). Direct query
+against the real `trades` rows confirmed every single one's
+`account_size_used` matches `current_equity` as of THAT position's own
+entry moment with NO lag: trade 2's `account_size_used` (1992.845)
+equals `equity_history`'s row for trade 1's close (`new_value`);
+trade 3's (2047.52) equals trade 2's close; trade 4's (2099.105) equals
+trade 3's close. `current_equity` after all three closes was
+`2099.105` — confirmed exactly equal to `2000 + (-7.155) + 54.675 +
+51.585`, the real `realized_pnl_dollars` sum (the third trade's own
+P&L also changed, 49.775 → 51.585, a direct consequence of it having
+been sized off the CORRECT, larger post-close equity this time).
+`equity_history` held exactly 3 rows, most-recent-first, each
+`old_value`/`new_value` pair chaining correctly with zero gaps —
+confirmed against real, non-contrived cascading data, not simulated,
+and specifically checked for the exact defect just fixed, not just
+re-run and eyeballed.
+
+**Reset/override, verified live (2026-09-18) — unaffected by the
+incident above (neither reads/writes mid-batch), re-confirmed
+regardless.** `POST /api/strategy_params {"base_equity": 5000}`
+followed by `POST /api/equity/reset` moved `current_equity` to exactly
+`5000.0` (the LIVE param, not the 2000 seed), logged `"manual_reset"`;
+`POST /api/equity/override {"value": 750}` moved it to `750.0`, logged
+`"manual_override"`, distinct from the reset; `POST /api/equity/
+override {"value": -5}` returned `409` and changed nothing, confirmed
+via a follow-up `GET /api/equity` still reading `750.0`. The rendered
+page (fetched live, not assumed from the template) showed `Current
+equity: $750.00`, `base_equity=5000.0000` and
+`risk_pct_per_trade=0.0100` on the strategy-params line, and each
+closed row's real `shares`/`P&L $` columns alongside their existing
+percentages — confirmed in the server-rendered markup itself, not
+just the JSON API.
 
 ### 12. Roadmap / phases
 

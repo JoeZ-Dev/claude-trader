@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 
@@ -517,6 +518,53 @@ def test_advance_journal_can_both_close_and_reopen_within_one_batch():
     assert tick.opened.setup_type == "round_number_reclaim"
     assert tick.opened.entry_price == 10.55
     assert tick.opened.entry_ts == 20
+
+
+def test_advance_journal_reopen_in_the_same_batch_sizes_off_post_close_equity():
+    # Found live 2026-09-18, caught with fresh instrumented evidence
+    # against a real cascading replay (see specs.md): app.py's
+    # _update_journal reads current_equity ONCE, before calling
+    # advance_journal -- but this SAME call can both close the existing
+    # position (test_advance_journal_can_both_close_and_reopen_within_
+    # one_batch, above) and size a fresh reopen, and the close's real
+    # dollar P&L only reaches current_equity in storage AFTER
+    # advance_journal returns (app.py applies it in the tick.closed
+    # branch, which runs after tick.opened was already computed). A
+    # same-batch reopen must therefore size off current_equity ADJUSTED
+    # for the just-closed position's own realized P&L -- pure
+    # arithmetic already available here (the closing position's own
+    # shares/entry_price, and the exit event's exit_price), not the
+    # raw pre-close value passed in from outside.
+    entry_price = 10.0
+    shares_closing = 100
+    pos = OpenPosition(id=1, symbol="AEHL", entry_ts=0, entry_price=entry_price,
+                       high_water_mark=entry_price,
+                       stop_level=initial_stop_level(entry_price, TRAIL_PCT),
+                       shares=shares_closing, trail_pct=TRAIL_PCT)
+    bars = [
+        _bar(10, high=10.2, low=9.4, close=9.45),    # breaches, closes it
+        _bar(20, high=10.6, low=10.5, close=10.55),  # fresh confirmation bar
+    ]
+    tick = _advance(
+        position=pos, new_bars=bars,
+        setups=[_setup("round_number_reclaim", confirmed=True, distance=0.1)],
+        current_equity=2000.0, risk_pct_per_trade=0.01, trail_pct=TRAIL_PCT,
+    )
+    assert tick.closed is not None
+    closed_position, exit_event = tick.closed
+    closing_pnl_dollars = closed_position.shares * (exit_event.exit_price - closed_position.entry_price)
+    assert closing_pnl_dollars != 0.0  # a real, nonzero closing P&L for this scenario
+
+    assert tick.opened is not None
+    expected_effective_equity = 2000.0 + closing_pnl_dollars
+    assert tick.opened.account_size_used == pytest.approx(expected_effective_equity)
+    # ... which is NOT the raw 2000.0 that was passed in -- the exact bug.
+    assert tick.opened.account_size_used != 2000.0
+
+    risk_amount = expected_effective_equity * 0.01
+    risk_per_share = tick.opened.entry_price * TRAIL_PCT
+    assert tick.opened.shares == math.floor(risk_amount / risk_per_share)
+    assert tick.opened.risk_amount_used == pytest.approx(tick.opened.shares * risk_per_share)
 
 
 def test_advance_journal_no_bars_is_a_safe_noop():
