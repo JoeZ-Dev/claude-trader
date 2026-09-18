@@ -22,10 +22,18 @@ a problem that doesn't exist at this call frequency.
 Schema (specs.md section 6): id, symbol, entry_ts, entry_price,
 high_water_mark (updated live while open), stop_level (updated live
 while open), exit_ts, exit_price, exit_reason (nullable while open),
-realized_pnl_pct (nullable while open).
+realized_pnl_pct (nullable while open), setup_type (added 2026-09-17 --
+which of the four setup types fired, see journal_logic.py), factors
+(added 2026-09-17 -- JSON-encoded dict of the factors behind that entry
+at the moment it happened: distance, trigger_price, relative_volume,
+plus whatever type-specific detail setup_types.SetupCandidate.factors
+carries -- so "why did this trade happen" is answerable later without
+guessing from whatever's currently displayed). Both nullable: a position
+opened before this existed has neither.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
@@ -43,7 +51,9 @@ CREATE TABLE IF NOT EXISTS trades (
     exit_ts INTEGER,
     exit_price REAL,
     exit_reason TEXT,
-    realized_pnl_pct REAL
+    realized_pnl_pct REAL,
+    setup_type TEXT,
+    factors TEXT
 )
 """
 
@@ -79,9 +89,11 @@ class JournalStore:
     def create(self, position: OpenPosition) -> OpenPosition:
         cur = self._conn.execute(
             "INSERT INTO trades (symbol, entry_ts, entry_price, "
-            "high_water_mark, stop_level) VALUES (?, ?, ?, ?, ?)",
+            "high_water_mark, stop_level, setup_type, factors) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (position.symbol.upper(), position.entry_ts, position.entry_price,
-             position.high_water_mark, position.stop_level),
+             position.high_water_mark, position.stop_level, position.setup_type,
+             json.dumps(position.factors) if position.factors is not None else None),
         )
         self._conn.commit()
         return replace(position, id=cur.lastrowid)
@@ -110,7 +122,7 @@ class JournalStore:
             "ORDER BY exit_ts DESC LIMIT ?",
             (limit,),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [_decode_factors(dict(r)) for r in rows]
 
     def delete_closed(self, trade_id: int) -> bool:
         """Permanently deletes one CLOSED trade row by id. Returns True if
@@ -144,5 +156,12 @@ def _row_to_position(row: sqlite3.Row) -> OpenPosition:
     return OpenPosition(
         id=row["id"], symbol=row["symbol"], entry_ts=row["entry_ts"],
         entry_price=row["entry_price"], high_water_mark=row["high_water_mark"],
-        stop_level=row["stop_level"],
+        stop_level=row["stop_level"], setup_type=row["setup_type"],
+        factors=json.loads(row["factors"]) if row["factors"] is not None else None,
     )
+
+
+def _decode_factors(row: dict) -> dict:
+    if row.get("factors") is not None:
+        row["factors"] = json.loads(row["factors"])
+    return row

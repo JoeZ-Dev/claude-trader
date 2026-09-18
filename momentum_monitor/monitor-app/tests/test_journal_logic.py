@@ -4,6 +4,8 @@ import sys
 _APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _APP_DIR)
 
+import pytest
+
 from journal_logic import (
     ExitEvent,
     OpenPosition,
@@ -14,12 +16,27 @@ from journal_logic import (
 )
 
 TRAIL_PCT = 0.05
+VOLUME_CONFIRM_THRESHOLD = 1.5
+HIGH_VOLUME = 2.0   # clears the threshold
+LOW_VOLUME = 1.0    # does not
 
 
 def _bar(ts, *, high, low, close, open_=None):
     o = open_ if open_ is not None else close
     return {"ts": ts, "open": o, "high": high, "low": low, "close": close,
             "volume": 1000.0, "is_extended": False}
+
+
+def _setup(setup_type, *, confirmed, distance=1.0, trigger_price=10.5, **factors):
+    return {
+        "setup_type": setup_type,
+        "trigger_price": trigger_price,
+        "distance": distance,
+        "hold": {"direction": "above", "required_bars": 3,
+                 "consecutive_bars": 3 if confirmed else 1,
+                 "confirmed": confirmed, "failed_attempts": 0},
+        "factors": factors or {"strength_score": 5.0, "touch_count": 2},
+    }
 
 
 # -- initial_stop_level ----------------------------------------------------
@@ -30,27 +47,42 @@ def test_initial_stop_level_is_trail_pct_below_entry():
 
 # -- should_enter ------------------------------------------------------------
 
-def test_should_enter_on_false_to_true_transition_with_no_open_position():
-    assert should_enter(was_confirmed_before=False, is_confirmed_now=True,
-                        position_open=False) is True
+def test_should_enter_on_fresh_confirmation_with_volume_and_no_open_position():
+    assert should_enter(
+        newly_confirmed_type="resistance_breakout", relative_volume=HIGH_VOLUME,
+        volume_confirm_threshold=VOLUME_CONFIRM_THRESHOLD, position_open=False,
+    ) is True
 
 
-def test_should_not_enter_when_already_confirmed_last_poll_too():
-    # no FRESH transition -- was already True
-    assert should_enter(was_confirmed_before=True, is_confirmed_now=True,
-                        position_open=False) is False
-
-
-def test_should_not_enter_when_not_confirmed_now():
-    assert should_enter(was_confirmed_before=False, is_confirmed_now=False,
-                        position_open=False) is False
+def test_should_not_enter_when_nothing_newly_confirmed():
+    assert should_enter(
+        newly_confirmed_type=None, relative_volume=HIGH_VOLUME,
+        volume_confirm_threshold=VOLUME_CONFIRM_THRESHOLD, position_open=False,
+    ) is False
 
 
 def test_should_not_enter_when_position_already_open_even_on_fresh_transition():
     # guards the "only one open position at a time" invariant even if the
     # transition bookkeeping somehow disagreed with position state
-    assert should_enter(was_confirmed_before=False, is_confirmed_now=True,
-                        position_open=True) is False
+    assert should_enter(
+        newly_confirmed_type="resistance_breakout", relative_volume=HIGH_VOLUME,
+        volume_confirm_threshold=VOLUME_CONFIRM_THRESHOLD, position_open=True,
+    ) is False
+
+
+def test_should_not_enter_when_volume_is_below_threshold():
+    assert should_enter(
+        newly_confirmed_type="resistance_breakout", relative_volume=LOW_VOLUME,
+        volume_confirm_threshold=VOLUME_CONFIRM_THRESHOLD, position_open=False,
+    ) is False
+
+
+def test_should_enter_when_volume_is_exactly_at_threshold():
+    assert should_enter(
+        newly_confirmed_type="resistance_breakout",
+        relative_volume=VOLUME_CONFIRM_THRESHOLD,
+        volume_confirm_threshold=VOLUME_CONFIRM_THRESHOLD, position_open=False,
+    ) is True
 
 
 # -- apply_bar_to_open_position: high-water-mark ratchet --------------------
@@ -147,12 +179,25 @@ def test_exit_price_is_the_stop_level_not_the_bar_low():
 
 # -- advance_journal: the per-poll orchestration function -------------------
 
+_ALL_FOUR_TYPES = ("resistance_breakout", "micro_breakout",
+                   "vwap_reclaim", "round_number_reclaim")
+
+
+def _advance(*, position=None, new_bars, setups, was_confirmed_types=frozenset(),
+            relative_volume=HIGH_VOLUME,
+            volume_confirm_threshold=VOLUME_CONFIRM_THRESHOLD, symbol="AEHL"):
+    return advance_journal(
+        position=position, new_bars=new_bars, setups=setups,
+        was_confirmed_types=was_confirmed_types, relative_volume=relative_volume,
+        volume_confirm_threshold=volume_confirm_threshold,
+        trail_pct=TRAIL_PCT, symbol=symbol,
+    )
+
+
 def test_advance_journal_opens_a_new_position_on_fresh_confirmation():
-    tick = advance_journal(
-        position=None,
+    tick = _advance(
         new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
-        is_confirmed_now=True, was_confirmed_before=False,
-        trail_pct=TRAIL_PCT, symbol="AEHL",
+        setups=[_setup("resistance_breakout", confirmed=True)],
     )
     assert tick.opened is not None
     assert tick.opened.entry_price == 10.2
@@ -160,17 +205,134 @@ def test_advance_journal_opens_a_new_position_on_fresh_confirmation():
     assert tick.opened.high_water_mark == 10.2
     assert tick.opened.stop_level == 10.2 * (1 - TRAIL_PCT)
     assert tick.closed is None
-    assert tick.was_confirmed_after is True
+    assert tick.confirmed_types_after == {"resistance_breakout"}
 
 
 def test_advance_journal_does_not_open_a_duplicate_when_already_confirmed():
-    tick = advance_journal(
-        position=None,
+    tick = _advance(
         new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
-        is_confirmed_now=True, was_confirmed_before=True,   # no fresh transition
-        trail_pct=TRAIL_PCT, symbol="AEHL",
+        setups=[_setup("resistance_breakout", confirmed=True)],
+        was_confirmed_types={"resistance_breakout"},   # no fresh transition
     )
     assert tick.opened is None
+
+
+# -- Part A: entry generalized to ALL four setup types, independently ------
+
+@pytest.mark.parametrize("setup_type", _ALL_FOUR_TYPES)
+def test_advance_journal_opens_on_each_setup_type_independently(setup_type):
+    tick = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[_setup(setup_type, confirmed=True)],
+    )
+    assert tick.opened is not None
+    assert tick.opened.setup_type == setup_type
+
+
+def test_advance_journal_a_second_type_confirming_later_still_fires_its_own_entry():
+    # resistance_breakout confirmed and fired (and, in this scenario, has
+    # since closed) an earlier trade; it's STILL sitting confirmed=True.
+    # micro_breakout confirming now is a fresh transition for micro_
+    # breakout specifically, and must fire its own entry -- this is
+    # exactly what a single collapsed "was anything confirmed" boolean
+    # would have missed (see journal_logic.py module docstring).
+    tick = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[
+            _setup("resistance_breakout", confirmed=True, distance=2.0),
+            _setup("micro_breakout", confirmed=True, distance=0.5),
+        ],
+        was_confirmed_types={"resistance_breakout"},
+    )
+    assert tick.opened is not None
+    assert tick.opened.setup_type == "micro_breakout"
+
+
+def test_advance_journal_ties_go_to_the_closest_setup():
+    # setups is pre-sorted ascending by distance (evaluate_setups' own
+    # contract) -- when two types confirm in the same tick, the first
+    # (closest) one in that order wins, deterministically.
+    tick = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[
+            _setup("micro_breakout", confirmed=True, distance=0.2),
+            _setup("resistance_breakout", confirmed=True, distance=1.0),
+        ],
+    )
+    assert tick.opened.setup_type == "micro_breakout"
+
+
+def test_advance_journal_still_guards_against_a_duplicate_open_position():
+    pos = OpenPosition(id=1, symbol="AEHL", entry_ts=0, entry_price=10.0,
+                       high_water_mark=10.0, stop_level=9.5)
+    tick = _advance(
+        position=pos,
+        new_bars=[_bar(10, high=10.2, low=10.1, close=10.15)],
+        setups=[_setup("vwap_reclaim", confirmed=True)],
+    )
+    assert tick.opened is None
+    assert tick.updated is not None  # the existing position just ratcheted
+
+
+# -- Part B: volume confirmation gates entries only, never exits -----------
+
+def test_advance_journal_blocks_entry_when_relative_volume_below_threshold():
+    # Same setup, same fresh confirmation -- the ONLY difference from
+    # test_advance_journal_opens_a_new_position_on_fresh_confirmation is
+    # volume. Proves the gate actually blocks something, not just that it
+    # exists: this exact scenario fires under the old, ungated logic.
+    tick = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[_setup("resistance_breakout", confirmed=True)],
+        relative_volume=LOW_VOLUME,
+    )
+    assert tick.opened is None
+    # still marked "seen" -- doesn't get a second chance later while it
+    # stays confirmed with the same low volume
+    assert tick.confirmed_types_after == {"resistance_breakout"}
+
+
+def test_advance_journal_allows_entry_once_volume_clears_threshold():
+    tick = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[_setup("resistance_breakout", confirmed=True)],
+        relative_volume=HIGH_VOLUME,
+    )
+    assert tick.opened is not None
+
+
+def test_advance_journal_exit_is_never_gated_by_volume():
+    # A position already open, breaching its stop, with LOW relative
+    # volume on the breaching bar -- the exit must fire exactly as if
+    # volume were high. Stops stay fast and unconditional, no exceptions,
+    # same asymmetry core/ has always used (specs.md section 3).
+    pos = OpenPosition(id=1, symbol="AEHL", entry_ts=0, entry_price=10.0,
+                       high_water_mark=10.0, stop_level=9.5)
+    tick = _advance(
+        position=pos,
+        new_bars=[_bar(20, high=10.2, low=9.4, close=9.45)],  # breaches 9.5
+        setups=[],
+        relative_volume=LOW_VOLUME,
+    )
+    assert tick.closed is not None
+    assert tick.closed[1].exit_reason == "trailing_stop"
+
+
+# -- Part C: setup_type / factors captured at the moment of entry ----------
+
+def test_advance_journal_records_setup_type_and_merged_factors_on_entry():
+    tick = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[_setup("resistance_breakout", confirmed=True, distance=1.25,
+                       trigger_price=11.45, strength_score=7.5, touch_count=3)],
+        relative_volume=1.8,
+    )
+    assert tick.opened.setup_type == "resistance_breakout"
+    assert tick.opened.factors["strength_score"] == 7.5
+    assert tick.opened.factors["touch_count"] == 3
+    assert tick.opened.factors["distance"] == 1.25
+    assert tick.opened.factors["trigger_price"] == 11.45
+    assert tick.opened.factors["relative_volume"] == 1.8
 
 
 def test_advance_journal_updates_open_position_across_multiple_new_bars():
@@ -180,10 +342,7 @@ def test_advance_journal_updates_open_position_across_multiple_new_bars():
         _bar(10, high=10.5, low=10.1, close=10.4),
         _bar(20, high=11.0, low=10.6, close=10.9),
     ]
-    tick = advance_journal(
-        position=pos, new_bars=bars, is_confirmed_now=True,
-        was_confirmed_before=True, trail_pct=TRAIL_PCT, symbol="AEHL",
-    )
+    tick = _advance(position=pos, new_bars=bars, setups=[])
     assert tick.updated is not None
     assert tick.updated.high_water_mark == 11.0
     assert tick.updated.stop_level == 11.0 * (1 - TRAIL_PCT)
@@ -199,10 +358,7 @@ def test_advance_journal_closes_position_the_moment_a_bar_breaches_stop():
         _bar(20, high=10.2, low=9.4, close=9.5),      # breaches 9.5
         _bar(30, high=9.6, low=9.5, close=9.55),      # should never be reached
     ]
-    tick = advance_journal(
-        position=pos, new_bars=bars, is_confirmed_now=True,
-        was_confirmed_before=True, trail_pct=TRAIL_PCT, symbol="AEHL",
-    )
+    tick = _advance(position=pos, new_bars=bars, setups=[])
     assert tick.closed is not None
     closed_position, exit_event = tick.closed
     assert exit_event.exit_reason == "trailing_stop"
@@ -210,11 +366,35 @@ def test_advance_journal_closes_position_the_moment_a_bar_breaches_stop():
     assert tick.updated is None
 
 
-def test_advance_journal_no_bars_is_a_safe_noop():
-    tick = advance_journal(
-        position=None, new_bars=[], is_confirmed_now=False,
-        was_confirmed_before=False, trail_pct=TRAIL_PCT, symbol="AEHL",
+def test_advance_journal_can_both_close_and_reopen_within_one_batch():
+    # A stop-out followed immediately, within the SAME batch of new_bars,
+    # by a fresh confirmation (e.g. round_number_reclaim re-confirming on
+    # the next round-number grid point right after a stop-out) -- both
+    # halves are real and JournalTick must report both; found live via
+    # generalizing entry to all four setup types (round_number_reclaim's
+    # "always present" nature makes this a real, not hypothetical,
+    # sequence), and the exact thing app.py's _update_journal must not
+    # silently drop the close half of just because opened is ALSO set.
+    pos = OpenPosition(id=1, symbol="AEHL", entry_ts=0, entry_price=10.0,
+                       high_water_mark=10.0, stop_level=9.5)
+    bars = [
+        _bar(10, high=10.2, low=9.4, close=9.45),    # breaches 9.5, closes it
+        _bar(20, high=10.6, low=10.5, close=10.55),  # fresh confirmation bar
+    ]
+    tick = _advance(
+        position=pos, new_bars=bars,
+        setups=[_setup("round_number_reclaim", confirmed=True, distance=0.1)],
     )
+    assert tick.closed is not None
+    assert tick.closed[1].exit_reason == "trailing_stop"
+    assert tick.opened is not None
+    assert tick.opened.setup_type == "round_number_reclaim"
+    assert tick.opened.entry_price == 10.55
+    assert tick.opened.entry_ts == 20
+
+
+def test_advance_journal_no_bars_is_a_safe_noop():
+    tick = _advance(new_bars=[], setups=[])
     assert tick.opened is None
     assert tick.updated is None
     assert tick.closed is None

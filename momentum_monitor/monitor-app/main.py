@@ -15,6 +15,13 @@ Environment:
                         mark for the virtual journal -- a starting point to
                         tune against real logged data, NOT a validated
                         number (specs.md section 6)        (default 0.05)
+  VOLUME_CONFIRM_THRESHOLD  how far above "average" (1.0 = equal to the
+                        trailing 20-bar volume average) a bar's volume must
+                        be, at the moment a setup type confirms, for a
+                        virtual entry to fire -- a starting point to tune
+                        against real logged data, NOT a validated number,
+                        same treatment as TRAIL_PCT (specs.md section 6)
+                                                            (default 1.5)
 
 Run:  uvicorn main:app --host 0.0.0.0 --port 8012
 """
@@ -36,6 +43,7 @@ CONNECTOR_URL = os.environ.get("SCHWAB_CONNECTOR_URL", "http://schwab-connector:
 WATCH_SYMBOL = os.environ.get("WATCH_SYMBOL") or None
 JOURNAL_DB_PATH = os.environ.get("JOURNAL_DB_PATH", "/data/journal.db")
 TRAIL_PCT = float(os.environ.get("TRAIL_PCT", "0.05"))
+VOLUME_CONFIRM_THRESHOLD = float(os.environ.get("VOLUME_CONFIRM_THRESHOLD", "1.5"))
 
 _client = httpx.AsyncClient(timeout=10.0)
 _journal_store = JournalStore(JOURNAL_DB_PATH)
@@ -98,4 +106,5 @@ async def stream_events(on_bar, on_reconnect, *, base_delay=1.0, max_delay=30.0)
 app = create_app(fetch_bars=fetch_bars, watch_symbol=WATCH_SYMBOL,
                  announce_watch=announce_watch, announce_unwatch=announce_unwatch,
                  stream_events=stream_events,
-                 journal_store=_journal_store, trail_pct=TRAIL_PCT)
+                 journal_store=_journal_store, trail_pct=TRAIL_PCT,
+                 volume_confirm_threshold=VOLUME_CONFIRM_THRESHOLD)

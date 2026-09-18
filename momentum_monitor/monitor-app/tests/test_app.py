@@ -817,9 +817,21 @@ def test_setup_and_level_chips_carry_a_data_key_for_expand_state_restore():
 
 # -- closed-trades table: symbol_switched rows visually muted ------------
 
-def _closed_row(symbol, exit_reason, pnl=1.0, trade_id=1):
+def _closed_row(symbol, exit_reason, pnl=1.0, trade_id=1,
+               entry_ts=1756909800, exit_ts=1756910400):
+    # entry_ts=1756909800 -> 2025-09-03 10:30:00 ET; exit_ts=1756910400
+    # (600s later) -> 2025-09-03 10:40:00 ET.
     return {"id": trade_id, "symbol": symbol, "entry_price": 10.0, "exit_price": 10.1,
-            "exit_reason": exit_reason, "realized_pnl_pct": pnl}
+            "exit_reason": exit_reason, "realized_pnl_pct": pnl,
+            "entry_ts": entry_ts, "exit_ts": exit_ts}
+
+
+def test_closed_row_shows_entry_and_exit_time_human_readable_not_epoch():
+    rows = _journal_closed_rows_html([_closed_row("AEHL", "trailing_stop")])
+    assert "1756909800" not in rows   # raw epoch never shown
+    assert "1756910400" not in rows
+    assert "10:30:00" in rows          # entry, America/New_York
+    assert "10:40:00" in rows          # exit, America/New_York
 
 
 def test_symbol_switched_rows_get_the_muted_housekeeping_class():

@@ -79,6 +79,10 @@ services:
       # a starting point to tune against real logged data, not a validated
       # number.
       TRAIL_PCT: "${TRAIL_PCT:-0.05}"
+      # Minimum relative_volume (1.0 = trailing 20-bar average) required,
+      # at the moment a setup type confirms, for a virtual entry to fire --
+      # same "starting point, not validated" treatment as TRAIL_PCT.
+      VOLUME_CONFIRM_THRESHOLD: "${VOLUME_CONFIRM_THRESHOLD:-1.5}"
     volumes:
       - ./monitor-app/data:/data
     depends_on:

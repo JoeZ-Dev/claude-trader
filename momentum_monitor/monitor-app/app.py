@@ -127,7 +127,9 @@ import re
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from urllib.parse import parse_qs
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -135,9 +137,26 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from journal_logic import ExitEvent, OpenPosition, advance_journal
 from state import build_state
 
+# Same exchange-local timezone state.py already anchors session VWAP to
+# (specs.md section 3) -- entry_ts/exit_ts are displayed in it too (Part D,
+# 2026-09-17), for the same reason: this app has no other timezone
+# convention to be consistent with.
+_NY = ZoneInfo("America/New_York")
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_TRAIL_PCT = 0.05
+# How far above "average" (1.0 = equal to the trailing 20-bar volume
+# average, core/indicators.py's relative_volume) a bar's volume must be,
+# at the moment a setup type confirms, for the entry to actually fire
+# (added 2026-09-17 -- see specs.md). 1.5x is a defensible starting
+# point, not a validated number, same treatment as TRAIL_PCT: high
+# enough to filter a low-conviction drift through a level (the exact
+# false-breakout pattern volume confirmation exists to catch), not so
+# high it requires an extreme spike that would filter out most real
+# breakouts too. Applies to ENTRIES ONLY -- exits stay fast and
+# unconditional, same asymmetry as always (journal_logic.py).
+DEFAULT_VOLUME_CONFIRM_THRESHOLD = 1.5
 MAX_SYMBOLS = 4
 
 # Real ticker symbols are short and plain (letters/digits, occasionally a
@@ -164,16 +183,23 @@ class _SymbolSlot:
     these as scalar fields directly on Poller (self._bars, self._symbol,
     self._journal_position, ...) -- phase 2 needs up to MAX_SYMBOLS of
     these independently and simultaneously, so they move into their own
-    per-symbol object. `journal_position`/`journal_was_confirmed` being
+    per-symbol object. `journal_position`/`journal_confirmed_types` being
     per-slot (not per-Poller) is exactly what makes "at most one open
-    position PER symbol" (rather than one globally) correct."""
+    position PER symbol" (rather than one globally) correct.
+
+    `journal_confirmed_types` (generalized 2026-09-17 from a single
+    `journal_was_confirmed: bool` -- see specs.md) tracks which of the
+    four setup types are CURRENTLY confirmed, per type, not one collapsed
+    boolean -- so a type confirming freshly while a DIFFERENT type is
+    still sitting confirmed from earlier is still detected as its own
+    entry signal (journal_logic.py's should_enter)."""
     symbol: str
     bars: list[dict] = field(default_factory=list)
     last_ts: float = 0.0
     state: dict = field(default_factory=dict)
     poll_ok: bool = False
     journal_position: OpenPosition | None = None
-    journal_was_confirmed: bool = False
+    journal_confirmed_types: frozenset[str] = field(default_factory=frozenset)
 
 
 class Poller:
@@ -182,8 +208,9 @@ class Poller:
                  announce_retry_attempts=ANNOUNCE_RETRY_ATTEMPTS,
                  announce_retry_base_delay=ANNOUNCE_RETRY_BASE_DELAY_SECONDS,
                  announce_retry_max_delay=ANNOUNCE_RETRY_MAX_DELAY_SECONDS,
-                 journal_store=None, trail_pct=DEFAULT_TRAIL_PCT, now_fn=time.time,
-                 max_symbols=MAX_SYMBOLS):
+                 journal_store=None, trail_pct=DEFAULT_TRAIL_PCT,
+                 volume_confirm_threshold=DEFAULT_VOLUME_CONFIRM_THRESHOLD,
+                 now_fn=time.time, max_symbols=MAX_SYMBOLS):
         self._fetch_bars = fetch_bars
         self._initial_symbol = watch_symbol.upper() if watch_symbol else None
         self._announce_watch = announce_watch
@@ -193,6 +220,7 @@ class Poller:
         self._announce_retry_max_delay = announce_retry_max_delay
         self._journal_store = journal_store
         self._trail_pct = trail_pct
+        self._volume_confirm_threshold = volume_confirm_threshold
         self._now_fn = now_fn
         self._max_symbols = max_symbols
         self._slots: dict[str, _SymbolSlot] = {}
@@ -335,12 +363,19 @@ class Poller:
         if self._journal_store is not None:
             # Resume an already-open position for this symbol (a restart,
             # or re-adding something with a position still open) rather
-            # than losing track of it. Seeding journal_was_confirmed to
-            # True when one exists prevents a spurious duplicate-entry
-            # attempt on the very next poll.
+            # than losing track of it. Seeding journal_confirmed_types to
+            # {resumed.setup_type} (the one type that actually opened it)
+            # rather than every type prevents a spurious duplicate-entry
+            # attempt on the very next poll for THAT type, while still
+            # leaving every OTHER type free to fire its own fresh entry
+            # once this position closes -- entry stays blocked either way
+            # while this position is open (should_enter's position_open
+            # guard), this only matters for what's "already seen" once it
+            # closes.
             resumed = self._journal_store.open_position_for(symbol)
             self._slots[symbol].journal_position = resumed
-            self._slots[symbol].journal_was_confirmed = resumed is not None
+            if resumed is not None and resumed.setup_type is not None:
+                self._slots[symbol].journal_confirmed_types = frozenset({resumed.setup_type})
         if self._announce_watch is not None:
             await self._announce_watch_with_retry(symbol)
         if self._poll_enabled:
@@ -532,24 +567,43 @@ class Poller:
             # phase 1: a resumed position was being phantom-stopped-out
             # against its own pre-entry price history on the next poll).
             new_bars = [b for b in new_bars if b["ts"] > slot.journal_position.entry_ts]
-        resistance = slot.state.get("levels", {}).get("resistance")
-        is_confirmed_now = bool(resistance and resistance["hold"]["confirmed"])
+        # Generalized 2026-09-17 (see specs.md and journal_logic.py's
+        # module docstring): entry now fires on ANY of the four setup
+        # types' own confirmation, not just resistance's -- the full
+        # setups list (already sorted closest-first, per
+        # setup_types.evaluate_setups' own contract) goes to
+        # advance_journal instead of a single resistance-only boolean.
+        # relative_volume gates entries only (Part B) -- exits never see
+        # it (apply_bar_to_open_position takes no volume argument at
+        # all).
+        setups = slot.state.get("setups", [])
+        relative_volume = slot.state.get("session", {}).get("relative_volume", 0.0)
         tick = advance_journal(
             position=slot.journal_position, new_bars=new_bars,
-            is_confirmed_now=is_confirmed_now,
-            was_confirmed_before=slot.journal_was_confirmed,
+            setups=setups, was_confirmed_types=slot.journal_confirmed_types,
+            relative_volume=relative_volume,
+            volume_confirm_threshold=self._volume_confirm_threshold,
             trail_pct=self._trail_pct, symbol=symbol,
         )
+        # tick.closed applies independently of opened/updated -- a stop-out
+        # can be immediately followed, within the SAME batch of new_bars,
+        # by a fresh entry on a newly-confirmed type (found via the
+        # generalized entry logic above: round_number_reclaim can re-
+        # confirm on the very next round-number grid point right after a
+        # stop-out). opened/updated stay mutually exclusive by construction
+        # (journal_logic.advance_journal never sets both), but closed+opened
+        # together is a real, valid shape this must not silently drop the
+        # close half of.
+        if tick.closed is not None:
+            position, exit_event = tick.closed
+            self._journal_store.close_position(position, exit_event)
+            slot.journal_position = None
         if tick.opened is not None:
             slot.journal_position = self._journal_store.create(tick.opened)
         elif tick.updated is not None:
             self._journal_store.update_trailing(tick.updated)
             slot.journal_position = tick.updated
-        elif tick.closed is not None:
-            position, exit_event = tick.closed
-            self._journal_store.close_position(position, exit_event)
-            slot.journal_position = None
-        slot.journal_was_confirmed = tick.was_confirmed_after
+        slot.journal_confirmed_types = tick.confirmed_types_after
 
 
 # -- rendering helpers shared in spirit (deliberately, minimally
@@ -567,6 +621,15 @@ def _fmt(v, decimals: int = 4) -> str:
     if isinstance(v, float):
         return f"{v:.{decimals}f}"
     return html.escape(str(v))
+
+
+def _fmt_ts(ts) -> str:
+    """Human-readable, America/New_York (Part D, 2026-09-17 -- entry_ts/
+    exit_ts existed in the schema since phase 4 but were never shown, raw
+    epoch is never displayed)."""
+    if ts is None:
+        return "—"
+    return datetime.fromtimestamp(ts, _NY).strftime("%m/%d %H:%M:%S")
 
 
 def _sign_class(v) -> str:
@@ -741,7 +804,7 @@ def _journal_open_html(open_block: dict | None) -> str:
 
 def _journal_closed_rows_html(closed: list[dict]) -> str:
     if not closed:
-        return "<tr><td colspan='6' class='muted'>No closed trades yet.</td></tr>"
+        return "<tr><td colspan='8' class='muted'>No closed trades yet.</td></tr>"
     rows = []
     for t in closed:
         # symbol_switched isn't a trading outcome -- it's watchlist
@@ -757,7 +820,10 @@ def _journal_closed_rows_html(closed: list[dict]) -> str:
         rows.append(
             f"{row_open}"
             f"<td>{html.escape(str(t['symbol']))}</td>"
-            f"<td>{_fmt(t['entry_price'], 2)}</td><td>{_fmt(t['exit_price'], 2)}</td>"
+            f"<td>{_fmt_ts(t.get('entry_ts'))}</td>"
+            f"<td>{_fmt(t['entry_price'], 2)}</td>"
+            f"<td>{_fmt_ts(t.get('exit_ts'))}</td>"
+            f"<td>{_fmt(t['exit_price'], 2)}</td>"
             f"<td>{html.escape(str(t['exit_reason']))}</td>"
             f"<td class='{cls}'>{pnl}</td>"
             "<td><button type='button' class='remove-btn journal-delete-btn' "
@@ -847,7 +913,8 @@ def _page(full_states: dict[str, dict], recent_closed: list[dict], poll_enabled:
     <span id="clear-status" class="muted"></span>
   </div>
   <table class="detail">
-    <tr><th>symbol</th><th>entry</th><th>exit</th><th>reason</th><th>P&amp;L %</th><th></th></tr>
+    <tr><th>symbol</th><th>entry time</th><th>entry</th><th>exit time</th>
+        <th>exit</th><th>reason</th><th>P&amp;L %</th><th></th></tr>
     <tbody id="journal-closed-tbody">{_journal_closed_rows_html(recent_closed)}</tbody>
   </table>
 </section>
@@ -881,6 +948,17 @@ function fmt(v, d) {
   if (v === null || v === undefined) return '\\u2014';
   if (typeof v === 'number') return v.toFixed(d === undefined ? 4 : d);
   return String(v);
+}
+// Human-readable, America/New_York -- same timezone convention as the
+// Python-rendered first paint (app.py's _fmt_ts), forced explicitly via
+// the Intl timeZone option regardless of the browser's own local zone
+// (Part D, 2026-09-17: entry_ts/exit_ts existed since phase 4, never shown).
+function fmtTs(ts) {
+  if (ts === null || ts === undefined) return '\\u2014';
+  return new Date(ts * 1000).toLocaleString('en-US', {
+    timeZone: 'America/New_York', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  });
 }
 function signClass(v) {
   if (v === null || v === undefined) return '';
@@ -941,7 +1019,7 @@ function journalOpenHtml(open) {
 }
 function journalClosedRows(closed) {
   if (!closed || !closed.length) {
-    return '<tr><td colspan="6" class="muted">No closed trades yet.</td></tr>';
+    return '<tr><td colspan="8" class="muted">No closed trades yet.</td></tr>';
   }
   return closed.map(function(t) {
     // symbol_switched = watchlist housekeeping, not a trading outcome --
@@ -951,8 +1029,10 @@ function journalClosedRows(closed) {
     const cls = isHousekeeping ? 'muted' : signClass(t.realized_pnl_pct);
     const pnl = t.realized_pnl_pct === null ? '' : fmt(t.realized_pnl_pct, 2) + '%';
     const rowOpen = isHousekeeping ? '<tr class="row-housekeeping">' : '<tr>';
-    return rowOpen + '<td>' + esc(t.symbol) + '</td><td>' + fmt(t.entry_price, 2) + '</td>' +
-      '<td>' + fmt(t.exit_price, 2) + '</td><td>' + esc(t.exit_reason) + '</td>' +
+    return rowOpen + '<td>' + esc(t.symbol) + '</td>' +
+      '<td>' + fmtTs(t.entry_ts) + '</td><td>' + fmt(t.entry_price, 2) + '</td>' +
+      '<td>' + fmtTs(t.exit_ts) + '</td><td>' + fmt(t.exit_price, 2) + '</td>' +
+      '<td>' + esc(t.exit_reason) + '</td>' +
       '<td class="' + cls + '">' + pnl + '</td>' +
       '<td><button type="button" class="remove-btn journal-delete-btn" data-trade-id="' +
       esc(t.id) + '">delete</button></td></tr>';
@@ -1381,6 +1461,7 @@ def create_app(*, fetch_bars, watch_symbol=None,
                announce_retry_base_delay=ANNOUNCE_RETRY_BASE_DELAY_SECONDS,
                announce_retry_max_delay=ANNOUNCE_RETRY_MAX_DELAY_SECONDS,
                journal_store=None, trail_pct=DEFAULT_TRAIL_PCT,
+               volume_confirm_threshold=DEFAULT_VOLUME_CONFIRM_THRESHOLD,
                now_fn=time.time, max_symbols=MAX_SYMBOLS) -> FastAPI:
     poller = Poller(fetch_bars=fetch_bars, watch_symbol=watch_symbol,
                     announce_watch=announce_watch,
@@ -1389,6 +1470,7 @@ def create_app(*, fetch_bars, watch_symbol=None,
                     announce_retry_base_delay=announce_retry_base_delay,
                     announce_retry_max_delay=announce_retry_max_delay,
                     journal_store=journal_store, trail_pct=trail_pct,
+                    volume_confirm_threshold=volume_confirm_threshold,
                     now_fn=now_fn, max_symbols=max_symbols)
 
     @asynccontextmanager

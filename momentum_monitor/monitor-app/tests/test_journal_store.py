@@ -43,6 +43,38 @@ def test_create_then_open_position_for_returns_it(tmp_path):
     assert found.stop_level == 9.5
 
 
+def test_create_persists_setup_type_and_factors(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    pos = OpenPosition(id=None, symbol="AEHL", entry_ts=100, entry_price=10.0,
+                       high_water_mark=10.0, stop_level=9.5,
+                       setup_type="micro_breakout",
+                       factors={"strength_score": 5.0, "distance": 0.3,
+                               "relative_volume": 1.8})
+    created = store.create(pos)
+    assert created.setup_type == "micro_breakout"
+    assert created.factors == {"strength_score": 5.0, "distance": 0.3,
+                               "relative_volume": 1.8}
+
+    found = store.open_position_for("AEHL")
+    assert found.setup_type == "micro_breakout"
+    assert found.factors == {"strength_score": 5.0, "distance": 0.3,
+                             "relative_volume": 1.8}
+
+
+def test_setup_type_and_factors_are_retrievable_on_a_closed_trade(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    pos = OpenPosition(id=None, symbol="AEHL", entry_ts=100, entry_price=10.0,
+                       high_water_mark=10.0, stop_level=9.5,
+                       setup_type="vwap_reclaim",
+                       factors={"vwap": 10.05, "relative_volume": 2.1})
+    created = store.create(pos)
+    store.close_position(created, ExitEvent(exit_ts=200, exit_price=11.0,
+                                            exit_reason="trailing_stop"))
+    (closed,) = store.recent_closed()
+    assert closed["setup_type"] == "vwap_reclaim"
+    assert closed["factors"] == {"vwap": 10.05, "relative_volume": 2.1}
+
+
 def test_open_position_for_is_case_insensitive_symbol_match(tmp_path):
     store = JournalStore(tmp_path / "journal.db")
     store.create(_position(symbol="AEHL"))
