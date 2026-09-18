@@ -150,6 +150,10 @@ def build_state(bars: list[dict], symbol: str | None = None) -> dict:
 
     session = session_bars_for_vwap(bars)
     vwap = session_vwap(session)[-1] if session else None
+    # today's cumulative session volume (specs.md section 13's session-
+    # level volume gate) -- the SAME session slice VWAP already uses
+    # above, not a separately-invented one.
+    cumulative_volume = sum(b["volume"] for b in session)
 
     # ema/macd/relative_volume/hold-confirmation are bar-count-windowed and
     # implicitly assume uniform bar width -- see the module docstring and
@@ -188,6 +192,7 @@ def build_state(bars: list[dict], symbol: str | None = None) -> dict:
                 "histogram": round(macd_result["histogram"][-1], 6),
             },
             "relative_volume": round(relvol, 4),
+            "cumulative_volume": round(cumulative_volume, 4),
         },
         "levels": {
             "resistance": _level_block(live_bars, picked["resistance"], "above"),

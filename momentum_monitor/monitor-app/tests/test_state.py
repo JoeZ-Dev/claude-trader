@@ -88,6 +88,16 @@ def test_build_state_on_demo_session_is_sane():
     assert res["hold"]["confirmed"] is False
 
 
+def test_build_state_exposes_session_cumulative_volume():
+    # specs.md section 13's session-level volume gate needs today's
+    # cumulative session volume -- the SAME session slice (session_bars_
+    # for_vwap) VWAP already uses, not a separately-invented one.
+    bars = _load_demo_session()
+    st = build_state(bars, symbol="AEHL")
+    session_bars = session_bars_for_vwap(bars)
+    assert st["session"]["cumulative_volume"] == sum(b["volume"] for b in session_bars)
+
+
 def test_build_state_exposes_level_components_separately():
     bars = _load_demo_session()
     res = build_state(bars)["levels"]["resistance"]
