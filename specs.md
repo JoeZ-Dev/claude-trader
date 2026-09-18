@@ -1167,6 +1167,29 @@ not a per-bug workaround: real interaction tests (click, wait through a
 real timer, assert on the resulting DOM) are now something this project
 can actually run, not just reason about.
 
+**Journal reset point (2026-09-18, following the generalized/volume-
+gated entry logic above).** Every row in `trades` as of this date —
+including the then-open AEMD and AIFF positions — was opened under the
+SUPERSEDED entry rule (resistance-breakout-only, no volume condition):
+not meaningfully comparable to anything entered after this point, and
+carrying it forward would silently mix two different strategies'
+outcomes in the same table. Backed up, not deleted — `docker run --rm
+-v .../monitor-app/data:/data alpine cp journal.db journal.db.pre-
+generalized-entry-reset-20260918-034027Z.bak` (exact copy verified:
+same row count, 18 total / 2 open, before the table was cleared) — kept
+alongside the live file in the same `/data` volume, since keeping it
+costs nothing and it's real history, just not history from the current
+rules. `DELETE FROM trades` then emptied the live table entirely (open
+positions included); `monitor-app` was stopped first and the deletion
+done via a throwaway container against the same volume, specifically to
+avoid a live process's in-memory `_SymbolSlot.journal_position` racing
+against the DB changing underneath it. Confirmed clean on restart:
+`GET /api/state` showed `"recent_closed": []` and `"journal": {"open":
+null}` for all 4 re-watched symbols. Any row in the `.bak` file predates
+generalized, volume-gated entries — read it as a record of the OLD
+resistance-only rule, not as comparable performance data for the
+current one.
+
 ### 7. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
