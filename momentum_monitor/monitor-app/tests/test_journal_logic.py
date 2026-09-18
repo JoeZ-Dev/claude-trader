@@ -19,6 +19,8 @@ TRAIL_PCT = 0.05
 VOLUME_CONFIRM_THRESHOLD = 1.5
 HIGH_VOLUME = 2.0   # clears the threshold
 LOW_VOLUME = 1.0    # does not
+CURRENT_EQUITY = 2000.0
+RISK_PCT_PER_TRADE = 0.01
 
 
 def _bar(ts, *, high, low, close, open_=None):
@@ -186,12 +188,14 @@ _ALL_FOUR_TYPES = ("resistance_breakout", "micro_breakout",
 def _advance(*, position=None, new_bars, setups, was_confirmed_types=frozenset(),
             relative_volume=HIGH_VOLUME,
             volume_confirm_threshold=VOLUME_CONFIRM_THRESHOLD, symbol="AEHL",
-            trail_pct=TRAIL_PCT, watch_note=None):
+            trail_pct=TRAIL_PCT, watch_note=None,
+            current_equity=CURRENT_EQUITY, risk_pct_per_trade=RISK_PCT_PER_TRADE):
     return advance_journal(
         position=position, new_bars=new_bars, setups=setups,
         was_confirmed_types=was_confirmed_types, relative_volume=relative_volume,
         volume_confirm_threshold=volume_confirm_threshold,
         trail_pct=trail_pct, symbol=symbol, watch_note=watch_note,
+        current_equity=current_equity, risk_pct_per_trade=risk_pct_per_trade,
     )
 
 
@@ -385,6 +389,76 @@ def test_new_entry_with_no_note_recorded_is_none_not_empty_string():
         watch_note=None,
     )
     assert tick.opened.watch_note is None
+
+
+# -- position sizing with compounding virtual equity (specs.md section 7) --
+
+def test_new_entry_computes_shares_from_current_equity_risk_pct_and_trail_pct():
+    # risk_amount = 2000 * 0.01 = 20.0; risk_per_share = 10.2 * 0.05 =
+    # 0.51; shares = floor(20.0 / 0.51) = 39; risk_amount_used = 39 *
+    # 0.51 = 19.89 (the REAL amount risked at this rounded share count,
+    # not the theoretical 20.0 target).
+    tick = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[_setup("resistance_breakout", confirmed=True)],
+        current_equity=2000.0, risk_pct_per_trade=0.01, trail_pct=0.05,
+    )
+    assert tick.opened.shares == 39
+    assert tick.opened.account_size_used == 2000.0
+    assert tick.opened.risk_pct_used == 0.01
+    assert tick.opened.risk_amount_used == pytest.approx(19.89)
+
+
+def test_new_entry_sizing_reads_current_equity_and_risk_pct_at_the_moment_of_entry():
+    # A DIFFERENT current_equity/risk_pct_per_trade than the module
+    # defaults -- proves these are read from the live values passed in,
+    # not some frozen module-level constant.
+    tick = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[_setup("resistance_breakout", confirmed=True)],
+        current_equity=5000.0, risk_pct_per_trade=0.02, trail_pct=0.05,
+    )
+    assert tick.opened.account_size_used == 5000.0
+    assert tick.opened.risk_pct_used == 0.02
+    # risk_amount = 100.0; risk_per_share = 10.2*0.05 = 0.51; shares =
+    # floor(100.0/0.51) = 196
+    assert tick.opened.shares == 196
+
+
+def test_new_entry_zero_shares_when_risk_amount_is_smaller_than_one_share():
+    # A tiny current_equity (or tight risk_pct) relative to the stock's
+    # own price/stop distance -- shares rounds DOWN to 0, a real, valid,
+    # journaled outcome (specs.md: "the trade still logs ... but visibly
+    # flagged as zero-size"), never a crash or a negative/fractional count.
+    tick = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[_setup("resistance_breakout", confirmed=True)],
+        current_equity=1.0, risk_pct_per_trade=0.01, trail_pct=0.05,
+    )
+    assert tick.opened.shares == 0
+    assert tick.opened.shares is not None
+    assert tick.opened.risk_amount_used == 0.0
+    assert tick.opened.account_size_used == 1.0
+    assert tick.opened.risk_pct_used == 0.01
+
+
+def test_open_positions_ratcheting_does_not_touch_sizing_fields():
+    # Sizing is an entry-time-only concern -- apply_bar_to_open_position
+    # (via advance_journal's ratchet loop) must never recompute or clear
+    # it on a position that's simply continuing.
+    pos = OpenPosition(id=1, symbol="AEHL", entry_ts=0, entry_price=10.0,
+                       high_water_mark=10.0, stop_level=9.5,
+                       shares=39, account_size_used=2000.0,
+                       risk_pct_used=0.01, risk_amount_used=19.89)
+    tick = _advance(
+        position=pos,
+        new_bars=[_bar(10, high=11.0, low=10.6, close=10.9)],
+        setups=[], current_equity=99999.0,  # a different live value, must be ignored
+    )
+    assert tick.updated.shares == 39
+    assert tick.updated.account_size_used == 2000.0
+    assert tick.updated.risk_pct_used == 0.01
+    assert tick.updated.risk_amount_used == 19.89
 
 
 def test_advance_journal_updates_open_position_across_multiple_new_bars():

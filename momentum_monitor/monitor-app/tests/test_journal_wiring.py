@@ -20,6 +20,7 @@ _APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _APP_DIR)
 sys.path.insert(0, os.path.join(os.path.dirname(_APP_DIR), "core"))
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app import create_app
@@ -442,3 +443,133 @@ def test_a_closed_trades_note_snapshot_is_unaffected_by_a_later_note_change(tmp_
     # the CLOSED trade's own snapshot is the ORIGINAL reason, untouched
     # by the note change that happened while it was still open
     assert closed["watch_note"] == "original reason at entry"
+
+
+# -- position sizing with compounding virtual equity, specs.md section 7 --
+
+# Real numbers for _entry_bars()+_sharp_breach_bar() under this file's
+# default current_equity (2000.0, the journal_store seed fallback -- no
+# default_params passed by _client below) and risk_pct_per_trade (0.01,
+# app.py's DEFAULT_RISK_PCT_PER_TRADE, since journal_store has no row for
+# it either): risk_amount = 2000*0.01 = 20.0; risk_per_share =
+# 9.1*TRAIL_PCT(0.05) = 0.455; shares = floor(20.0/0.455) = 43;
+# risk_amount_used = 43*0.455 = 19.565. The breach exits at the
+# unmoved initial stop (8.645 = 9.1*0.95, no ratchet step in these
+# fixtures) -- a FULL stop-out therefore loses exactly its own
+# risk_amount_used, dollar for dollar: 43*(8.645-9.1) = -19.565.
+_EXPECTED_SHARES = 43
+_EXPECTED_RISK_AMOUNT_USED = 43 * (9.1 * TRAIL_PCT)
+_EXPECTED_LOSS_DOLLARS = 43 * (8.645 - 9.1)
+
+
+def test_entry_sizing_is_computed_and_persisted_end_to_end(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": [_entry_bars()]})
+    with _client(fetch, journal_store=store) as c:
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        pos = store.open_position_for("AEHL")
+
+    assert pos.shares == _EXPECTED_SHARES
+    assert pos.account_size_used == 2000.0
+    assert pos.risk_pct_used == 0.01
+    assert pos.risk_amount_used == pytest.approx(_EXPECTED_RISK_AMOUNT_USED)
+
+
+def test_closed_trade_realized_pnl_dollars_and_compounded_equity_end_to_end(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": [_entry_bars(), _sharp_breach_bar()]})
+    with _client(fetch, journal_store=store) as c:
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        _resync(c)  # sharp breach -- trailing stop trips, trade closes
+        assert store.open_position_for("AEHL") is None
+
+    (closed,) = store.recent_closed()
+    assert closed["realized_pnl_dollars"] == pytest.approx(_EXPECTED_LOSS_DOLLARS)
+    assert store.current_equity() == pytest.approx(2000.0 + _EXPECTED_LOSS_DOLLARS)
+
+    history = store.equity_history()
+    assert len(history) == 1
+    assert history[0]["reason"].startswith(f"trade_close:trade_id={closed['id']}:")
+    assert history[0]["old_value"] == pytest.approx(2000.0)
+    assert history[0]["new_value"] == pytest.approx(2000.0 + _EXPECTED_LOSS_DOLLARS)
+
+
+def test_symbol_switched_force_close_does_not_move_current_equity(tmp_path):
+    # Housekeeping, not a trading outcome (specs.md section 6 -- muted
+    # display, excluded from win/loss, bulk-deletable) -- unwatching a
+    # symbol with an open position must never silently move the virtual
+    # account balance off whatever price happened to be current at that
+    # moment. The row still records a real, honest realized_pnl_dollars
+    # (the fact of what the price move WOULD have been), it just never
+    # reaches current_equity -- see app.py's _update_journal vs.
+    # remove_symbol, the only two callers of close_position.
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": [_entry_bars()]})
+    with _client(fetch, journal_store=store) as c:
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        entered = store.open_position_for("AEHL")
+        assert entered.shares == _EXPECTED_SHARES
+        c.post("/api/unwatch", data={"symbol": "AEHL"})
+        assert _wait_until(lambda: store.open_position_for("AEHL") is None)
+
+    (closed,) = store.recent_closed()
+    assert closed["exit_reason"] == "symbol_switched"
+    assert closed["realized_pnl_dollars"] is not None
+    assert store.current_equity() == 2000.0       # UNCHANGED
+    assert store.equity_history() == []            # no trade_close entry at all
+
+
+def test_two_symbols_closing_in_the_same_resync_batch_compound_equity_sequentially(tmp_path):
+    # The concurrency requirement (specs.md section 7): two REAL trade
+    # closes, for two DIFFERENT symbols, landing within the SAME
+    # resync_all() call -- the real "same processing batch/poll cycle"
+    # shape in this codebase: resync_all() awaits catch_up() for every
+    # watched symbol in turn, all before the caller (here, _resync's
+    # POST /api/polling round trip) gets a response. Proves current_
+    # equity compounds BOTH realized P&L amounts correctly and
+    # sequentially -- neither lost nor double-applied. This is the same
+    # CLASS of bug already found once in this project (app.py's
+    # opened/updated/closed if/elif/elif silently dropping a write when
+    # two things happened in the same batch, Part A of setup-type
+    # generalization, specs.md) in a new location: current_equity's own
+    # update path, not the trades table.
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({
+        "AEHL": [_entry_bars(), _sharp_breach_bar()],
+        "MSFT": [_entry_bars(), _sharp_breach_bar()],
+    })
+
+    with _client(fetch, journal_store=store, symbol="AEHL") as c:
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        c.post("/api/watch", data={"symbol": "MSFT"})
+        assert _wait_until(lambda: _sym(c, "MSFT").get("bar_count") == 15)
+
+        aehl_entry = store.open_position_for("AEHL")
+        msft_entry = store.open_position_for("MSFT")
+        assert aehl_entry.shares == _EXPECTED_SHARES
+        assert msft_entry.shares == _EXPECTED_SHARES
+        # Both entries sized off the SAME starting equity -- neither
+        # symbol has closed yet at either one's own moment of entry.
+        assert aehl_entry.account_size_used == 2000.0
+        assert msft_entry.account_size_used == 2000.0
+
+        # ONE resync_all() call processes AEHL then MSFT in turn
+        # (insertion order == watch order) -- both close within it.
+        _resync(c)
+
+        assert store.open_position_for("AEHL") is None
+        assert store.open_position_for("MSFT") is None
+
+    assert len(store.recent_closed(limit=10)) == 2
+    assert store.current_equity() == pytest.approx(2000.0 + 2 * _EXPECTED_LOSS_DOLLARS)
+
+    history = store.equity_history()
+    assert len(history) == 2
+    # Sequential, not lost or double-applied: the SECOND close (most
+    # recent, history[0]) applied against the equity the FIRST close had
+    # ALREADY moved -- never the original 2000.0 twice over, and never
+    # just one of the two losses alone.
+    assert history[0]["old_value"] == pytest.approx(2000.0 + _EXPECTED_LOSS_DOLLARS)
+    assert history[0]["new_value"] == pytest.approx(2000.0 + 2 * _EXPECTED_LOSS_DOLLARS)
+    assert history[1]["old_value"] == pytest.approx(2000.0)
+    assert history[1]["new_value"] == pytest.approx(2000.0 + _EXPECTED_LOSS_DOLLARS)

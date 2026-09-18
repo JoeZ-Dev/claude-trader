@@ -127,7 +127,7 @@ def test_api_state_shape_has_symbols_recent_closed_poll_enabled_max_symbols():
     with _client(FakeFetch({"AEHL": [_bars(3)]})) as c:
         body = c.get("/api/state").json()
         assert set(body) == {"symbols", "recent_closed", "poll_enabled",
-                             "max_symbols", "strategy_params"}
+                             "max_symbols", "strategy_params", "current_equity"}
         assert isinstance(body["symbols"], dict)
         assert isinstance(body["recent_closed"], list)
         assert body["max_symbols"] == 4
@@ -482,6 +482,9 @@ def test_post_watch_eviction_force_closes_the_evicted_symbols_open_position():
 
         def reverse_splits_for(self, symbol):
             return []
+
+        def current_equity(self):
+            return 2000.0
 
     from journal_logic import OpenPosition
 
@@ -846,6 +849,73 @@ def test_root_page_displays_current_strategy_params_read_only(tmp_path):
         page = c.get("/").text
         assert "id=\"strategy-params\"" in page or "id='strategy-params'" in page
         assert "trail_pct=0.0500" in page
+
+
+# -- position sizing with compounding virtual equity, specs.md section 7 --
+
+def test_get_equity_reports_current_value_and_empty_history_initially(tmp_path):
+    c, store = _client_with_real_store(FakeFetch({}), tmp_path)
+    with c:
+        body = c.get("/api/equity").json()
+        assert body["current_equity"] == 2000.0
+        assert body["history"] == []
+
+
+def test_post_equity_reset_sets_to_live_base_equity_param(tmp_path):
+    c, store = _client_with_real_store(
+        FakeFetch({}), tmp_path,
+        default_params={"trail_pct": 0.05, "volume_confirm_threshold": 1.5,
+                        "base_equity": 2000.0, "risk_pct_per_trade": 0.01})
+    with c:
+        store.apply_realized_pnl(trade_id=1, pnl_dollars=250.0)
+        assert c.get("/api/equity").json()["current_equity"] == 2250.0
+
+        c.post("/api/strategy_params", json={"base_equity": 5000.0})
+        r = c.post("/api/equity/reset")
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+        assert r.json()["current_equity"] == 5000.0
+
+        body = c.get("/api/equity").json()
+        assert body["current_equity"] == 5000.0
+        assert body["history"][0]["reason"] == "manual_reset"
+
+
+def test_post_equity_override_sets_an_arbitrary_value(tmp_path):
+    c, store = _client_with_real_store(FakeFetch({}), tmp_path)
+    with c:
+        r = c.post("/api/equity/override", json={"value": 777.0})
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+        assert c.get("/api/equity").json()["current_equity"] == 777.0
+
+
+def test_post_equity_override_rejects_a_non_positive_value(tmp_path):
+    c, store = _client_with_real_store(FakeFetch({}), tmp_path)
+    with c:
+        r = c.post("/api/equity/override", json={"value": 0.0})
+        assert r.status_code == 409
+        assert r.json()["ok"] is False
+        assert c.get("/api/equity").json()["current_equity"] == 2000.0
+
+
+def test_root_page_displays_current_equity(tmp_path):
+    c, store = _client_with_real_store(FakeFetch({"AEHL": [_bars(3)]}), tmp_path)
+    with c:
+        page = c.get("/").text
+        assert "id=\"current-equity\"" in page or "id='current-equity'" in page
+        assert "$2,000.00" in page
+
+
+def test_root_page_displays_base_equity_and_risk_pct_alongside_strategy_params(tmp_path):
+    c, store = _client_with_real_store(
+        FakeFetch({"AEHL": [_bars(3)]}), tmp_path,
+        default_params={"trail_pct": 0.05, "volume_confirm_threshold": 1.5,
+                        "base_equity": 2000.0, "risk_pct_per_trade": 0.01})
+    with c:
+        page = c.get("/").text
+        assert "base_equity=2000.0000" in page
+        assert "risk_pct_per_trade=0.0100" in page
 
 
 def test_apply_bar_push_reaches_state_the_instant_its_awaited():

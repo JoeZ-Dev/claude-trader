@@ -69,6 +69,31 @@ immutable historical fact, not a live value that could drift out from
 under an already-open position -- there is nothing to lock in at entry
 that `reverse_splits_for(symbol)` doesn't already answer correctly at
 any later point in time.
+
+Also (added 2026-09-18, specs.md section 7's position-sizing gap):
+`trades` gains `shares`/`account_size_used`/`risk_pct_used`/
+`risk_amount_used` (entry-time sizing, LOCKED onto the row the same way
+as trail_pct_used -- see journal_logic.py's OpenPosition) and
+`realized_pnl_dollars` (computed at close from the position's own
+`shares`, alongside the existing `realized_pnl_pct`). All nullable: a
+position opened before these existed has none of them, and a genuinely
+computed zero-share entry (shares=0, a real outcome, see specs.md) is
+never confused with "sizing was never computed" (shares=NULL) -- the
+two read identically in casual display but are stored, and must stay
+distinguishable, as different things. `base_equity`/`risk_pct_per_trade`
+reuse the EXISTING `strategy_params`/`strategy_params_history` mechanism
+above (live-tunable, same validation/history discipline as trail_pct) --
+no new table needed for the params themselves. `current_equity` -- the
+actual running virtual account balance a new entry sizes against -- is
+different in kind from those and gets its own two tables:
+`equity_state` (a single row, `id` fixed at 1, holding the current live
+value) and `equity_history` (id, old_value, new_value, `reason`,
+changed_at) -- an append-only log like strategy_params_history's, but
+with a `reason` field in place of a bare key, since current_equity
+changes through three DIFFERENT kinds of action (a real trade closing,
+an explicit reset to base_equity, an explicit manual override) that
+must stay distinguishable later, not just old-value/new-value pairs
+with no indication of WHICH path produced them.
 """
 from __future__ import annotations
 
@@ -121,6 +146,18 @@ CREATE TABLE IF NOT EXISTS reverse_splits (
     ratio TEXT NOT NULL,
     note TEXT,
     recorded_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS equity_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    value REAL NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS equity_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    old_value REAL,
+    new_value REAL NOT NULL,
+    reason TEXT NOT NULL,
+    changed_at INTEGER NOT NULL
 )
 """
 
@@ -137,6 +174,11 @@ _ADDED_COLUMNS = [
     ("trail_pct_used", "REAL"),
     ("volume_threshold_used", "REAL"),
     ("watch_note", "TEXT"),
+    ("shares", "INTEGER"),
+    ("account_size_used", "REAL"),
+    ("risk_pct_used", "REAL"),
+    ("risk_amount_used", "REAL"),
+    ("realized_pnl_dollars", "REAL"),
 ]
 
 # A note longer than this is rejected outright (409), never silently
@@ -154,15 +196,38 @@ MAX_WATCH_NOTE_LENGTH = 500
 # entry here and is rejected outright, not silently accepted with no
 # bounds check -- a mistyped key should fail loudly, not write a value
 # nothing ever reads.
+# base_equity (specs.md section 7's position-sizing gap) is a dollar
+# account size -- must be positive, with a generous-but-non-absurd
+# ceiling matching this project's existing bounds style (nothing about
+# this virtual journal needs an account size in the tens of millions).
+# risk_pct_per_trade is a fraction of that account risked on a single
+# entry (0.01 = 1%, the same convention the EOD swing bot used) -- 0.5
+# (50%) as a ceiling mirrors trail_pct's own reasoning exactly: already
+# far more than this strategy would ever plausibly risk on one trade,
+# chosen as a sanity ceiling, not a validated "correct" number.
 _PARAM_BOUNDS = {
     "trail_pct": (0.0, 0.5),
     "volume_confirm_threshold": (0.0, 20.0),
+    "base_equity": (0.0, 10_000_000.0),
+    "risk_pct_per_trade": (0.0, 0.5),
 }
+
+# current_equity's own seed/reset fallback (specs.md section 7) -- "2000
+# (the reset target)" per spec. Used when default_params carries no
+# "base_equity" key at all (e.g. journal_store constructed directly in a
+# test with no default_params) and by reset_equity's own get_param
+# fallback -- mirrors get_param's existing "value or explicit default"
+# pattern rather than ever leaving current_equity undefined.
+DEFAULT_BASE_EQUITY = 2000.0
 
 
 class InvalidParamError(ValueError):
     """Raised by set_param for a value outside _PARAM_BOUNDS, or a key
     with no known bounds at all (a mistyped or unsupported key)."""
+
+
+class InvalidEquityOverrideError(ValueError):
+    """Raised by override_equity for a non-positive value."""
 
 
 class InvalidWatchNoteError(ValueError):
@@ -206,6 +271,7 @@ class JournalStore:
         self._conn.executescript(_SCHEMA)
         self._migrate_added_columns()
         self._seed_params(default_params or {})
+        self._seed_equity(default_params or {})
         self._conn.commit()
 
     def _migrate_added_columns(self) -> None:
@@ -230,6 +296,19 @@ class JournalStore:
                     "INSERT INTO strategy_params (key, value, updated_at) VALUES (?, ?, ?)",
                     (key, value, now),
                 )
+
+    def _seed_equity(self, defaults: dict[str, float]) -> None:
+        """current_equity starts at base_equity's seed value, on the
+        FIRST-EVER run only -- same never-reset-on-a-later-restart
+        precedent as _seed_params, since main.py passes the same
+        default_params in on every startup, tuned or not."""
+        existing = self._conn.execute("SELECT 1 FROM equity_state WHERE id = 1").fetchone()
+        if existing is None:
+            base = defaults.get("base_equity", DEFAULT_BASE_EQUITY)
+            self._conn.execute(
+                "INSERT INTO equity_state (id, value, updated_at) VALUES (1, ?, ?)",
+                (base, int(self._now_fn())),
+            )
 
     # -- live-tunable strategy parameters (specs.md section 8) ------------
 
@@ -295,6 +374,93 @@ class JournalStore:
                 "ORDER BY id DESC LIMIT ?",
                 (key, limit),
             ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- compounding virtual equity (specs.md section 7) -------------------
+
+    def current_equity(self) -> float:
+        """The live running account balance a fresh entry sizes against
+        -- never adjusted for unrealized/open positions (specs.md:
+        sizing a new entry while others remain open uses whatever this
+        was as of the last REALIZED close, full stop). Falls back to
+        DEFAULT_BASE_EQUITY only in the never-expected case that
+        equity_state somehow has no row yet (it's always seeded by
+        __init__, same defensive style as get_param's own fallback)."""
+        row = self._conn.execute("SELECT value FROM equity_state WHERE id = 1").fetchone()
+        return row["value"] if row is not None else DEFAULT_BASE_EQUITY
+
+    def _write_equity(self, old_value: float, new_value: float, reason: str) -> float:
+        """The one place that actually moves current_equity -- every
+        caller below (apply_realized_pnl/reset_equity/override_equity)
+        routes through here, so the value+history write can never drift
+        apart or happen out of order. ALWAYS called with an `old_value`
+        read fresh, immediately beforehand, by the caller (never a value
+        cached earlier in a batch of several updates) -- this is what
+        makes two same-batch closes apply sequentially rather than one
+        silently clobbering or double-counting against the other (the
+        same class of bug already found once in this project, app.py's
+        opened/updated/closed if/elif/elif during Part A of setup-type
+        generalization, see specs.md -- guarded against here structurally,
+        not just by convention)."""
+        now = int(self._now_fn())
+        self._conn.execute(
+            "INSERT INTO equity_state (id, value, updated_at) VALUES (1, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET value = excluded.value, "
+            "updated_at = excluded.updated_at",
+            (new_value, now),
+        )
+        self._conn.execute(
+            "INSERT INTO equity_history (old_value, new_value, reason, changed_at) "
+            "VALUES (?, ?, ?, ?)",
+            (old_value, new_value, reason, now),
+        )
+        self._conn.commit()
+        return new_value
+
+    def apply_realized_pnl(self, trade_id: int, pnl_dollars: float) -> float:
+        """The ONLY automatic path that moves current_equity (specs.md:
+        "do this and nothing else moves current_equity automatically") --
+        called once per REAL trade close (never for a symbol_switched
+        housekeeping force-close, see app.py's remove_symbol) with the
+        real realized dollar P&L (shares * (exit_price - entry_price)).
+        reason is machine-parseable (`trade_close:trade_id=<id>:
+        pnl=<+/-X.XX>`) so the full equity curve is reconstructable later
+        with real provenance, not just a bare sequence of numbers."""
+        old = self.current_equity()
+        new = old + pnl_dollars
+        reason = f"trade_close:trade_id={trade_id}:pnl={pnl_dollars:+.2f}"
+        return self._write_equity(old, new, reason)
+
+    def reset_equity(self) -> float:
+        """Sets current_equity to the LIVE base_equity strategy_param
+        (not a frozen constant -- a reset targets whatever base_equity
+        has since been tuned to, per specs.md), logged as "manual_reset"
+        -- distinct from a trade-driven change, never confused with one
+        later."""
+        old = self.current_equity()
+        base = self.get_param("base_equity", DEFAULT_BASE_EQUITY)
+        return self._write_equity(old, base, "manual_reset")
+
+    def override_equity(self, value: float) -> float:
+        """Sets current_equity directly to an arbitrary value -- for
+        correcting a mistake or deliberately starting from a different
+        number, WITHOUT changing what a future reset targets (that's
+        base_equity, untouched here). Raises InvalidEquityOverrideError
+        (changing nothing) for a non-positive value; logged as
+        "manual_override", distinct from "manual_reset"."""
+        if value <= 0:
+            raise InvalidEquityOverrideError(f"value {value!r} must be positive")
+        old = self.current_equity()
+        return self._write_equity(old, value, "manual_override")
+
+    def equity_history(self, limit: int = 50) -> list[dict]:
+        """Most-recent-first log of every current_equity change, with the
+        provenance (`reason`) of which of the three paths produced it --
+        the full equity curve is reconstructable from this, real numbers
+        with real causes, not just a bare sequence."""
+        rows = self._conn.execute(
+            "SELECT * FROM equity_history ORDER BY id DESC LIMIT ?", (limit,),
+        ).fetchall()
         return [dict(r) for r in rows]
 
     # -- watch notes (specs.md section 7's highest-priority gap) ----------
@@ -390,12 +556,15 @@ class JournalStore:
         cur = self._conn.execute(
             "INSERT INTO trades (symbol, entry_ts, entry_price, "
             "high_water_mark, stop_level, setup_type, factors, "
-            "trail_pct_used, volume_threshold_used, watch_note) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "trail_pct_used, volume_threshold_used, watch_note, "
+            "shares, account_size_used, risk_pct_used, risk_amount_used) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (position.symbol.upper(), position.entry_ts, position.entry_price,
              position.high_water_mark, position.stop_level, position.setup_type,
              json.dumps(position.factors) if position.factors is not None else None,
-             position.trail_pct, position.volume_threshold_used, position.watch_note),
+             position.trail_pct, position.volume_threshold_used, position.watch_note,
+             position.shares, position.account_size_used, position.risk_pct_used,
+             position.risk_amount_used),
         )
         self._conn.commit()
         return replace(position, id=cur.lastrowid)
@@ -407,16 +576,29 @@ class JournalStore:
         )
         self._conn.commit()
 
-    def close_position(self, position: OpenPosition, exit_event: ExitEvent) -> None:
+    def close_position(self, position: OpenPosition, exit_event: ExitEvent) -> float | None:
+        """Records the exit, including realized_pnl_dollars computed from
+        this position's OWN locked-in `shares` (shares * (exit_price -
+        entry_price)) -- None (never an invented number) for a position
+        whose shares were never computed (a pre-migration open position,
+        see the migration tests). Returns that same dollar figure (or
+        None) so the caller can decide whether/how to apply it to
+        current_equity -- this method itself never touches current_equity;
+        specs.md is explicit that only the caller's own judgment (a real
+        trade exit vs. e.g. a symbol_switched housekeeping force-close,
+        see app.py's remove_symbol) decides that."""
         pnl_pct = ((exit_event.exit_price - position.entry_price)
                   / position.entry_price * 100.0)
+        pnl_dollars = (position.shares * (exit_event.exit_price - position.entry_price)
+                      if position.shares is not None else None)
         self._conn.execute(
             "UPDATE trades SET exit_ts = ?, exit_price = ?, exit_reason = ?, "
-            "realized_pnl_pct = ? WHERE id = ?",
+            "realized_pnl_pct = ?, realized_pnl_dollars = ? WHERE id = ?",
             (exit_event.exit_ts, exit_event.exit_price, exit_event.exit_reason,
-             pnl_pct, position.id),
+             pnl_pct, pnl_dollars, position.id),
         )
         self._conn.commit()
+        return pnl_dollars
 
     def recent_closed(self, limit: int = 10) -> list[dict]:
         rows = self._conn.execute(
@@ -470,6 +652,8 @@ def _row_to_position(row: sqlite3.Row) -> OpenPosition:
                    else _DEFAULT_TRAIL_PCT),
         volume_threshold_used=row["volume_threshold_used"],
         watch_note=row["watch_note"],
+        shares=row["shares"], account_size_used=row["account_size_used"],
+        risk_pct_used=row["risk_pct_used"], risk_amount_used=row["risk_amount_used"],
     )
 
 

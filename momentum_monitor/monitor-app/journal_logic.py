@@ -68,6 +68,7 @@ by omission.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 
 
@@ -105,6 +106,31 @@ class OpenPosition:
     # answering "why was I watching this" regardless. None if no note
     # was ever recorded for this symbol before this entry.
     watch_note: str | None = None
+    # Position sizing, computed ONCE at entry from the live current_equity/
+    # risk_pct_per_trade values in effect at that exact moment (added
+    # 2026-09-18, specs.md section 7's position-sizing gap) -- same
+    # snapshot-at-entry discipline as trail_pct/watch_note above, and for
+    # the same reason: current_equity keeps moving as later trades close,
+    # so re-deriving these later from "whatever current_equity is now"
+    # would misattribute a trade's own sizing to a value it never actually
+    # used. account_size_used is the current_equity reading itself;
+    # risk_pct_used is the risk_pct_per_trade reading; shares is
+    # floor(risk_amount / risk_per_share), which can be 0 (an expensive
+    # stock, a tight stop, or a small current_equity) -- a real, valid
+    # outcome that still gets journaled, not suppressed, so shares is
+    # never a fallback/sentinel value, only the true computed count.
+    # risk_amount_used is the ACTUAL dollar amount the rounded share count
+    # risks (shares * risk_per_share), which can differ slightly from the
+    # theoretical risk_amount target -- the real number is recorded, not
+    # the theoretical one. All four None for a position opened before this
+    # existed (migrated in place, see journal_store.py) or built directly
+    # in a test/tool without sizing inputs -- never a numeric sentinel
+    # that could be mistaken for a real computed value (0 shares IS a
+    # real, meaningful value; None means "never computed" instead).
+    shares: int | None = None
+    account_size_used: float | None = None
+    risk_pct_used: float | None = None
+    risk_amount_used: float | None = None
 
 
 @dataclass(frozen=True)
@@ -193,7 +219,8 @@ def advance_journal(
     *, position: OpenPosition | None, new_bars: list[dict],
     setups: list[dict], was_confirmed_types: frozenset[str],
     relative_volume: float, volume_confirm_threshold: float,
-    trail_pct: float, symbol: str, watch_note: str | None = None,
+    trail_pct: float, symbol: str, current_equity: float,
+    risk_pct_per_trade: float, watch_note: str | None = None,
 ) -> JournalTick:
     """Run one poll cycle's newly-arrived bars (in order) through the
     journal: if a position is open, walk each new bar ratcheting the stop
@@ -217,6 +244,14 @@ def advance_journal(
     `position` ratchets using ITS OWN locked-in trail_pct
     (apply_bar_to_open_position reads position.trail_pct, not this
     parameter) -- a mid-trade parameter change never reaches it.
+
+    `current_equity`/`risk_pct_per_trade` (2026-09-18, specs.md section 7's
+    position-sizing gap) are likewise the CURRENT live values, read by the
+    caller at the literal moment this function is invoked -- used ONLY to
+    size a brand-new entry (never re-read for an already-open position;
+    apply_bar_to_open_position takes neither). Required, not optional
+    (no default), same treatment as trail_pct -- sizing math has no
+    meaningful zero-effort default the way an optional watch_note does.
     """
     current = position
     updated = None
@@ -255,6 +290,20 @@ def advance_journal(
         ):
             entry_bar = new_bars[-1]
             entry_price = entry_bar["close"]
+            # risk_per_share is the dollar distance from entry to the
+            # initial stop (entry_price * trail_pct, algebraically the
+            # same distance initial_stop_level computes below) -- shares
+            # is how many of those risk_per_share units fit inside this
+            # entry's risk budget, rounded DOWN (never up: overshooting
+            # risk_amount on a rounding technicality would defeat the
+            # whole point of a risk-based size). risk_amount_used is the
+            # REAL amount the rounded share count risks, which can differ
+            # slightly from the theoretical risk_amount target above --
+            # the real number is what gets recorded.
+            risk_amount = current_equity * risk_pct_per_trade
+            risk_per_share = entry_price * trail_pct
+            shares = math.floor(risk_amount / risk_per_share) if risk_per_share > 0 else 0
+            risk_amount_used = shares * risk_per_share
             opened = OpenPosition(
                 id=None, symbol=symbol, entry_ts=entry_bar["ts"],
                 entry_price=entry_price, high_water_mark=entry_price,
@@ -269,6 +318,8 @@ def advance_journal(
                 trail_pct=trail_pct,
                 volume_threshold_used=volume_confirm_threshold,
                 watch_note=watch_note,
+                shares=shares, account_size_used=current_equity,
+                risk_pct_used=risk_pct_per_trade, risk_amount_used=risk_amount_used,
             )
 
     return JournalTick(opened=opened, updated=updated, closed=closed,

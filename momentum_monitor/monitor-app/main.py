@@ -26,6 +26,17 @@ Environment:
                         virtual entry to fire (specs.md section 6) -- same
                         seed-only treatment as TRAIL_PCT above, live-tuned
                         via the API from then on     (default 1.5)
+  BASE_EQUITY           dollar "reset target" for the virtual account --
+                        position sizing with compounding equity (specs.md
+                        section 7) -- same seed-only treatment as TRAIL_PCT:
+                        read once, on the very first run against a given
+                        journal.db, to seed BOTH the live-tunable
+                        strategy_params row AND current_equity's own
+                        starting value. Every run after that reads the DB,
+                        not this env var                (default 2000)
+  RISK_PCT_PER_TRADE     fraction of current_equity risked on a single
+                        entry (0.01 = 1%, same convention the EOD swing bot
+                        used) -- same seed-only treatment  (default 0.01)
 
 Run:  uvicorn main:app --host 0.0.0.0 --port 8012
 """
@@ -48,11 +59,15 @@ WATCH_SYMBOL = os.environ.get("WATCH_SYMBOL") or None
 JOURNAL_DB_PATH = os.environ.get("JOURNAL_DB_PATH", "/data/journal.db")
 TRAIL_PCT = float(os.environ.get("TRAIL_PCT", "0.05"))
 VOLUME_CONFIRM_THRESHOLD = float(os.environ.get("VOLUME_CONFIRM_THRESHOLD", "1.5"))
+BASE_EQUITY = float(os.environ.get("BASE_EQUITY", "2000"))
+RISK_PCT_PER_TRADE = float(os.environ.get("RISK_PCT_PER_TRADE", "0.01"))
 
 _client = httpx.AsyncClient(timeout=10.0)
 _journal_store = JournalStore(JOURNAL_DB_PATH, default_params={
     "trail_pct": TRAIL_PCT,
     "volume_confirm_threshold": VOLUME_CONFIRM_THRESHOLD,
+    "base_equity": BASE_EQUITY,
+    "risk_pct_per_trade": RISK_PCT_PER_TRADE,
 })
 
 
@@ -114,4 +129,5 @@ app = create_app(fetch_bars=fetch_bars, watch_symbol=WATCH_SYMBOL,
                  announce_watch=announce_watch, announce_unwatch=announce_unwatch,
                  stream_events=stream_events,
                  journal_store=_journal_store, trail_pct=TRAIL_PCT,
-                 volume_confirm_threshold=VOLUME_CONFIRM_THRESHOLD)
+                 volume_confirm_threshold=VOLUME_CONFIRM_THRESHOLD,
+                 base_equity=BASE_EQUITY, risk_pct_per_trade=RISK_PCT_PER_TRADE)

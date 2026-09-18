@@ -135,8 +135,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from journal_logic import ExitEvent, OpenPosition, advance_journal
-from journal_store import (MAX_WATCH_NOTE_LENGTH, InvalidParamError,
-                           InvalidReverseSplitError, InvalidWatchNoteError)
+from journal_store import (MAX_WATCH_NOTE_LENGTH, InvalidEquityOverrideError,
+                           InvalidParamError, InvalidReverseSplitError,
+                           InvalidWatchNoteError)
 from state import build_state
 
 # Same exchange-local timezone state.py already anchors session VWAP to
@@ -159,6 +160,14 @@ DEFAULT_TRAIL_PCT = 0.05
 # breakouts too. Applies to ENTRIES ONLY -- exits stay fast and
 # unconditional, same asymmetry as always (journal_logic.py).
 DEFAULT_VOLUME_CONFIRM_THRESHOLD = 1.5
+# Position sizing with compounding virtual equity (specs.md section 7).
+# base_equity is the dollar "reset target" a fresh journal starts from
+# and a manual reset returns to; risk_pct_per_trade (1%) is the same
+# convention the EOD swing bot used. Both are seed/fallback defaults
+# ONLY -- see journal_store.py's DEFAULT_BASE_EQUITY and _PARAM_BOUNDS,
+# same fallback-vs-live-tunable split as DEFAULT_TRAIL_PCT above.
+DEFAULT_BASE_EQUITY = 2000.0
+DEFAULT_RISK_PCT_PER_TRADE = 0.01
 MAX_SYMBOLS = 4
 
 # Real ticker symbols are short and plain (letters/digits, occasionally a
@@ -212,6 +221,8 @@ class Poller:
                  announce_retry_max_delay=ANNOUNCE_RETRY_MAX_DELAY_SECONDS,
                  journal_store=None, trail_pct=DEFAULT_TRAIL_PCT,
                  volume_confirm_threshold=DEFAULT_VOLUME_CONFIRM_THRESHOLD,
+                 base_equity=DEFAULT_BASE_EQUITY,
+                 risk_pct_per_trade=DEFAULT_RISK_PCT_PER_TRADE,
                  now_fn=time.time, max_symbols=MAX_SYMBOLS):
         self._fetch_bars = fetch_bars
         self._initial_symbol = watch_symbol.upper() if watch_symbol else None
@@ -223,6 +234,8 @@ class Poller:
         self._journal_store = journal_store
         self._trail_pct = trail_pct
         self._volume_confirm_threshold = volume_confirm_threshold
+        self._base_equity = base_equity
+        self._risk_pct_per_trade = risk_pct_per_trade
         self._now_fn = now_fn
         self._max_symbols = max_symbols
         self._slots: dict[str, _SymbolSlot] = {}
@@ -360,6 +373,9 @@ class Poller:
                 "trail_pct": {"value": self._trail_pct, "updated_at": None},
                 "volume_confirm_threshold": {
                     "value": self._volume_confirm_threshold, "updated_at": None},
+                "base_equity": {"value": self._base_equity, "updated_at": None},
+                "risk_pct_per_trade": {
+                    "value": self._risk_pct_per_trade, "updated_at": None},
             }
         return self._journal_store.all_params()
 
@@ -380,18 +396,64 @@ class Poller:
             return []
         return self._journal_store.param_history(key, limit)
 
+    def current_equity(self) -> float:
+        """The live virtual account balance (specs.md section 7) --
+        falls back to the constructor-provided base_equity default when
+        journaling is disabled, same "still report something meaningful"
+        precedent as strategy_params()'s own no-store branch."""
+        if self._journal_store is None:
+            return self._base_equity
+        return self._journal_store.current_equity()
+
+    def equity_history(self, limit: int = 50) -> list[dict]:
+        if self._journal_store is None:
+            return []
+        return self._journal_store.equity_history(limit)
+
+    def reset_equity(self) -> tuple[bool, float | str]:
+        """Sets current_equity to the live base_equity param, logged
+        distinctly from a trade-driven change (specs.md section 7).
+        Returns (False, reason) if journaling is disabled; (True,
+        new_value) on success."""
+        if self._journal_store is None:
+            return False, "journaling is disabled"
+        new_value = self._journal_store.reset_equity()
+        self._broadcast_state()
+        return True, new_value
+
+    def override_equity(self, value: float) -> tuple[bool, str]:
+        """Sets current_equity directly, without touching base_equity
+        (specs.md section 7) -- (False, reason) for journaling disabled
+        or (propagated) InvalidEquityOverrideError's message for a
+        non-positive value; (True, "") on success."""
+        if self._journal_store is None:
+            return False, "journaling is disabled"
+        try:
+            self._journal_store.override_equity(value)
+        except InvalidEquityOverrideError as exc:
+            return False, str(exc)
+        self._broadcast_state()
+        return True, ""
+
     def _journal_open_for(self, slot: _SymbolSlot) -> dict | None:
         if slot.journal_position is None:
             return None
-        last_price = (slot.bars[-1]["close"] if slot.bars
-                     else slot.journal_position.entry_price)
-        unrealized_pct = ((last_price - slot.journal_position.entry_price)
-                          / slot.journal_position.entry_price * 100.0)
+        pos = slot.journal_position
+        last_price = slot.bars[-1]["close"] if slot.bars else pos.entry_price
+        unrealized_pct = (last_price - pos.entry_price) / pos.entry_price * 100.0
+        # shares/unrealized $ (specs.md section 7): real dollar P&L, now
+        # that a real share count exists -- None (never a fabricated 0)
+        # for a pre-migration position whose shares were never computed.
+        unrealized_dollars = (pos.shares * (last_price - pos.entry_price)
+                              if pos.shares is not None else None)
         return {
-            "symbol": slot.journal_position.symbol,
-            "entry_price": round(slot.journal_position.entry_price, 4),
-            "stop_level": round(slot.journal_position.stop_level, 4),
+            "symbol": pos.symbol,
+            "entry_price": round(pos.entry_price, 4),
+            "stop_level": round(pos.stop_level, 4),
             "unrealized_pnl_pct": round(unrealized_pct, 4),
+            "shares": pos.shares,
+            "unrealized_pnl_dollars": (round(unrealized_dollars, 2)
+                                       if unrealized_dollars is not None else None),
         }
 
     async def run(self) -> None:
@@ -648,6 +710,7 @@ class Poller:
             "poll_enabled": self.poll_enabled,
             "max_symbols": self.max_symbols,
             "strategy_params": self.strategy_params(),
+            "current_equity": self.current_equity(),
         }
 
     def _broadcast_state(self) -> None:
@@ -708,12 +771,21 @@ class Poller:
         # live-lookup-then-lock pattern as trail_pct/volume_confirm_
         # threshold above, not a live reference kept on the position.
         watch_note = self._journal_store.current_note_for(symbol)
+        # Position sizing (specs.md section 7): current_equity/
+        # risk_pct_per_trade read fresh from the store on EVERY decision,
+        # same live-lookup-then-lock discipline as trail_pct/watch_note
+        # above -- advance_journal only actually uses these when a BRAND
+        # NEW entry fires, and locks them onto that position permanently.
+        risk_pct_per_trade = self._journal_store.get_param(
+            "risk_pct_per_trade", self._risk_pct_per_trade)
+        current_equity = self._journal_store.current_equity()
         tick = advance_journal(
             position=slot.journal_position, new_bars=new_bars,
             setups=setups, was_confirmed_types=slot.journal_confirmed_types,
             relative_volume=relative_volume,
             volume_confirm_threshold=volume_confirm_threshold,
             trail_pct=trail_pct, symbol=symbol, watch_note=watch_note,
+            current_equity=current_equity, risk_pct_per_trade=risk_pct_per_trade,
         )
         # tick.closed applies independently of opened/updated -- a stop-out
         # can be immediately followed, within the SAME batch of new_bars,
@@ -726,7 +798,19 @@ class Poller:
         # close half of.
         if tick.closed is not None:
             position, exit_event = tick.closed
-            self._journal_store.close_position(position, exit_event)
+            pnl_dollars = self._journal_store.close_position(position, exit_event)
+            # The ONLY automatic path that compounds current_equity
+            # (specs.md section 7) -- a REAL trade exit, never the
+            # symbol_switched housekeeping force-close in remove_symbol
+            # below, which calls close_position directly and deliberately
+            # does not reach this line. pnl_dollars is None (skip, don't
+            # apply a fabricated 0) only for a pre-migration position
+            # whose shares were never computed; a genuine zero-share
+            # trade's pnl_dollars is 0.0, which DOES apply (a real,
+            # well-defined no-op change, still logged with real
+            # provenance).
+            if pnl_dollars is not None:
+                self._journal_store.apply_realized_pnl(position.id, pnl_dollars)
             slot.journal_position = None
         if tick.opened is not None:
             slot.journal_position = self._journal_store.create(tick.opened)
@@ -751,6 +835,13 @@ def _fmt(v, decimals: int = 4) -> str:
     if isinstance(v, float):
         return f"{v:.{decimals}f}"
     return html.escape(str(v))
+
+
+def _fmt_dollars(v) -> str:
+    if v is None:
+        return "—"
+    sign = "-" if v < 0 else ""
+    return f"{sign}${abs(v):,.2f}"
 
 
 def _fmt_ts(ts) -> str:
@@ -921,20 +1012,30 @@ def _journal_open_html(open_block: dict | None) -> str:
     if open_block is None:
         return "<p class='muted'>No open virtual position.</p>"
     cls = _sign_class(open_block["unrealized_pnl_pct"])
+    shares = open_block.get("shares")
+    # A genuinely computed zero-share entry (specs.md section 7: "the
+    # trade still logs ... but visibly flagged as zero-size") must never
+    # look like a real position at a glance -- flagged distinctly from
+    # both a real share count and a pre-migration "never computed" dash.
+    zero_flag = (" <span class='zero-size-flag'>zero-size — no real position</span>"
+                if shares == 0 else "")
     return (
         "<table class='detail'>"
         f"<tr><th>symbol</th><td>{html.escape(str(open_block['symbol']))}</td></tr>"
         f"<tr><th>entry price</th><td>{_fmt(open_block['entry_price'], 2)}</td></tr>"
         f"<tr><th>trailing stop</th><td>{_fmt(open_block['stop_level'], 2)}</td></tr>"
+        f"<tr><th>shares</th><td>{_fmt(shares)}{zero_flag}</td></tr>"
         f"<tr><th>unrealized P&amp;L %</th>"
         f"<td class='{cls}'>{_fmt(open_block['unrealized_pnl_pct'], 2)}%</td></tr>"
+        f"<tr><th>unrealized P&amp;L $</th>"
+        f"<td class='{cls}'>{_fmt_dollars(open_block.get('unrealized_pnl_dollars'))}</td></tr>"
         "</table>"
     )
 
 
 def _journal_closed_rows_html(closed: list[dict]) -> str:
     if not closed:
-        return "<tr><td colspan='8' class='muted'>No closed trades yet.</td></tr>"
+        return "<tr><td colspan='10' class='muted'>No closed trades yet.</td></tr>"
     rows = []
     for t in closed:
         # symbol_switched isn't a trading outcome -- it's watchlist
@@ -945,7 +1046,13 @@ def _journal_closed_rows_html(closed: list[dict]) -> str:
         # win/loss at a glance -- see specs.md section 6.
         is_housekeeping = t["exit_reason"] == "symbol_switched"
         cls = "muted" if is_housekeeping else _sign_class(t["realized_pnl_pct"])
-        pnl = "" if t["realized_pnl_pct"] is None else f"{_fmt(t['realized_pnl_pct'], 2)}%"
+        pnl_pct = "" if t["realized_pnl_pct"] is None else f"{_fmt(t['realized_pnl_pct'], 2)}%"
+        pnl_dollars = _fmt_dollars(t.get("realized_pnl_dollars"))
+        shares = t.get("shares")
+        # Same zero-size-vs-never-computed distinction as the open
+        # position block (specs.md section 7) -- 0 flagged, None a dash.
+        shares_html = (f"{shares} <span class='zero-size-flag'>zero-size</span>"
+                      if shares == 0 else _fmt(shares))
         row_open = "<tr class='row-housekeeping'>" if is_housekeeping else "<tr>"
         rows.append(
             f"{row_open}"
@@ -955,7 +1062,9 @@ def _journal_closed_rows_html(closed: list[dict]) -> str:
             f"<td>{_fmt_ts(t.get('exit_ts'))}</td>"
             f"<td>{_fmt(t['exit_price'], 2)}</td>"
             f"<td>{html.escape(str(t['exit_reason']))}</td>"
-            f"<td class='{cls}'>{pnl}</td>"
+            f"<td>{shares_html}</td>"
+            f"<td class='{cls}'>{pnl_pct}</td>"
+            f"<td class='{cls}'>{pnl_dollars}</td>"
             "<td><button type='button' class='remove-btn journal-delete-btn' "
             f"data-trade-id='{t['id']}'>delete</button></td>"
             "</tr>"
@@ -1085,8 +1194,15 @@ def _strategy_params_html(params: dict) -> str:
     return " · ".join(parts)
 
 
+def _current_equity_html(value: float) -> str:
+    # Prominent, above the strategy-params line (specs.md section 7) --
+    # id="current-equity" so render() can refresh it in place on every
+    # push, same pattern as strategy-params itself.
+    return f"<p id='current-equity'><strong>Current equity: {_fmt_dollars(value)}</strong></p>"
+
+
 def _page(full_states: dict[str, dict], recent_closed: list[dict], poll_enabled: bool,
-          max_symbols: int, strategy_params: dict) -> str:
+          max_symbols: int, strategy_params: dict, current_equity: float) -> str:
     if full_states:
         cards_html = "".join(_symbol_card_html(sym, st) for sym, st in full_states.items())
     else:
@@ -1094,6 +1210,7 @@ def _page(full_states: dict[str, dict], recent_closed: list[dict], poll_enabled:
                       f"(up to {max_symbols}).</p>")
 
     body = f"""
+{_current_equity_html(current_equity)}
 <p id="strategy-params" class="muted">{_strategy_params_html(strategy_params)}</p>
 {_watch_form_html(len(full_states), max_symbols)}
 <div id="symbols" class="grid">{cards_html}</div>
@@ -1105,7 +1222,8 @@ def _page(full_states: dict[str, dict], recent_closed: list[dict], poll_enabled:
   </div>
   <table class="detail">
     <tr><th>symbol</th><th>entry time</th><th>entry</th><th>exit time</th>
-        <th>exit</th><th>reason</th><th>P&amp;L %</th><th></th></tr>
+        <th>exit</th><th>reason</th><th>shares</th><th>P&amp;L %</th>
+        <th>P&amp;L $</th><th></th></tr>
     <tbody id="journal-closed-tbody">{_journal_closed_rows_html(recent_closed)}</tbody>
   </table>
 </section>
@@ -1139,6 +1257,12 @@ function fmt(v, d) {
   if (v === null || v === undefined) return '\\u2014';
   if (typeof v === 'number') return v.toFixed(d === undefined ? 4 : d);
   return String(v);
+}
+// Mirrors _fmt_dollars (Python side).
+function fmtDollars(v) {
+  if (v === null || v === undefined) return '\\u2014';
+  const sign = v < 0 ? '-' : '';
+  return sign + '$' + Math.abs(v).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
 }
 // Human-readable, America/New_York -- same timezone convention as the
 // Python-rendered first paint (app.py's _fmt_ts), forced explicitly via
@@ -1201,16 +1325,20 @@ function levelChipsHtml(symbol, resistance, support) {
 function journalOpenHtml(open) {
   if (!open) return '<p class="muted">No open virtual position.</p>';
   const cls = signClass(open.unrealized_pnl_pct);
+  const zeroFlag = open.shares === 0
+    ? ' <span class="zero-size-flag">zero-size \\u2014 no real position</span>' : '';
   return '<table class="detail">' +
     '<tr><th>symbol</th><td>' + esc(open.symbol) + '</td></tr>' +
     '<tr><th>entry price</th><td>' + fmt(open.entry_price, 2) + '</td></tr>' +
     '<tr><th>trailing stop</th><td>' + fmt(open.stop_level, 2) + '</td></tr>' +
+    '<tr><th>shares</th><td>' + fmt(open.shares, 0) + zeroFlag + '</td></tr>' +
     '<tr><th>unrealized P&amp;L %</th><td class="' + cls + '">' + fmt(open.unrealized_pnl_pct, 2) + '%</td></tr>' +
+    '<tr><th>unrealized P&amp;L $</th><td class="' + cls + '">' + fmtDollars(open.unrealized_pnl_dollars) + '</td></tr>' +
     '</table>';
 }
 function journalClosedRows(closed) {
   if (!closed || !closed.length) {
-    return '<tr><td colspan="8" class="muted">No closed trades yet.</td></tr>';
+    return '<tr><td colspan="10" class="muted">No closed trades yet.</td></tr>';
   }
   return closed.map(function(t) {
     // symbol_switched = watchlist housekeeping, not a trading outcome --
@@ -1218,13 +1346,18 @@ function journalClosedRows(closed) {
     // whole row is muted, overriding pos/neg P&L coloring too.
     const isHousekeeping = t.exit_reason === 'symbol_switched';
     const cls = isHousekeeping ? 'muted' : signClass(t.realized_pnl_pct);
-    const pnl = t.realized_pnl_pct === null ? '' : fmt(t.realized_pnl_pct, 2) + '%';
+    const pnlPct = t.realized_pnl_pct === null ? '' : fmt(t.realized_pnl_pct, 2) + '%';
+    const pnlDollars = fmtDollars(t.realized_pnl_dollars);
+    const sharesHtml = t.shares === 0
+      ? '0 <span class="zero-size-flag">zero-size</span>' : fmt(t.shares, 0);
     const rowOpen = isHousekeeping ? '<tr class="row-housekeeping">' : '<tr>';
     return rowOpen + '<td>' + esc(t.symbol) + '</td>' +
       '<td>' + fmtTs(t.entry_ts) + '</td><td>' + fmt(t.entry_price, 2) + '</td>' +
       '<td>' + fmtTs(t.exit_ts) + '</td><td>' + fmt(t.exit_price, 2) + '</td>' +
       '<td>' + esc(t.exit_reason) + '</td>' +
-      '<td class="' + cls + '">' + pnl + '</td>' +
+      '<td>' + sharesHtml + '</td>' +
+      '<td class="' + cls + '">' + pnlPct + '</td>' +
+      '<td class="' + cls + '">' + pnlDollars + '</td>' +
       '<td><button type="button" class="remove-btn journal-delete-btn" data-trade-id="' +
       esc(t.id) + '">delete</button></td></tr>';
   }).join('');
@@ -1374,6 +1507,10 @@ function render(data) {
   document.getElementById('slot-count').textContent = syms.length + ' / ' + maxSymbols + ' symbols watched';
   const paramsEl = document.getElementById('strategy-params');
   if (paramsEl && data.strategy_params) paramsEl.textContent = strategyParamsText(data.strategy_params);
+  const equityEl = document.getElementById('current-equity');
+  if (equityEl && data.current_equity !== undefined) {
+    equityEl.innerHTML = '<strong>Current equity: ' + fmtDollars(data.current_equity) + '</strong>';
+  }
 }
 
 // Mirrors _strategy_params_html (Python side) -- read-only display, kept
@@ -1654,6 +1791,8 @@ table.detail th{color:var(--muted);font-weight:500;width:45%}
 .neg{color:var(--neg);font-weight:600}
 .muted{color:var(--muted)}
 .reverse-split-flag{color:var(--pending);font-weight:600;font-size:.82rem;margin:.15rem 0}
+.zero-size-flag{color:var(--pending);font-weight:600;font-size:.72rem}
+#current-equity{font-size:1.1rem;margin:0 0 .5rem}
 .badge{display:inline-block;padding:.1rem .5rem;border-radius:1rem;
   font-size:.72rem;font-weight:600}
 .badge-confirmed{background:rgba(62,207,126,.18);color:var(--pos)}
@@ -1693,6 +1832,8 @@ def create_app(*, fetch_bars, watch_symbol=None,
                announce_retry_max_delay=ANNOUNCE_RETRY_MAX_DELAY_SECONDS,
                journal_store=None, trail_pct=DEFAULT_TRAIL_PCT,
                volume_confirm_threshold=DEFAULT_VOLUME_CONFIRM_THRESHOLD,
+               base_equity=DEFAULT_BASE_EQUITY,
+               risk_pct_per_trade=DEFAULT_RISK_PCT_PER_TRADE,
                now_fn=time.time, max_symbols=MAX_SYMBOLS) -> FastAPI:
     poller = Poller(fetch_bars=fetch_bars, watch_symbol=watch_symbol,
                     announce_watch=announce_watch,
@@ -1702,6 +1843,7 @@ def create_app(*, fetch_bars, watch_symbol=None,
                     announce_retry_max_delay=announce_retry_max_delay,
                     journal_store=journal_store, trail_pct=trail_pct,
                     volume_confirm_threshold=volume_confirm_threshold,
+                    base_equity=base_equity, risk_pct_per_trade=risk_pct_per_trade,
                     now_fn=now_fn, max_symbols=max_symbols)
 
     @asynccontextmanager
@@ -1751,7 +1893,8 @@ def create_app(*, fetch_bars, watch_symbol=None,
     @app.get("/", response_class=HTMLResponse)
     async def root():
         return _page(poller.all_full_states(), poller.recent_closed(limit=10),
-                    poller.poll_enabled, poller.max_symbols, poller.strategy_params())
+                    poller.poll_enabled, poller.max_symbols, poller.strategy_params(),
+                    poller.current_equity())
 
     @app.post("/api/watch")
     async def api_watch(request: Request):
@@ -1885,5 +2028,43 @@ def create_app(*, fetch_bars, watch_symbol=None,
              "params": poller.strategy_params()},
             status_code=status,
         )
+
+    @app.get("/api/equity")
+    async def api_equity_get():
+        # current_equity is a running value, not a simple param (specs.md
+        # section 7) -- its own endpoint, distinct from strategy_params,
+        # since base_equity/risk_pct_per_trade (the live-tunable INPUTS to
+        # sizing) already live there via the existing mechanism.
+        return JSONResponse({
+            "current_equity": poller.current_equity(),
+            "history": poller.equity_history(),
+        })
+
+    @app.post("/api/equity/reset")
+    async def api_equity_reset():
+        # Sets current_equity to the LIVE base_equity param -- a distinct
+        # explicit action from an override below, logged as "manual_reset"
+        # so it's never confused with a trade-driven change later.
+        ok, result = poller.reset_equity()
+        if not ok:
+            return JSONResponse({"ok": False, "reason": result}, status_code=409)
+        return JSONResponse({"ok": True, "current_equity": result})
+
+    @app.post("/api/equity/override")
+    async def api_equity_override(request: Request):
+        # {"value": 1500.0} -- sets current_equity directly, WITHOUT
+        # touching base_equity (a future reset still targets the
+        # unchanged base_equity) -- for correcting a mistake or
+        # deliberately starting from a different number. Rejects a
+        # non-positive value, same 409 convention as every other
+        # validation failure in this app.
+        body = await request.json()
+        try:
+            value = float(body.get("value"))
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"ok": False, "reason": "value must be a number"}, status_code=409)
+        ok, reason = poller.override_equity(value)
+        return JSONResponse({"ok": ok, "reason": reason}, status_code=200 if ok else 409)
 
     return app

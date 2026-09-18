@@ -5,6 +5,8 @@ import sys
 _APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _APP_DIR)
 
+import pytest
+
 from journal_logic import ExitEvent, OpenPosition
 from journal_store import JournalStore
 
@@ -104,10 +106,13 @@ def test_migrates_a_parts_a_d_db_missing_trail_pct_and_volume_threshold_used(tmp
 
 
 def _position(symbol="AEHL", entry_ts=100, entry_price=10.0,
-             high_water_mark=10.0, stop_level=9.5):
+             high_water_mark=10.0, stop_level=9.5, shares=None,
+             account_size_used=None, risk_pct_used=None, risk_amount_used=None):
     return OpenPosition(id=None, symbol=symbol, entry_ts=entry_ts,
                         entry_price=entry_price,
-                        high_water_mark=high_water_mark, stop_level=stop_level)
+                        high_water_mark=high_water_mark, stop_level=stop_level,
+                        shares=shares, account_size_used=account_size_used,
+                        risk_pct_used=risk_pct_used, risk_amount_used=risk_amount_used)
 
 
 def test_open_position_for_returns_none_when_nothing_open(tmp_path):
@@ -674,3 +679,304 @@ def test_watch_note_migrates_onto_an_existing_trades_table(tmp_path):
     assert resumed.watch_note is None
     store.add_watch_note("AEHL", "works after migration")
     assert store.current_note_for("AEHL") == "works after migration"
+
+
+# -- position sizing with compounding virtual equity (specs.md section 7) --
+
+def test_base_equity_and_risk_pct_per_trade_are_recognized_strategy_params(tmp_path):
+    # Live-tunable via the EXISTING mechanism (specs.md section 8), same
+    # validation/history discipline as trail_pct -- no new table needed
+    # for the params themselves, only for current_equity's own tracking.
+    store = JournalStore(tmp_path / "journal.db")
+    store.set_param("base_equity", 5000.0)
+    store.set_param("risk_pct_per_trade", 0.02)
+    assert store.get_param("base_equity", 0.0) == 5000.0
+    assert store.get_param("risk_pct_per_trade", 0.0) == 0.02
+
+
+def test_base_equity_rejects_a_non_positive_value(tmp_path):
+    from journal_store import InvalidParamError
+    store = JournalStore(tmp_path / "journal.db")
+    with pytest.raises(InvalidParamError):
+        store.set_param("base_equity", 0.0)
+
+
+def test_risk_pct_per_trade_rejects_a_value_over_its_ceiling(tmp_path):
+    from journal_store import InvalidParamError
+    store = JournalStore(tmp_path / "journal.db")
+    with pytest.raises(InvalidParamError):
+        store.set_param("risk_pct_per_trade", 0.9)
+
+
+def test_current_equity_defaults_to_2000_with_no_default_params(tmp_path):
+    from journal_store import DEFAULT_BASE_EQUITY
+    store = JournalStore(tmp_path / "journal.db")
+    assert DEFAULT_BASE_EQUITY == 2000.0
+    assert store.current_equity() == 2000.0
+
+
+def test_current_equity_seeds_from_default_params_base_equity_on_first_run(tmp_path):
+    store = JournalStore(tmp_path / "journal.db", default_params={"base_equity": 3000.0})
+    assert store.current_equity() == 3000.0
+
+
+def test_current_equity_seed_is_never_reset_on_a_later_restart(tmp_path):
+    # Same "already-tuned value on disk is never reset back to the
+    # env/seed default" precedent as strategy_params (specs.md section 8)
+    # -- main.py passes the same default_params on every startup.
+    db_path = tmp_path / "journal.db"
+    store1 = JournalStore(db_path, default_params={"base_equity": 3000.0})
+    store1.apply_realized_pnl(trade_id=1, pnl_dollars=100.0)
+    assert store1.current_equity() == 3100.0
+
+    store2 = JournalStore(db_path, default_params={"base_equity": 3000.0})
+    assert store2.current_equity() == 3100.0  # NOT reset back to 3000
+
+
+def test_apply_realized_pnl_adds_to_current_equity(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    new_value = store.apply_realized_pnl(trade_id=47, pnl_dollars=42.10)
+    assert new_value == pytest.approx(2042.10)
+    assert store.current_equity() == pytest.approx(2042.10)
+
+
+def test_apply_realized_pnl_subtracts_a_loss(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    store.apply_realized_pnl(trade_id=1, pnl_dollars=-19.565)
+    assert store.current_equity() == pytest.approx(2000.0 - 19.565)
+
+
+def test_apply_realized_pnl_logs_history_with_trade_close_provenance(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    store.apply_realized_pnl(trade_id=47, pnl_dollars=42.10)
+    (entry,) = store.equity_history()
+    assert entry["reason"] == "trade_close:trade_id=47:pnl=+42.10"
+    assert entry["old_value"] == 2000.0
+    assert entry["new_value"] == pytest.approx(2042.10)
+
+
+def test_apply_realized_pnl_history_reason_records_a_negative_pnl_with_its_sign(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    store.apply_realized_pnl(trade_id=9, pnl_dollars=-19.565)
+    (entry,) = store.equity_history()
+    assert entry["reason"] == f"trade_close:trade_id=9:pnl={-19.565:+.2f}"
+    assert entry["reason"].startswith("trade_close:trade_id=9:pnl=-19.5")
+
+
+def test_two_same_batch_closes_apply_sequentially_neither_lost_nor_doubled(tmp_path):
+    # The concurrency requirement, at the storage primitive itself: two
+    # trade closes back to back, no read from anywhere else in between --
+    # this is the exact same class of bug already found once in this
+    # project (app.py's opened/updated/closed if/elif/elif silently
+    # dropping a write when two things happened in the same batch, Part A
+    # of setup-type generalization, specs.md) in a new location. Each
+    # apply_realized_pnl call must read current_equity FRESH, immediately
+    # before writing, never a value cached before the first call --
+    # otherwise the second call would either clobber the first (lost) or
+    # both would double-count against the ORIGINAL starting value.
+    store = JournalStore(tmp_path / "journal.db")
+    store.apply_realized_pnl(trade_id=1, pnl_dollars=-19.565)
+    store.apply_realized_pnl(trade_id=2, pnl_dollars=-19.565)
+    assert store.current_equity() == pytest.approx(2000.0 - 19.565 - 19.565)
+
+    history = store.equity_history()
+    assert len(history) == 2
+    # Most-recent-first: trade_id=2's close applied against the value
+    # trade_id=1's close had ALREADY moved, not the original 2000.0 --
+    # this is what "sequential, not lost or double-applied" means here.
+    assert history[0]["reason"] == f"trade_close:trade_id=2:pnl={-19.565:+.2f}"
+    assert history[0]["old_value"] == pytest.approx(2000.0 - 19.565)
+    assert history[0]["new_value"] == pytest.approx(2000.0 - 19.565 - 19.565)
+    assert history[1]["reason"] == f"trade_close:trade_id=1:pnl={-19.565:+.2f}"
+    assert history[1]["old_value"] == pytest.approx(2000.0)
+    assert history[1]["new_value"] == pytest.approx(2000.0 - 19.565)
+
+
+def test_reset_equity_sets_current_equity_to_the_live_base_equity_param(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    store.apply_realized_pnl(trade_id=1, pnl_dollars=250.0)
+    assert store.current_equity() == pytest.approx(2250.0)
+
+    store.set_param("base_equity", 5000.0)  # tuned AFTER the compounding above
+    store.reset_equity()
+    assert store.current_equity() == 5000.0  # the LIVE param, not the 2000 seed
+
+
+def test_reset_equity_is_logged_distinctly_from_a_trade_driven_change(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    store.apply_realized_pnl(trade_id=1, pnl_dollars=250.0)
+    store.reset_equity()
+    history = store.equity_history()
+    assert history[0]["reason"] == "manual_reset"
+    assert history[0]["old_value"] == pytest.approx(2250.0)
+    assert history[0]["new_value"] == 2000.0
+    assert history[1]["reason"] == "trade_close:trade_id=1:pnl=+250.00"
+
+
+def test_override_equity_sets_an_arbitrary_value_without_touching_base_equity(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    store.override_equity(777.0)
+    assert store.current_equity() == 777.0
+    # base_equity (what a FUTURE reset targets) is untouched by an override
+    assert store.get_param("base_equity", 2000.0) == 2000.0
+    store.reset_equity()
+    assert store.current_equity() == 2000.0  # reset still targets the seed default
+
+
+def test_override_equity_is_logged_distinctly_from_a_reset(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    store.override_equity(777.0)
+    (entry,) = store.equity_history()
+    assert entry["reason"] == "manual_override"
+    assert entry["old_value"] == 2000.0
+    assert entry["new_value"] == 777.0
+
+
+def test_override_equity_rejects_a_non_positive_value(tmp_path):
+    from journal_store import InvalidEquityOverrideError
+    store = JournalStore(tmp_path / "journal.db")
+    with pytest.raises(InvalidEquityOverrideError):
+        store.override_equity(0.0)
+    with pytest.raises(InvalidEquityOverrideError):
+        store.override_equity(-5.0)
+    assert store.current_equity() == 2000.0  # unchanged
+    assert store.equity_history() == []
+
+
+def test_equity_history_orders_most_recent_first_and_respects_limit(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    for i in range(3):
+        store.apply_realized_pnl(trade_id=i, pnl_dollars=1.0)
+    history = store.equity_history(limit=2)
+    assert len(history) == 2
+    assert history[0]["reason"] == "trade_close:trade_id=2:pnl=+1.00"
+    assert history[1]["reason"] == "trade_close:trade_id=1:pnl=+1.00"
+
+
+# -- entry-time sizing persisted on the trade row --------------------------
+
+def test_create_persists_sizing_snapshot(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    pos = _position(shares=43, account_size_used=2000.0,
+                    risk_pct_used=0.01, risk_amount_used=19.565)
+    created = store.create(pos)
+    assert created.shares == 43
+    assert created.account_size_used == 2000.0
+    assert created.risk_pct_used == 0.01
+    assert created.risk_amount_used == 19.565
+
+    found = store.open_position_for("AEHL")
+    assert found.shares == 43
+    assert found.account_size_used == 2000.0
+    assert found.risk_pct_used == 0.01
+    assert found.risk_amount_used == 19.565
+
+
+def test_create_persists_a_zero_shares_sizing_snapshot_distinctly_from_unset(tmp_path):
+    # 0 (a real, computed "sized down to nothing") must round-trip as 0,
+    # never coerced to/confused with None ("sizing was never computed" --
+    # a pre-migration position, see the migration test below).
+    store = JournalStore(tmp_path / "journal.db")
+    pos = _position(shares=0, account_size_used=50.0, risk_pct_used=0.01,
+                    risk_amount_used=0.0)
+    store.create(pos)
+    found = store.open_position_for("AEHL")
+    assert found.shares == 0
+    assert found.shares is not None
+
+
+def test_close_position_computes_realized_pnl_dollars_from_shares(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    created = store.create(_position(entry_price=9.1, shares=43))
+    pnl_dollars = store.close_position(
+        created, ExitEvent(exit_ts=200, exit_price=8.645, exit_reason="trailing_stop"))
+    assert pnl_dollars == pytest.approx(43 * (8.645 - 9.1))
+    (closed,) = store.recent_closed()
+    assert closed["realized_pnl_dollars"] == pytest.approx(43 * (8.645 - 9.1))
+
+
+def test_close_position_zero_shares_realized_pnl_dollars_is_zero_not_none(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    created = store.create(_position(entry_price=9.1, shares=0))
+    pnl_dollars = store.close_position(
+        created, ExitEvent(exit_ts=200, exit_price=8.645, exit_reason="trailing_stop"))
+    assert pnl_dollars == 0.0
+    assert pnl_dollars is not None
+    (closed,) = store.recent_closed()
+    assert closed["realized_pnl_dollars"] == 0.0
+
+
+def test_close_position_with_unknown_shares_leaves_realized_pnl_dollars_null(tmp_path):
+    # A pre-migration position (shares never computed) -- there is no real
+    # number to record, and none must be invented.
+    store = JournalStore(tmp_path / "journal.db")
+    created = store.create(_position(entry_price=9.1, shares=None))
+    pnl_dollars = store.close_position(
+        created, ExitEvent(exit_ts=200, exit_price=8.645, exit_reason="trailing_stop"))
+    assert pnl_dollars is None
+    (closed,) = store.recent_closed()
+    assert closed["realized_pnl_dollars"] is None
+
+
+# -- migration: sizing/equity columns onto an existing DB -------------------
+
+_PRE_SIZING_SCHEMA = """
+CREATE TABLE trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    entry_ts INTEGER NOT NULL,
+    entry_price REAL NOT NULL,
+    high_water_mark REAL NOT NULL,
+    stop_level REAL NOT NULL,
+    exit_ts INTEGER,
+    exit_price REAL,
+    exit_reason TEXT,
+    realized_pnl_pct REAL,
+    setup_type TEXT,
+    factors TEXT,
+    trail_pct_used REAL,
+    volume_threshold_used REAL,
+    watch_note TEXT
+)
+"""
+
+
+def test_sizing_columns_migrate_onto_an_existing_trades_table(tmp_path):
+    db_path = tmp_path / "journal.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(_PRE_SIZING_SCHEMA)
+    conn.execute(
+        "INSERT INTO trades (symbol, entry_ts, entry_price, high_water_mark, "
+        "stop_level) VALUES ('AEHL', 100, 10.0, 10.0, 9.5)",
+    )
+    conn.commit()
+    conn.close()
+
+    store = JournalStore(db_path)  # must not raise
+    resumed = store.open_position_for("AEHL")
+    assert resumed.shares is None
+    assert resumed.account_size_used is None
+    assert resumed.risk_pct_used is None
+    assert resumed.risk_amount_used is None
+    # A pre-migration open position must still close cleanly, with no
+    # invented dollar P&L.
+    pnl_dollars = store.close_position(
+        resumed, ExitEvent(exit_ts=200, exit_price=10.5, exit_reason="trailing_stop"))
+    assert pnl_dollars is None
+
+
+def test_equity_state_and_history_tables_exist_on_a_db_that_predates_them(tmp_path):
+    # equity_state/equity_history are CREATE TABLE IF NOT EXISTS (new
+    # tables, not new columns on an existing one) -- still worth proving
+    # explicitly against a DB file that predates this feature entirely,
+    # same discipline as every prior schema addition this session.
+    db_path = tmp_path / "journal.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(_PRE_SIZING_SCHEMA)
+    conn.commit()
+    conn.close()
+
+    store = JournalStore(db_path)  # must not raise
+    assert store.current_equity() == 2000.0
+    store.apply_realized_pnl(trade_id=1, pnl_dollars=10.0)
+    assert store.current_equity() == 2010.0
