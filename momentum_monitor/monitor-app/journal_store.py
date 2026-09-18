@@ -111,6 +111,14 @@ change for a trade already in flight, not a neutral default.
 `session_volume_multiple` (the session-level volume gate, same
 section) join `base_equity`/`risk_pct_per_trade` in the EXISTING
 `strategy_params` mechanism -- no new table.
+
+Also (added 2026-09-18, specs.md section 7's continuation-vs-fresh-day
+gap): `continuation_lookback_days`/`continuation_threshold_pct` join
+`strategy_params` the same way -- an INFORMATIONAL flag, never
+snapshotted onto `trades` at all (unlike every entry-time-locked value
+above), since it never gates or influences an entry decision and is
+meant to reflect whatever the CURRENT live threshold says whenever a
+symbol's panel is viewed, not a value frozen at some past moment.
 """
 from __future__ import annotations
 
@@ -248,6 +256,24 @@ MAX_WATCH_NOTE_LENGTH = 500
 # criterion, not a guess; 50.0 as a ceiling mirrors volume_confirm_
 # threshold's own "generous but non-absurd" reasoning, scaled up since
 # this compares a full day's cumulative volume, not one bar's.
+# continuation_lookback_days (specs.md section 7's continuation-vs-
+# fresh-day gap) is how many recent trading days get scanned for a
+# qualifying move -- 7 (about a trading week) is the chosen default:
+# long enough that a runner day's immediate aftermath (the "Day 2, Day
+# 3..." continuation window this flag exists to distinguish from a
+# genuine Day 1) is still caught, short enough that a move from weeks
+# ago has stopped being relevant context for TODAY's setup; 30 (about
+# six weeks) as a ceiling is already well past what "recent" means for
+# this purpose. continuation_threshold_pct is how large a single day's
+# move (either direction) must be to count as a qualifying day -- 0.5
+# (50%) is the chosen default: real examples from this project's own
+# candidates (RETO, QCLS, DLXY) moved 100%+ on their actual runner
+# days, but ordinary daily noise for a volatile small/micro cap can
+# itself run into the 10-30% range on an unremarkable day -- 50% sits
+# meaningfully above that noise floor without requiring the most
+# extreme outcomes only to register as "not a normal day"; 5.0 (500%)
+# as a ceiling is a generous sanity bound (a move that large is
+# essentially a halt/reopen event), not a validated "correct" number.
 _PARAM_BOUNDS = {
     "trail_pct": (0.0, 0.5),
     "volume_confirm_threshold": (0.0, 20.0),
@@ -256,6 +282,8 @@ _PARAM_BOUNDS = {
     "swing_low_buffer_pct": (0.0, 0.1),
     "pattern_progress_threshold_pct": (0.0, 1.0),
     "session_volume_multiple": (0.0, 50.0),
+    "continuation_lookback_days": (0.0, 30.0),
+    "continuation_threshold_pct": (0.0, 5.0),
 }
 
 # current_equity's own seed/reset fallback (specs.md section 7) -- "2000

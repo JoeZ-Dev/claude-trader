@@ -1064,3 +1064,20 @@ def test_two_phase_exit_columns_migrate_onto_an_existing_trades_table(tmp_path):
     still_open = store.open_position_for("AEHL")
     assert still_open.exit_phase == "trailing"
     assert still_open.high_water_mark == 10.5
+
+
+# -- continuation-vs-fresh-day strategy params (specs.md section 7) -------
+
+def test_continuation_lookback_days_and_threshold_pct_are_recognized_params(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    store.set_param("continuation_lookback_days", 10.0)
+    store.set_param("continuation_threshold_pct", 0.75)
+    assert store.get_param("continuation_lookback_days", 0.0) == 10.0
+    assert store.get_param("continuation_threshold_pct", 0.0) == 0.75
+
+
+def test_continuation_threshold_pct_rejects_a_value_over_its_ceiling(tmp_path):
+    from journal_store import InvalidParamError
+    store = JournalStore(tmp_path / "journal.db")
+    with pytest.raises(InvalidParamError):
+        store.set_param("continuation_threshold_pct", 6.0)
