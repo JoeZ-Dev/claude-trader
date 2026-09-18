@@ -154,6 +154,7 @@ _CORE = os.environ.get("CORE_PATH") or os.path.join(
 if _CORE not in sys.path:
     sys.path.insert(0, _CORE)
 
+from indicators import continuation_days  # noqa: E402
 from levels import confirmed_swing_lows  # noqa: E402
 
 # Same exchange-local timezone state.py already anchors session VWAP to
@@ -195,6 +196,12 @@ DEFAULT_SESSION_VOLUME_MULTIPLE = 3.0
 # watch, cached on _SymbolSlot.avg_daily_volume, never per-bar) for the
 # session-level volume gate's baseline.
 DAILY_VOLUME_LOOKBACK_DAYS = 30
+# Continuation-vs-fresh-day flag (specs.md section 7) -- see
+# journal_store.py's _PARAM_BOUNDS comment for the full reasoning behind
+# each default; seed/fallback defaults ONLY, same split as every other
+# DEFAULT_* constant here.
+DEFAULT_CONTINUATION_LOOKBACK_DAYS = 7
+DEFAULT_CONTINUATION_THRESHOLD_PCT = 0.5
 MAX_SYMBOLS = 4
 
 # Real ticker symbols are short and plain (letters/digits, occasionally a
@@ -245,6 +252,14 @@ class _SymbolSlot:
     # than blocking them (see journal_logic.should_enter's documented
     # choice), not a crash or a silently-wrong zero.
     avg_daily_volume: float | None = None
+    # The RAW daily bars that avg_daily_volume above was computed from --
+    # retained (added 2026-09-18, specs.md section 7's continuation-vs-
+    # fresh-day gap), not discarded, so the continuation flag reuses this
+    # SAME single fetch instead of pulling the same underlying data
+    # twice. [] if never fetched yet, or the fetch failed/returned
+    # nothing -- same "unknown, not silently zero" meaning as
+    # avg_daily_volume being None (see _continuation_status_for).
+    daily_bars: list[dict] = field(default_factory=list)
 
 
 class Poller:
@@ -260,6 +275,8 @@ class Poller:
                  swing_low_buffer_pct=DEFAULT_SWING_LOW_BUFFER_PCT,
                  pattern_progress_threshold_pct=DEFAULT_PATTERN_PROGRESS_THRESHOLD_PCT,
                  session_volume_multiple=DEFAULT_SESSION_VOLUME_MULTIPLE,
+                 continuation_lookback_days=DEFAULT_CONTINUATION_LOOKBACK_DAYS,
+                 continuation_threshold_pct=DEFAULT_CONTINUATION_THRESHOLD_PCT,
                  fetch_daily_bars=None,
                  now_fn=time.time, max_symbols=MAX_SYMBOLS):
         self._fetch_bars = fetch_bars
@@ -278,6 +295,8 @@ class Poller:
         self._swing_low_buffer_pct = swing_low_buffer_pct
         self._pattern_progress_threshold_pct = pattern_progress_threshold_pct
         self._session_volume_multiple = session_volume_multiple
+        self._continuation_lookback_days = continuation_lookback_days
+        self._continuation_threshold_pct = continuation_threshold_pct
         self._now_fn = now_fn
         self._max_symbols = max_symbols
         self._slots: dict[str, _SymbolSlot] = {}
@@ -338,7 +357,41 @@ class Poller:
         # not zero; exposed here mainly so it's directly checkable via
         # GET /api/state, same as everything else on this page.
         payload["avg_daily_volume"] = slot.avg_daily_volume
+        # Continuation-vs-fresh-day flag (specs.md section 7) --
+        # INFORMATIONAL only, never gates or influences entry logic (see
+        # journal_logic.should_enter, which takes no continuation-related
+        # parameter at all). Recomputed fresh on every read against the
+        # CURRENT live threshold/lookback, not cached or snapshotted --
+        # unlike avg_daily_volume, this has no reason to reflect a value
+        # frozen at add-time.
+        payload["continuation"] = self._continuation_status_for(slot)
         return payload
+
+    def _continuation_status_for(self, slot: _SymbolSlot) -> dict:
+        """{"status": "unknown"|"fresh"|"continuation", "days": [...],
+        "lookback_days_used", "threshold_pct_used"} -- "unknown" (never
+        "fresh") when slot.daily_bars is empty (the fetch never
+        happened, or failed): "no qualifying day found" and "no data to
+        check" are different facts, and must never be displayed as the
+        same thing (specs.md section 7's own framing: "unknown, no
+        data" must never be confused with "checked, and it's fresh")."""
+        if not slot.daily_bars:
+            return {"status": "unknown", "days": [],
+                   "lookback_days_used": None, "threshold_pct_used": None}
+        lookback_days = (self._journal_store.get_param(
+            "continuation_lookback_days", self._continuation_lookback_days)
+            if self._journal_store is not None else self._continuation_lookback_days)
+        threshold_pct = (self._journal_store.get_param(
+            "continuation_threshold_pct", self._continuation_threshold_pct)
+            if self._journal_store is not None else self._continuation_threshold_pct)
+        days = continuation_days(slot.daily_bars, lookback_days=int(lookback_days),
+                                 threshold_pct=threshold_pct)
+        return {
+            "status": "continuation" if days else "fresh",
+            "days": days,
+            "lookback_days_used": int(lookback_days),
+            "threshold_pct_used": threshold_pct,
+        }
 
     def reverse_splits_for(self, symbol: str) -> list[dict]:
         """Every recorded reverse split for `symbol`, most recent first --
@@ -429,6 +482,10 @@ class Poller:
                     "value": self._pattern_progress_threshold_pct, "updated_at": None},
                 "session_volume_multiple": {
                     "value": self._session_volume_multiple, "updated_at": None},
+                "continuation_lookback_days": {
+                    "value": self._continuation_lookback_days, "updated_at": None},
+                "continuation_threshold_pct": {
+                    "value": self._continuation_threshold_pct, "updated_at": None},
             }
         return self._journal_store.all_params()
 
@@ -581,6 +638,10 @@ class Poller:
             if daily_bars:
                 self._slots[symbol].avg_daily_volume = (
                     sum(b["volume"] for b in daily_bars) / len(daily_bars))
+                # Retained for the continuation-vs-fresh-day flag (specs.md
+                # section 7) -- REUSING this same fetch, not a second pull
+                # of the same underlying data.
+                self._slots[symbol].daily_bars = daily_bars
         if self._journal_store is not None and watch_note:
             self._journal_store.add_watch_note(symbol, watch_note)
         if self._journal_store is not None:
@@ -970,6 +1031,16 @@ def _fmt_ts(ts) -> str:
     return datetime.fromtimestamp(ts, _NY).strftime("%m/%d %H:%M:%S")
 
 
+def _fmt_date(ts) -> str:
+    """Date only, America/New_York -- for a DAILY bar's ts (specs.md
+    section 7's continuation flag), where a time-of-day would be noise:
+    a daily candle's ts isn't a moment worth showing to the minute the
+    way an intraday entry_ts/exit_ts is."""
+    if ts is None:
+        return "—"
+    return datetime.fromtimestamp(ts, _NY).strftime("%m/%d")
+
+
 def _sign_class(v) -> str:
     if v is None:
         return ""
@@ -1235,6 +1306,33 @@ def _reverse_splits_html(splits: list[dict] | None) -> str:
     return f"<p class='reverse-split-flag'>⚠ Reverse-split history: {items}</p>"
 
 
+def _continuation_html(status: dict | None) -> str:
+    # ALWAYS rendered (specs.md section 7) -- deliberately NOT the
+    # reverse-split flag's "only when non-empty" treatment: "Day 1,
+    # fresh" is just as useful to see at a glance as a real flag, and
+    # "unknown" (daily history never fetched, or the fetch failed) must
+    # never be silently indistinguishable from either real answer.
+    status = status or {"status": "unknown"}
+    kind = status.get("status")
+    if kind == "fresh":
+        lookback = status.get("lookback_days_used")
+        threshold_pct = status.get("threshold_pct_used") or 0.0
+        text = (f"Day 1 (fresh) — no moves over {threshold_pct * 100:.0f}% "
+                f"in the past {lookback} trading days")
+        cls = "continuation-flag"
+    elif kind == "continuation":
+        items = "; ".join(
+            f"{d['pct_change'] * 100:+.1f}% on {_fmt_date(d['ts'])}"
+            for d in status.get("days", [])
+        )
+        text = f"Continuation — {items}"
+        cls = "continuation-flag continuation-flag-active"
+    else:
+        text = "Continuation status: unknown (no daily history available)"
+        cls = "continuation-flag muted"
+    return f"<p class='{cls}'>{html.escape(text)}</p>"
+
+
 def _symbol_card_html(symbol: str, state: dict) -> str:
     """One grid panel per watched symbol: the same per-block renderers
     phase 1's single-symbol page used, plus a remove control scoped to
@@ -1243,6 +1341,7 @@ def _symbol_card_html(symbol: str, state: dict) -> str:
     sym = html.escape(symbol)
     note_html = _watch_note_html(state.get("watch_note"))
     split_html = _reverse_splits_html(state.get("reverse_splits"))
+    continuation_html = _continuation_html(state.get("continuation"))
     if state.get("status") != "ok":
         msg = (f"Warming up — waiting for bars for {sym}." if state.get("symbol")
               else "No data yet.")
@@ -1250,6 +1349,7 @@ def _symbol_card_html(symbol: str, state: dict) -> str:
                 f"<div class='hero'><h2>{sym}</h2>{_remove_button_html(symbol)}</div>"
                 f"{note_html}"
                 f"{split_html}"
+                f"{continuation_html}"
                 f"<p class='muted'>{html.escape(msg)}</p></section>")
 
     s = state["session"]
@@ -1267,6 +1367,7 @@ def _symbol_card_html(symbol: str, state: dict) -> str:
   </div>
   {note_html}
   {split_html}
+  {continuation_html}
   <table class="detail">
     <tr><th>Bars</th><td>{state['bar_count']}</td></tr>
     <tr><th>Last bar extended-hours</th><td>{"yes" if state["last_bar_is_extended"] else "no"}</td></tr>
@@ -1399,6 +1500,13 @@ function fmtTs(ts) {
   return new Date(ts * 1000).toLocaleString('en-US', {
     timeZone: 'America/New_York', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  });
+}
+// Mirrors _fmt_date (Python side) -- date only, for a DAILY bar's ts.
+function fmtDate(ts) {
+  if (ts === null || ts === undefined) return '\\u2014';
+  return new Date(ts * 1000).toLocaleString('en-US', {
+    timeZone: 'America/New_York', month: '2-digit', day: '2-digit',
   });
 }
 function signClass(v) {
@@ -1561,14 +1669,40 @@ function reverseSplitsHtml(splits) {
   }).join('; ');
   return '<p class="reverse-split-flag">\\u26a0 Reverse-split history: ' + items + '</p>';
 }
+function continuationHtml(status) {
+  // Mirrors _continuation_html (Python side) -- ALWAYS rendered, unlike
+  // reverseSplitsHtml's "only when non-empty" treatment; see that
+  // function's own comment for why "unknown" must stay distinct from
+  // both real answers.
+  status = status || {status: 'unknown'};
+  var text, cls;
+  if (status.status === 'fresh') {
+    var thresholdPct = (status.threshold_pct_used || 0) * 100;
+    text = 'Day 1 (fresh) \\u2014 no moves over ' + thresholdPct.toFixed(0) +
+      '% in the past ' + status.lookback_days_used + ' trading days';
+    cls = 'continuation-flag';
+  } else if (status.status === 'continuation') {
+    var items = (status.days || []).map(function (d) {
+      var pct = d.pct_change * 100;
+      return (pct >= 0 ? '+' : '') + pct.toFixed(1) + '% on ' + fmtDate(d.ts);
+    }).join('; ');
+    text = 'Continuation \\u2014 ' + items;
+    cls = 'continuation-flag continuation-flag-active';
+  } else {
+    text = 'Continuation status: unknown (no daily history available)';
+    cls = 'continuation-flag muted';
+  }
+  return '<p class="' + cls + '">' + esc(text) + '</p>';
+}
 function symbolCardHtml(symbol, state) {
   const sym = esc(symbol);
   const noteHtml = watchNoteHtml(state.watch_note);
   const splitHtml = reverseSplitsHtml(state.reverse_splits);
+  const continuationHtmlStr = continuationHtml(state.continuation);
   if (state.status !== 'ok') {
     return '<section class="card" data-symbol="' + sym + '">' +
       '<div class="hero"><h2>' + sym + '</h2>' + removeButtonHtml(symbol) + '</div>' +
-      noteHtml + splitHtml +
+      noteHtml + splitHtml + continuationHtmlStr +
       '<p class="muted">Warming up \\u2014 waiting for bars.</p></section>';
   }
   const s = state.session;
@@ -1582,7 +1716,7 @@ function symbolCardHtml(symbol, state) {
     '<div class="hero"><div class="hero-symbol">' + sym + '</div>' +
     '<div class="hero-price ' + priceCls + '">' + fmt(state.last_price, 2) + '</div>' +
     removeButtonHtml(symbol) + '</div>' +
-    noteHtml + splitHtml +
+    noteHtml + splitHtml + continuationHtmlStr +
     '<table class="detail">' +
     '<tr><th>Bars</th><td>' + state.bar_count + '</td></tr>' +
     '<tr><th>Last bar extended-hours</th><td>' + (state.last_bar_is_extended ? 'yes' : 'no') + '</td></tr>' +
@@ -1924,6 +2058,8 @@ table.detail th{color:var(--muted);font-weight:500;width:45%}
 .muted{color:var(--muted)}
 .reverse-split-flag{color:var(--pending);font-weight:600;font-size:.82rem;margin:.15rem 0}
 .zero-size-flag{color:var(--pending);font-weight:600;font-size:.72rem}
+.continuation-flag{font-size:.82rem;margin:.15rem 0}
+.continuation-flag-active{color:var(--pending);font-weight:600}
 #current-equity{font-size:1.1rem;margin:0 0 .5rem}
 .badge{display:inline-block;padding:.1rem .5rem;border-radius:1rem;
   font-size:.72rem;font-weight:600}
@@ -1969,6 +2105,8 @@ def create_app(*, fetch_bars, watch_symbol=None,
                swing_low_buffer_pct=DEFAULT_SWING_LOW_BUFFER_PCT,
                pattern_progress_threshold_pct=DEFAULT_PATTERN_PROGRESS_THRESHOLD_PCT,
                session_volume_multiple=DEFAULT_SESSION_VOLUME_MULTIPLE,
+               continuation_lookback_days=DEFAULT_CONTINUATION_LOOKBACK_DAYS,
+               continuation_threshold_pct=DEFAULT_CONTINUATION_THRESHOLD_PCT,
                fetch_daily_bars=None,
                now_fn=time.time, max_symbols=MAX_SYMBOLS) -> FastAPI:
     poller = Poller(fetch_bars=fetch_bars, watch_symbol=watch_symbol,
@@ -1983,6 +2121,8 @@ def create_app(*, fetch_bars, watch_symbol=None,
                     swing_low_buffer_pct=swing_low_buffer_pct,
                     pattern_progress_threshold_pct=pattern_progress_threshold_pct,
                     session_volume_multiple=session_volume_multiple,
+                    continuation_lookback_days=continuation_lookback_days,
+                    continuation_threshold_pct=continuation_threshold_pct,
                     fetch_daily_bars=fetch_daily_bars,
                     now_fn=now_fn, max_symbols=max_symbols)
 

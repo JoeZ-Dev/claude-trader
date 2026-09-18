@@ -9,6 +9,7 @@ _APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _APP_DIR)
 sys.path.insert(0, os.path.join(os.path.dirname(_APP_DIR), "core"))
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app import _journal_closed_rows_html, _journal_open_html, create_app
@@ -963,6 +964,114 @@ def test_add_symbol_fetches_daily_bars_once_and_caches_the_average(tmp_path):
         c.post("/api/polling", json={"enabled": False})
         c.post("/api/polling", json={"enabled": True})
         assert calls == ["AEHL"]
+
+
+# -- continuation-vs-fresh-day flag, specs.md section 7 -- REUSES the
+# same daily-bars fetch built for the volume gate above, never a second
+# pull of the same underlying data.
+
+def _daily_bar(ts, close, vol=100_000.0):
+    return {"ts": ts, "volume": vol, "open": close, "high": close,
+           "low": close, "close": close, "is_extended": False}
+
+
+def test_continuation_flag_reuses_the_single_daily_bars_fetch_not_a_second_one(tmp_path):
+    calls = []
+    closes = [10.0, 10.1, 9.9, 21.0, 20.5, 20.0, 19.8, 19.9]  # a real +103% day
+
+    async def fetch_daily_bars(symbol):
+        calls.append(symbol)
+        return [_daily_bar(i, c) for i, c in enumerate(closes)]
+
+    c = _client(FakeFetch({"AEHL": [_bars(3)]}), symbol="AEHL",
+               fetch_daily_bars=fetch_daily_bars)
+    with c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        state = _sym_state(c, "AEHL")
+        # BOTH avg_daily_volume and the continuation flag are populated...
+        assert state["avg_daily_volume"] == 100_000.0
+        assert state["continuation"]["status"] == "continuation"
+        # ...from exactly ONE fetch call -- the real assertion this test
+        # exists for, not just "it works."
+        assert calls == ["AEHL"]
+
+        c.post("/api/polling", json={"enabled": False})
+        c.post("/api/polling", json={"enabled": True})
+        assert calls == ["AEHL"]
+
+
+def test_continuation_flag_identifies_a_real_continuation_day():
+    closes = [10.0, 10.1, 9.9, 21.0, 20.5, 20.0, 19.8, 19.9]
+
+    async def fetch_daily_bars(symbol):
+        return [_daily_bar(i, c) for i, c in enumerate(closes)]
+
+    c = _client(FakeFetch({"AEHL": [_bars(3)]}), symbol="AEHL",
+               fetch_daily_bars=fetch_daily_bars)
+    with c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        continuation = _sym_state(c, "AEHL")["continuation"]
+        assert continuation["status"] == "continuation"
+        assert len(continuation["days"]) == 1
+        assert continuation["days"][0]["ts"] == 3
+        assert continuation["days"][0]["pct_change"] == pytest.approx((21.0 - 9.9) / 9.9)
+
+
+def test_continuation_flag_identifies_a_genuinely_fresh_symbol():
+    closes = [10.0, 10.2, 9.9, 10.1, 10.0, 9.8, 10.05, 10.1]  # ordinary noise
+
+    async def fetch_daily_bars(symbol):
+        return [_daily_bar(i, c) for i, c in enumerate(closes)]
+
+    c = _client(FakeFetch({"AEHL": [_bars(3)]}), symbol="AEHL",
+               fetch_daily_bars=fetch_daily_bars)
+    with c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        continuation = _sym_state(c, "AEHL")["continuation"]
+        assert continuation["status"] == "fresh"
+        assert continuation["days"] == []
+        assert continuation["lookback_days_used"] == 7
+        assert continuation["threshold_pct_used"] == 0.5
+
+
+def test_continuation_flag_is_unknown_without_a_configured_fetcher(tmp_path):
+    c = _client(FakeFetch({"AEHL": [_bars(3)]}), symbol="AEHL")  # no fetch_daily_bars
+    with c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        continuation = _sym_state(c, "AEHL")["continuation"]
+        assert continuation["status"] == "unknown"
+        assert continuation["days"] == []
+
+
+def test_root_page_always_shows_continuation_status_fresh_or_flagged():
+    fresh_closes = [10.0, 10.2, 9.9, 10.1, 10.0, 9.8, 10.05, 10.1]
+
+    async def fetch_daily_bars(symbol):
+        return [_daily_bar(i, c) for i, c in enumerate(fresh_closes)]
+
+    c = _client(FakeFetch({"AEHL": [_bars(3)]}), symbol="AEHL",
+               fetch_daily_bars=fetch_daily_bars)
+    with c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        page = c.get("/").text
+        rendered = page.split("<script>")[0]
+        assert "Day 1 (fresh)" in rendered
+
+
+def test_root_page_shows_continuation_flag_with_real_date_and_magnitude():
+    closes = [10.0, 10.1, 9.9, 21.0, 20.5, 20.0, 19.8, 19.9]
+
+    async def fetch_daily_bars(symbol):
+        return [_daily_bar(i, c) for i, c in enumerate(closes)]
+
+    c = _client(FakeFetch({"AEHL": [_bars(3)]}), symbol="AEHL",
+               fetch_daily_bars=fetch_daily_bars)
+    with c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        page = c.get("/").text
+        rendered = page.split("<script>")[0]
+        assert "Continuation" in rendered
+        assert "+112." in rendered  # (21.0-9.9)/9.9 = +112.1%
 
 
 def test_add_symbol_leaves_avg_daily_volume_none_when_fetch_fails(tmp_path):

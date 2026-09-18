@@ -732,3 +732,50 @@ def test_session_volume_gate_allows_a_real_entry_when_session_volume_clears_it(t
     assert pos.factors["avg_daily_volume"] == 100_000.0
     assert pos.factors["session_cumulative_volume"] == pytest.approx(750_000.0)
     assert pos.factors["session_volume_multiple_used"] == 3.0
+
+
+# -- continuation-vs-fresh-day flag, specs.md section 7 -- INFORMATIONAL
+# only: proves a real entry succeeds identically regardless of which
+# continuation status the SAME daily-bars fetch (reused, not a second
+# pull) produces -- journal_logic.should_enter/advance_journal take no
+# continuation-related parameter at all, so this is a real end-to-end
+# proof of that, not just "the signature doesn't have the field."
+
+def _daily_bars_fetcher_with_closes(avg_volume, closes):
+    async def fetch_daily_bars(symbol):
+        return [{"ts": i, "volume": avg_volume, "open": c, "high": c,
+                 "low": c, "close": c, "is_extended": False}
+                for i, c in enumerate(closes)]
+    return fetch_daily_bars
+
+
+def test_a_flagged_continuation_symbol_still_enters_normally(tmp_path):
+    # avg_daily_volume=100_000 keeps the session-level volume gate
+    # passing (same as test_session_volume_gate_allows_..., isolating
+    # continuation status as the only real variable here) -- the closes
+    # produce a genuine +103% day, so continuation status is "continuation".
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": [_entry_bars()]})
+    closes = [10.0, 10.1, 9.9, 21.0, 20.5, 20.0, 19.8, 19.9]
+
+    with _client(fetch, journal_store=store,
+                fetch_daily_bars=_daily_bars_fetcher_with_closes(100_000.0, closes)) as c:
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        assert _wait_until(lambda: store.open_position_for("AEHL") is not None)
+        assert _sym(c, "AEHL")["continuation"]["status"] == "continuation"
+
+    assert store.open_position_for("AEHL") is not None
+
+
+def test_a_fresh_symbol_also_enters_normally_no_different_treatment(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": [_entry_bars()]})
+    closes = [10.0, 10.2, 9.9, 10.1, 10.0, 9.8, 10.05, 10.1]  # ordinary noise
+
+    with _client(fetch, journal_store=store,
+                fetch_daily_bars=_daily_bars_fetcher_with_closes(100_000.0, closes)) as c:
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        assert _wait_until(lambda: store.open_position_for("AEHL") is not None)
+        assert _sym(c, "AEHL")["continuation"]["status"] == "fresh"
+
+    assert store.open_position_for("AEHL") is not None
