@@ -2090,17 +2090,45 @@ section 12's own verification (no real Schwab credentials for daily
 history in this dev environment) — with the stub logging its own call
 count this time, specifically to prove reuse.
 
-Two runs from fresh `journal.db` files: with daily closes producing a
-real +112.1% day, `GET /api/state` showed `{"status": "continuation",
-"days": [{"ts": 3, "pct_change": 1.121...}], ...}`, the rendered page
-showed `Continuation — +112.1% on 12/31`, and the fetch-call log
+**A first verification pass used the stub's own loop index (0..7) as
+each daily bar's `ts`, not a real date — caught, not shipped: the
+rendered date came out `12/31` (`ts=3` is `1969-12-31 19:00:03 EST`,
+the standard "small-integer-as-Unix-epoch" artifact), which is a
+completely ordinary shortcut for testing the pure day-over-day
+comparison logic (the loop index is never fine for a LIVE-verification
+demonstration meant to show what a real user would actually see, and
+was corrected before this section shipped, not after). Traced to
+confirm it was ONLY this stub's own shortcut, not a bug in the shared
+`schwab-connector/price_history.py` fetch path both this flag and
+section 12's volume gate depend on: that module's real `candles_to_bars`
+(`ts = int(dt) // 1000`, a plain epoch-ms-to-seconds conversion) is
+pre-existing code, unchanged by this session, already covered by its
+own test asserting a REAL 2025-09-03 epoch-ms value maps back to the
+exact matching real date — and was itself verified live against
+production Schwab data before this session even began (section 4: a
+real NVDA backfill, 775 real bars). `avg_daily_volume`'s own math never
+even reads `ts` at all, only `volume` — so section 12's already-
+deployed calculation was never at risk either way. The verification
+below was re-run using genuinely realistic dates (real September 2026
+calendar dates, each converted to its own real epoch second) before
+this section was marked done.
+
+Two runs from fresh `journal.db` files, using real dates 2026-09-08
+through 2026-09-17 (a real Tuesday-through-Thursday span, skipping the
+weekend): with daily closes producing a real +112.1% day on 2026-09-11,
+`GET /api/state` showed `{"status": "continuation", "days":
+[{"ts": 1789133400, "pct_change": 1.121...}], ...}` (`1789133400` is
+exactly `2026-09-11 09:30:00 America/New_York`, confirmed independently
+via direct epoch-to-date conversion, not just trusted), the rendered
+page showed `Continuation — +112.1% on 09/11`, and the fetch-call log
 showed exactly `call_count=1` for the symbol — the SAME single fetch
 that also populated `avg_daily_volume`. With ordinary-noise daily
-closes (no day exceeding 50%), `GET /api/state` showed `{"status":
-"fresh", "days": [], ...}`, the rendered page showed `Day 1 (fresh) —
-no moves over 50% in the past 7 trading days`, and the fetch-call log
-again showed exactly `call_count=1`. Both runs, against the SAME real
-cascading replay fixture, produced the identical real trade count (5,
+closes over the same real date range (no day exceeding 50%), `GET
+/api/state` showed `{"status": "fresh", "days": [], ...}`, the
+rendered page showed `Day 1 (fresh) — no moves over 50% in the past 7
+trading days`, and the fetch-call log again showed exactly
+`call_count=1`. Both runs, against the SAME real cascading replay
+fixture, produced the identical real trade count (5,
 confirmed by direct query against each run's own `trades` table) —
 live, direct proof that continuation status never affects entry
 behavior, not merely that `should_enter`'s signature has no parameter
