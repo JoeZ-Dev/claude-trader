@@ -2,7 +2,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from indicators import session_vwap, ema, macd, relative_volume
-from levels import detect_levels, evaluate_hold
+from levels import confirmed_swing_lows, detect_levels, evaluate_hold
 
 
 def bar(ts, o, h, l, c, v):
@@ -49,6 +49,43 @@ def test_relative_volume_hand_computed():
     result = relative_volume(bars, lookback=20)
     assert result[:20] == [1.0] * 20  # not enough history yet
     assert abs(result[20] - 5.0) < 1e-9
+
+
+# -- confirmed_swing_lows (specs.md section 13's early-phase exit) --------
+
+def test_confirmed_swing_lows_finds_a_clean_v_shape():
+    # window=3 needs 3 bars on EACH side of the candidate -- exactly 7
+    # bars here, the low (4) at index 3, fully bracketed.
+    lows = [10, 8, 6, 4, 6, 8, 10]
+    bars = [bar(i, l, l + 1, l, l, 1000) for i, l in enumerate(lows)]
+    result = confirmed_swing_lows(bars, window=3)
+    assert len(result) == 1
+    assert result[0]["ts"] == 3
+    assert result[0]["price"] == 4
+
+
+def test_confirmed_swing_lows_empty_when_not_enough_bars_to_confirm():
+    # A dip right at the tail end has no bars after it yet to confirm it.
+    lows = [10, 8, 6, 4]
+    bars = [bar(i, l, l + 1, l, l, 1000) for i, l in enumerate(lows)]
+    assert confirmed_swing_lows(bars, window=3) == []
+
+
+def test_confirmed_swing_lows_ignores_zero_volume_bars_as_candidates():
+    # Same forward-fill exclusion detect_levels already relies on
+    # (_swing_points) -- reused here, not reimplemented.
+    lows = [10, 8, 6, 4, 6, 8, 10]
+    bars = [bar(i, l, l + 1, l, l, 1000) for i, l in enumerate(lows)]
+    bars[3]["volume"] = 0.0  # the candidate low itself, forward-filled
+    assert confirmed_swing_lows(bars, window=3) == []
+
+
+def test_confirmed_swing_lows_returns_multiple_in_bar_order():
+    lows = [10, 8, 6, 4, 6, 8, 10, 8, 6, 3, 6, 8, 10]
+    bars = [bar(i, l, l + 1, l, l, 1000) for i, l in enumerate(lows)]
+    result = confirmed_swing_lows(bars, window=3)
+    assert [r["price"] for r in result] == [4, 3]
+    assert [r["ts"] for r in result] == [3, 9]
 
 
 def test_detect_levels_finds_double_top_with_higher_strength_than_single_touch():

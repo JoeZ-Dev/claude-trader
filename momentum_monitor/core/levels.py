@@ -83,6 +83,25 @@ def _swing_points(bars: list[dict], window: int, kind: str) -> list[int]:
     return idxs
 
 
+def confirmed_swing_lows(bars: list[dict], window: int = 3) -> list[dict]:
+    """Every CONFIRMED swing low in `bars` (a local minimum with `window`
+    bars fully bracketing it on both sides, per `_swing_points` -- reused
+    directly, not reimplemented) as `{"ts", "price"}` dicts, oldest first.
+
+    Exposed as its own public function, separate from `detect_levels`'
+    clustered/scored `Level` output, because the virtual journal's early-
+    phase exit (specs.md section 13, the swing-low-anchored stop) needs
+    the raw sequence of confirmed lows -- including the SAME real
+    confirmation delay `_swing_points` already imposes (a low isn't
+    "confirmed" until `window` bars have printed after it) -- not a level
+    clustered and scored for resistance/support display. `bars` is used
+    exactly as given; a caller wanting "since a position's entry" slices
+    to that range itself, the same way every other function in this
+    module takes bars as-is with no concept of a caller-specific window."""
+    idxs = _swing_points(bars, window, kind="low")
+    return [{"ts": bars[i]["ts"], "price": bars[i]["low"]} for i in idxs]
+
+
 def _nearest_round_number(price: float, increment: float | None = None) -> float:
     """Nearest round-number grid point on EITHER side of `price`. Grid
     increment is picked by `_round_number_increment(price)` (that price's
