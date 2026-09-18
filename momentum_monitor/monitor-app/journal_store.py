@@ -94,6 +94,23 @@ changes through three DIFFERENT kinds of action (a real trade closing,
 an explicit reset to base_equity, an explicit manual override) that
 must stay distinguishable later, not just old-value/new-value pairs
 with no indication of WHICH path produced them.
+
+Also (added 2026-09-18, specs.md section 13): `trades` gains
+`exit_phase`/`swing_low_buffer_pct_used`/
+`pattern_progress_threshold_pct_used`/`phase_transitioned_ts` for the
+two-phase exit (see journal_logic.py's OpenPosition). Unlike every
+prior addition's migration story, a NULL `exit_phase` on an existing
+row does NOT mean "defaulted the same as a brand-new position" --
+`_row_to_position` explicitly reads a NULL back as `"trailing"`, never
+`"trailing_stop"` phase's dataclass-default sibling `"swing_low"`,
+because a pre-migration OPEN position was already using the original
+flat-trail-only mechanism the whole time it's been open; resuming it
+into the early phase would be a real, wrong, retroactive behavior
+change for a trade already in flight, not a neutral default.
+`swing_low_buffer_pct`/`pattern_progress_threshold_pct`/
+`session_volume_multiple` (the session-level volume gate, same
+section) join `base_equity`/`risk_pct_per_trade` in the EXISTING
+`strategy_params` mechanism -- no new table.
 """
 from __future__ import annotations
 
@@ -179,6 +196,10 @@ _ADDED_COLUMNS = [
     ("risk_pct_used", "REAL"),
     ("risk_amount_used", "REAL"),
     ("realized_pnl_dollars", "REAL"),
+    ("exit_phase", "TEXT"),
+    ("swing_low_buffer_pct_used", "REAL"),
+    ("pattern_progress_threshold_pct_used", "REAL"),
+    ("phase_transitioned_ts", "INTEGER"),
 ]
 
 # A note longer than this is rejected outright (409), never silently
@@ -205,11 +226,36 @@ MAX_WATCH_NOTE_LENGTH = 500
 # (50%) as a ceiling mirrors trail_pct's own reasoning exactly: already
 # far more than this strategy would ever plausibly risk on one trade,
 # chosen as a sanity ceiling, not a validated "correct" number.
+# swing_low_buffer_pct (specs.md section 13) is a small cushion below
+# whatever anchor (a confirmed swing low, or the entry-trigger level)
+# governs phase 1's stop -- 0.005 (0.5%) is the chosen default: enough
+# to absorb a typical wick-through-the-exact-low without meaningfully
+# widening the stop, small enough that it's still anchored to a REAL
+# level, not a guess; 0.1 (10%) as a ceiling is already a wide cushion
+# for a "small buffer" concept, a sanity bound not a validated number.
+# pattern_progress_threshold_pct is how far above entry price must climb
+# (measured via high_water_mark, same ratchet-from-high convention as
+# the flat trail itself) before phase 1 hands off to phase 2's proven
+# flat trail -- 0.03 (3%) is the chosen default: comfortably past normal
+# intrabar noise/spread on these volatile low-priced candidates, while
+# still handing off early enough that most real winners actually reach
+# phase 2 (the point of having one at all); 1.0 (100%) as a ceiling
+# reflects how volatile these candidates genuinely are, not an absurd
+# extreme for this project's own trading range.
+# session_volume_multiple (specs.md section 13) is how many multiples of
+# a symbol's typical daily volume today's cumulative session volume
+# must clear to allow an entry -- 3.0 is the user's own stated
+# criterion, not a guess; 50.0 as a ceiling mirrors volume_confirm_
+# threshold's own "generous but non-absurd" reasoning, scaled up since
+# this compares a full day's cumulative volume, not one bar's.
 _PARAM_BOUNDS = {
     "trail_pct": (0.0, 0.5),
     "volume_confirm_threshold": (0.0, 20.0),
     "base_equity": (0.0, 10_000_000.0),
     "risk_pct_per_trade": (0.0, 0.5),
+    "swing_low_buffer_pct": (0.0, 0.1),
+    "pattern_progress_threshold_pct": (0.0, 1.0),
+    "session_volume_multiple": (0.0, 50.0),
 }
 
 # current_equity's own seed/reset fallback (specs.md section 7) -- "2000
@@ -557,22 +603,34 @@ class JournalStore:
             "INSERT INTO trades (symbol, entry_ts, entry_price, "
             "high_water_mark, stop_level, setup_type, factors, "
             "trail_pct_used, volume_threshold_used, watch_note, "
-            "shares, account_size_used, risk_pct_used, risk_amount_used) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "shares, account_size_used, risk_pct_used, risk_amount_used, "
+            "exit_phase, swing_low_buffer_pct_used, "
+            "pattern_progress_threshold_pct_used, phase_transitioned_ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (position.symbol.upper(), position.entry_ts, position.entry_price,
              position.high_water_mark, position.stop_level, position.setup_type,
              json.dumps(position.factors) if position.factors is not None else None,
              position.trail_pct, position.volume_threshold_used, position.watch_note,
              position.shares, position.account_size_used, position.risk_pct_used,
-             position.risk_amount_used),
+             position.risk_amount_used, position.exit_phase,
+             position.swing_low_buffer_pct_used,
+             position.pattern_progress_threshold_pct_used,
+             position.phase_transitioned_ts),
         )
         self._conn.commit()
         return replace(position, id=cur.lastrowid)
 
     def update_trailing(self, position: OpenPosition) -> None:
+        # exit_phase/phase_transitioned_ts persist here too (specs.md
+        # section 13) -- the ONE-WAY swing_low -> trailing transition
+        # happens mid-trade, on a ratchet, not at create()/close_position()
+        # time, so it needs to survive a restart the same way high_water_
+        # mark/stop_level already do.
         self._conn.execute(
-            "UPDATE trades SET high_water_mark = ?, stop_level = ? WHERE id = ?",
-            (position.high_water_mark, position.stop_level, position.id),
+            "UPDATE trades SET high_water_mark = ?, stop_level = ?, "
+            "exit_phase = ?, phase_transitioned_ts = ? WHERE id = ?",
+            (position.high_water_mark, position.stop_level, position.exit_phase,
+             position.phase_transitioned_ts, position.id),
         )
         self._conn.commit()
 
@@ -640,6 +698,18 @@ class JournalStore:
 # row (trail_pct_used NULL) resumes using whatever OpenPosition itself
 # considers "no value given," so the two can never silently drift apart.
 _DEFAULT_TRAIL_PCT = OpenPosition.__dataclass_fields__["trail_pct"].default
+# The dataclass's own default ("trailing") -- a pre-migration open
+# position, resumed after this feature shipped, was ALREADY using the
+# original flat-trail-only mechanism the whole time it's been open;
+# resuming it into "swing_low" phase would be a wrong, retroactive
+# behavior change for a trade already in flight. Reading a NULL
+# exit_phase column back as "trailing" (never "swing_low", the
+# dataclass field default would otherwise imply nothing either way
+# here, since _row_to_position always passes an explicit value) is
+# what keeps that correct -- same migration discipline as trail_pct
+# above, applied to a case where the safe fallback ISN'T the dataclass
+# field default's own literal value.
+_DEFAULT_EXIT_PHASE_ON_RESUME = "trailing"
 
 
 def _row_to_position(row: sqlite3.Row) -> OpenPosition:
@@ -654,6 +724,11 @@ def _row_to_position(row: sqlite3.Row) -> OpenPosition:
         watch_note=row["watch_note"],
         shares=row["shares"], account_size_used=row["account_size_used"],
         risk_pct_used=row["risk_pct_used"], risk_amount_used=row["risk_amount_used"],
+        exit_phase=(row["exit_phase"] if row["exit_phase"] is not None
+                   else _DEFAULT_EXIT_PHASE_ON_RESUME),
+        swing_low_buffer_pct_used=row["swing_low_buffer_pct_used"],
+        pattern_progress_threshold_pct_used=row["pattern_progress_threshold_pct_used"],
+        phase_transitioned_ts=row["phase_transitioned_ts"],
     )
 
 

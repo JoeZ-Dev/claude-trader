@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import sys
+from dataclasses import replace
 
 _APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _APP_DIR)
@@ -980,3 +981,86 @@ def test_equity_state_and_history_tables_exist_on_a_db_that_predates_them(tmp_pa
     assert store.current_equity() == 2000.0
     store.apply_realized_pnl(trade_id=1, pnl_dollars=10.0)
     assert store.current_equity() == 2010.0
+
+
+# -- two-phase exit + session-level volume gate (specs.md section 13) -----
+
+def test_swing_low_buffer_pattern_progress_and_session_volume_multiple_are_recognized_params(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    store.set_param("swing_low_buffer_pct", 0.008)
+    store.set_param("pattern_progress_threshold_pct", 0.04)
+    store.set_param("session_volume_multiple", 4.0)
+    assert store.get_param("swing_low_buffer_pct", 0.0) == 0.008
+    assert store.get_param("pattern_progress_threshold_pct", 0.0) == 0.04
+    assert store.get_param("session_volume_multiple", 0.0) == 4.0
+
+
+def test_session_volume_multiple_rejects_a_value_over_its_ceiling(tmp_path):
+    from journal_store import InvalidParamError
+    store = JournalStore(tmp_path / "journal.db")
+    with pytest.raises(InvalidParamError):
+        store.set_param("session_volume_multiple", 51.0)
+
+
+def test_create_persists_two_phase_exit_snapshot(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    pos = OpenPosition(id=None, symbol="AEHL", entry_ts=100, entry_price=10.0,
+                       high_water_mark=10.0, stop_level=9.45,
+                       exit_phase="swing_low", swing_low_buffer_pct_used=0.005,
+                       pattern_progress_threshold_pct_used=0.03,
+                       phase_transitioned_ts=None)
+    created = store.create(pos)
+    assert created.exit_phase == "swing_low"
+    assert created.swing_low_buffer_pct_used == 0.005
+    assert created.pattern_progress_threshold_pct_used == 0.03
+    assert created.phase_transitioned_ts is None
+
+    found = store.open_position_for("AEHL")
+    assert found.exit_phase == "swing_low"
+    assert found.swing_low_buffer_pct_used == 0.005
+    assert found.pattern_progress_threshold_pct_used == 0.03
+
+
+def test_update_trailing_persists_a_phase_transition(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    pos = OpenPosition(id=None, symbol="AEHL", entry_ts=100, entry_price=10.0,
+                       high_water_mark=10.0, stop_level=9.45,
+                       exit_phase="swing_low", swing_low_buffer_pct_used=0.005,
+                       pattern_progress_threshold_pct_used=0.03)
+    created = store.create(pos)
+
+    transitioned = replace(created, high_water_mark=10.35, stop_level=9.83,
+                          exit_phase="trailing", phase_transitioned_ts=150)
+    store.update_trailing(transitioned)
+
+    found = store.open_position_for("AEHL")
+    assert found.exit_phase == "trailing"
+    assert found.phase_transitioned_ts == 150
+    assert found.high_water_mark == 10.35
+
+
+def test_two_phase_exit_columns_migrate_onto_an_existing_trades_table(tmp_path):
+    db_path = tmp_path / "journal.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(_PRE_SIZING_SCHEMA)
+    conn.execute(
+        "INSERT INTO trades (symbol, entry_ts, entry_price, high_water_mark, "
+        "stop_level) VALUES ('AEHL', 100, 10.0, 10.0, 9.5)",
+    )
+    conn.commit()
+    conn.close()
+
+    store = JournalStore(db_path)  # must not raise
+    resumed = store.open_position_for("AEHL")
+    # A pre-migration OPEN position was already using the flat-trail-only
+    # mechanism the whole time it's been open -- resuming it must NOT
+    # retroactively drop it into the early swing_low phase.
+    assert resumed.exit_phase == "trailing"
+    assert resumed.swing_low_buffer_pct_used is None
+    assert resumed.pattern_progress_threshold_pct_used is None
+    assert resumed.phase_transitioned_ts is None
+    # And it must still ratchet/close cleanly afterward.
+    store.update_trailing(replace(resumed, high_water_mark=10.5, stop_level=9.975))
+    still_open = store.open_position_for("AEHL")
+    assert still_open.exit_phase == "trailing"
+    assert still_open.high_water_mark == 10.5
