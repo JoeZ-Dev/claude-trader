@@ -135,6 +135,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from journal_logic import ExitEvent, OpenPosition, advance_journal
+from journal_store import InvalidParamError
 from state import build_state
 
 # Same exchange-local timezone state.py already anchors session VWAP to
@@ -308,6 +309,37 @@ class Poller:
         if deleted:
             self._broadcast_state()
         return deleted
+
+    def strategy_params(self) -> dict:
+        """Live-tunable strategy_params (specs.md section 8): current
+        value + when each was last changed, for GET /api/strategy_params.
+        Falls back to the constructor-provided defaults (never seeded/
+        journaling disabled) rather than an empty dict, so the endpoint
+        still reports something meaningful."""
+        if self._journal_store is None:
+            return {
+                "trail_pct": {"value": self._trail_pct, "updated_at": None},
+                "volume_confirm_threshold": {
+                    "value": self._volume_confirm_threshold, "updated_at": None},
+            }
+        return self._journal_store.all_params()
+
+    def set_strategy_param(self, key: str, value: float) -> None:
+        """Raises journal_store.InvalidParamError (propagated, not
+        swallowed) for an invalid key or out-of-range value -- the route
+        translates that into a 409, same convention as every other
+        validation failure in this app. A no-op (not an error) if
+        journaling is disabled entirely, matching every other
+        journal_store-backed method's None-store handling."""
+        if self._journal_store is None:
+            return
+        self._journal_store.set_param(key, value)
+        self._broadcast_state()
+
+    def strategy_param_history(self, key: str | None = None, limit: int = 50) -> list[dict]:
+        if self._journal_store is None:
+            return []
+        return self._journal_store.param_history(key, limit)
 
     def _journal_open_for(self, slot: _SymbolSlot) -> dict | None:
         if slot.journal_position is None:
@@ -537,6 +569,7 @@ class Poller:
             "recent_closed": self.recent_closed(limit=10),
             "poll_enabled": self.poll_enabled,
             "max_symbols": self.max_symbols,
+            "strategy_params": self.strategy_params(),
         }
 
     def _broadcast_state(self) -> None:
@@ -578,12 +611,25 @@ class Poller:
         # all).
         setups = slot.state.get("setups", [])
         relative_volume = slot.state.get("session", {}).get("relative_volume", 0.0)
+        # Live-tunable (2026-09-18, specs.md section 8): read from
+        # strategy_params on EVERY decision, not the constructor-frozen
+        # self._trail_pct/self._volume_confirm_threshold (which now only
+        # serve as the seed/fallback default, passed as get_param's
+        # `default` -- used if journal_store somehow has no row yet). A
+        # change made via POST /api/strategy_params takes effect on the
+        # very next call here, no restart needed. An already-open
+        # position is unaffected either way -- advance_journal only
+        # applies these to a BRAND NEW entry; an existing position keeps
+        # ratcheting on its own locked-in OpenPosition.trail_pct.
+        trail_pct = self._journal_store.get_param("trail_pct", self._trail_pct)
+        volume_confirm_threshold = self._journal_store.get_param(
+            "volume_confirm_threshold", self._volume_confirm_threshold)
         tick = advance_journal(
             position=slot.journal_position, new_bars=new_bars,
             setups=setups, was_confirmed_types=slot.journal_confirmed_types,
             relative_volume=relative_volume,
-            volume_confirm_threshold=self._volume_confirm_threshold,
-            trail_pct=self._trail_pct, symbol=symbol,
+            volume_confirm_threshold=volume_confirm_threshold,
+            trail_pct=trail_pct, symbol=symbol,
         )
         # tick.closed applies independently of opened/updated -- a stop-out
         # can be immediately followed, within the SAME batch of new_bars,
@@ -895,8 +941,23 @@ def _watch_form_html(count: int, max_symbols: int) -> str:
 """
 
 
+def _strategy_params_html(params: dict) -> str:
+    # Read-only display (specs.md section 8: "no UI element required this
+    # pass beyond maybe displaying current values read-only somewhere
+    # convenient" -- the adjustment mechanism itself is API-only for now,
+    # a settings UI is a separate follow-up). id="strategy-params" so
+    # render() can refresh it in place on every push, same pattern as
+    # every other element this page updates without a full reload.
+    parts = []
+    for key in sorted(params):
+        p = params[key]
+        when = _fmt_ts(p.get("updated_at")) if p.get("updated_at") else "seed default"
+        parts.append(f"{html.escape(key)}={_fmt(p['value'], 4)} (since {when})")
+    return " · ".join(parts)
+
+
 def _page(full_states: dict[str, dict], recent_closed: list[dict], poll_enabled: bool,
-          max_symbols: int) -> str:
+          max_symbols: int, strategy_params: dict) -> str:
     if full_states:
         cards_html = "".join(_symbol_card_html(sym, st) for sym, st in full_states.items())
     else:
@@ -904,6 +965,7 @@ def _page(full_states: dict[str, dict], recent_closed: list[dict], poll_enabled:
                       f"(up to {max_symbols}).</p>")
 
     body = f"""
+<p id="strategy-params" class="muted">{_strategy_params_html(strategy_params)}</p>
 {_watch_form_html(len(full_states), max_symbols)}
 <div id="symbols" class="grid">{cards_html}</div>
 <section class="card">
@@ -1160,6 +1222,18 @@ function render(data) {
 
   document.getElementById('journal-closed-tbody').innerHTML = journalClosedRows(data.recent_closed);
   document.getElementById('slot-count').textContent = syms.length + ' / ' + maxSymbols + ' symbols watched';
+  const paramsEl = document.getElementById('strategy-params');
+  if (paramsEl && data.strategy_params) paramsEl.textContent = strategyParamsText(data.strategy_params);
+}
+
+// Mirrors _strategy_params_html (Python side) -- read-only display, kept
+// in sync on every push the same way as everything else on this page.
+function strategyParamsText(params) {
+  return Object.keys(params).sort().map(function (key) {
+    const p = params[key];
+    const when = p.updated_at ? fmtTs(p.updated_at) : 'seed default';
+    return key + '=' + fmt(p.value, 4) + ' (since ' + when + ')';
+  }).join(' \\u00b7 ');
 }
 
 // Thin wrapper kept for the explicit post-action call sites below
@@ -1520,7 +1594,7 @@ def create_app(*, fetch_bars, watch_symbol=None,
     @app.get("/", response_class=HTMLResponse)
     async def root():
         return _page(poller.all_full_states(), poller.recent_closed(limit=10),
-                    poller.poll_enabled, poller.max_symbols)
+                    poller.poll_enabled, poller.max_symbols, poller.strategy_params())
 
     @app.post("/api/watch")
     async def api_watch(request: Request):
@@ -1576,5 +1650,43 @@ def create_app(*, fetch_bars, watch_symbol=None,
     async def api_journal_clear_symbol_switched():
         deleted = poller.clear_symbol_switched()
         return JSONResponse({"ok": True, "deleted": deleted})
+
+    @app.get("/api/strategy_params")
+    async def api_strategy_params_get():
+        # Live-tunable strategy parameters (specs.md section 8): current
+        # value + when each was last changed. "history" is the full
+        # change log (most recent first), included here rather than a
+        # separate route -- there's only ever a handful of parameters and
+        # a modest number of changes, not worth a second round trip for.
+        return JSONResponse({
+            "params": poller.strategy_params(),
+            "history": poller.strategy_param_history(),
+        })
+
+    @app.post("/api/strategy_params")
+    async def api_strategy_params_post(request: Request):
+        # {"trail_pct": 0.08} or {"trail_pct": 0.08, "volume_confirm_threshold": 2.0}
+        # -- one or more keys in a single call. Each is validated
+        # independently (journal_store.InvalidParamError -> 409, same
+        # convention as every other validation failure in this app); a
+        # rejected key changes NOTHING for that key (set_param never
+        # writes on failure) and the response reports exactly which keys
+        # succeeded vs. were rejected, rather than all-or-nothing failing
+        # the whole call over one bad value among several.
+        body = await request.json()
+        updated = {}
+        rejected = {}
+        for key, value in body.items():
+            try:
+                poller.set_strategy_param(key, float(value))
+                updated[key] = value
+            except (InvalidParamError, TypeError, ValueError) as exc:
+                rejected[key] = str(exc)
+        status = 200 if not rejected else 409
+        return JSONResponse(
+            {"ok": not rejected, "updated": updated, "rejected": rejected,
+             "params": poller.strategy_params()},
+            status_code=status,
+        )
 
     return app

@@ -12,16 +12,20 @@ Environment:
   JOURNAL_DB_PATH       SQLite file for the virtual trade journal
                         (specs.md section 6)              (default /data/journal.db)
   TRAIL_PCT             trailing-stop percent below the running high-water
-                        mark for the virtual journal -- a starting point to
-                        tune against real logged data, NOT a validated
-                        number (specs.md section 6)        (default 0.05)
+                        mark for the virtual journal (specs.md section 6) --
+                        only the SEED default for the strategy_params table
+                        (section 8): read once, on the very first run
+                        against a given journal.db, to initialize the
+                        live-tunable value there. Every run after that
+                        reads the DB, not this env var -- change the value
+                        via POST /api/strategy_params, not by editing this
+                        and redeploying               (default 0.05)
   VOLUME_CONFIRM_THRESHOLD  how far above "average" (1.0 = equal to the
                         trailing 20-bar volume average) a bar's volume must
                         be, at the moment a setup type confirms, for a
-                        virtual entry to fire -- a starting point to tune
-                        against real logged data, NOT a validated number,
-                        same treatment as TRAIL_PCT (specs.md section 6)
-                                                            (default 1.5)
+                        virtual entry to fire (specs.md section 6) -- same
+                        seed-only treatment as TRAIL_PCT above, live-tuned
+                        via the API from then on     (default 1.5)
 
 Run:  uvicorn main:app --host 0.0.0.0 --port 8012
 """
@@ -46,7 +50,10 @@ TRAIL_PCT = float(os.environ.get("TRAIL_PCT", "0.05"))
 VOLUME_CONFIRM_THRESHOLD = float(os.environ.get("VOLUME_CONFIRM_THRESHOLD", "1.5"))
 
 _client = httpx.AsyncClient(timeout=10.0)
-_journal_store = JournalStore(JOURNAL_DB_PATH)
+_journal_store = JournalStore(JOURNAL_DB_PATH, default_params={
+    "trail_pct": TRAIL_PCT,
+    "volume_confirm_threshold": VOLUME_CONFIRM_THRESHOLD,
+})
 
 
 async def fetch_bars(symbol: str, since_ts: float):

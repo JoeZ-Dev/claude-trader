@@ -28,13 +28,26 @@ which of the four setup types fired, see journal_logic.py), factors
 at the moment it happened: distance, trigger_price, relative_volume,
 plus whatever type-specific detail setup_types.SetupCandidate.factors
 carries -- so "why did this trade happen" is answerable later without
-guessing from whatever's currently displayed). Both nullable: a position
-opened before this existed has neither.
+guessing from whatever's currently displayed), trail_pct_used /
+volume_threshold_used (added 2026-09-18 -- the live strategy_params
+values actually in effect at entry, LOCKED onto the row -- see
+"strategy_params" below and journal_logic.py's OpenPosition.trail_pct).
+All four nullable: a position opened before each existed has none of
+that generation's columns.
+
+Also (added 2026-09-18, specs.md section 8): `strategy_params` (key,
+value, updated_at) -- the live-tunable values `Poller` reads on every
+journal decision instead of a frozen env-var constant, and
+`strategy_params_history` (id, key, old_value, new_value, changed_at) --
+an append-only log of every change, never an in-place overwrite with no
+trail. `trail_pct`/`volume_confirm_threshold` are the only two keys
+today; the schema doesn't assume that stays true.
 """
 from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -54,6 +67,18 @@ CREATE TABLE IF NOT EXISTS trades (
     realized_pnl_pct REAL,
     setup_type TEXT,
     factors TEXT
+);
+CREATE TABLE IF NOT EXISTS strategy_params (
+    key TEXT PRIMARY KEY,
+    value REAL NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS strategy_params_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key TEXT NOT NULL,
+    old_value REAL,
+    new_value REAL NOT NULL,
+    changed_at INTEGER NOT NULL
 )
 """
 
@@ -67,11 +92,34 @@ CREATE TABLE IF NOT EXISTS trades (
 _ADDED_COLUMNS = [
     ("setup_type", "TEXT"),
     ("factors", "TEXT"),
+    ("trail_pct_used", "REAL"),
+    ("volume_threshold_used", "REAL"),
 ]
+
+# (lower, upper] bounds a set_param value must fall within -- "positive,
+# reasonable-range" per specs.md section 8. trail_pct is a fraction (0.05 =
+# 5%); 0.5 (50%) is already a far wider trailing stop than this strategy
+# would ever plausibly use, chosen as a generous but non-absurd ceiling.
+# volume_confirm_threshold is a multiplier of the trailing 20-bar average
+# (1.5 = 50% above average); 20x average volume on a single bar is already
+# an extreme outlier, not a realistic gate setting. An unknown key has no
+# entry here and is rejected outright, not silently accepted with no
+# bounds check -- a mistyped key should fail loudly, not write a value
+# nothing ever reads.
+_PARAM_BOUNDS = {
+    "trail_pct": (0.0, 0.5),
+    "volume_confirm_threshold": (0.0, 20.0),
+}
+
+
+class InvalidParamError(ValueError):
+    """Raised by set_param for a value outside _PARAM_BOUNDS, or a key
+    with no known bounds at all (a mistyped or unsupported key)."""
 
 
 class JournalStore:
-    def __init__(self, db_path) -> None:
+    def __init__(self, db_path, *, default_params: dict[str, float] | None = None,
+                now_fn=time.time) -> None:
         # check_same_thread=False: an ASGI test client (and, in principle,
         # any WSGI/ASGI server using a worker-thread pool) may run the
         # request handling and the background poller task on different OS
@@ -80,11 +128,14 @@ class JournalStore:
         # single thread is driving that event loop at a time, never
         # concurrently, so relaxing sqlite3's same-thread check is safe
         # here rather than a real concurrency risk.
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        if str(db_path) != ":memory:":
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._now_fn = now_fn
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute(_SCHEMA)
+        self._conn.executescript(_SCHEMA)
         self._migrate_added_columns()
+        self._seed_params(default_params or {})
         self._conn.commit()
 
     def _migrate_added_columns(self) -> None:
@@ -92,6 +143,89 @@ class JournalStore:
         for name, sql_type in _ADDED_COLUMNS:
             if name not in existing:
                 self._conn.execute(f"ALTER TABLE trades ADD COLUMN {name} {sql_type}")
+
+    def _seed_params(self, defaults: dict[str, float]) -> None:
+        """Seeds strategy_params from the current env-derived defaults on
+        the FIRST-EVER run for each key only -- an already-tuned value
+        already on disk is never overwritten back to the env default on a
+        later restart (specs.md section 8), since main.py passes the same
+        defaults in on every single startup, tuned or not."""
+        now = int(self._now_fn())
+        for key, value in defaults.items():
+            existing = self._conn.execute(
+                "SELECT 1 FROM strategy_params WHERE key = ?", (key,),
+            ).fetchone()
+            if existing is None:
+                self._conn.execute(
+                    "INSERT INTO strategy_params (key, value, updated_at) VALUES (?, ?, ?)",
+                    (key, value, now),
+                )
+
+    # -- live-tunable strategy parameters (specs.md section 8) ------------
+
+    def get_param(self, key: str, default: float) -> float:
+        """The live value for `key`, or `default` if it's never been set
+        (no default_params were seeded for it and nobody has called
+        set_param yet)."""
+        row = self._conn.execute(
+            "SELECT value FROM strategy_params WHERE key = ?", (key,),
+        ).fetchone()
+        return row["value"] if row is not None else default
+
+    def all_params(self) -> dict[str, dict]:
+        """Every current value, with when it was last changed -- the data
+        behind GET /api/strategy_params."""
+        rows = self._conn.execute("SELECT key, value, updated_at FROM strategy_params").fetchall()
+        return {r["key"]: {"value": r["value"], "updated_at": r["updated_at"]} for r in rows}
+
+    def set_param(self, key: str, value: float) -> None:
+        """Validates against _PARAM_BOUNDS (raises InvalidParamError,
+        changing NOTHING, if it fails), then updates the live value AND
+        appends an old-value/new-value/timestamp row to
+        strategy_params_history -- never an in-place overwrite with no
+        trail (specs.md section 8's explicit requirement)."""
+        bounds = _PARAM_BOUNDS.get(key)
+        if bounds is None:
+            raise InvalidParamError(f"{key!r} is not a recognized strategy parameter")
+        lo, hi = bounds
+        if not (lo < value <= hi):
+            raise InvalidParamError(
+                f"{key}={value!r} is out of the valid range ({lo}, {hi}]")
+
+        now = int(self._now_fn())
+        old_row = self._conn.execute(
+            "SELECT value FROM strategy_params WHERE key = ?", (key,),
+        ).fetchone()
+        old_value = old_row["value"] if old_row is not None else None
+
+        self._conn.execute(
+            "INSERT INTO strategy_params (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "updated_at = excluded.updated_at",
+            (key, value, now),
+        )
+        self._conn.execute(
+            "INSERT INTO strategy_params_history (key, old_value, new_value, changed_at) "
+            "VALUES (?, ?, ?, ?)",
+            (key, old_value, value, now),
+        )
+        self._conn.commit()
+
+    def param_history(self, key: str | None = None, limit: int = 50) -> list[dict]:
+        """Most-recent-first. Scoped to one `key` if given, else every
+        parameter's changes interleaved by time."""
+        if key is None:
+            rows = self._conn.execute(
+                "SELECT * FROM strategy_params_history ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM strategy_params_history WHERE key = ? "
+                "ORDER BY id DESC LIMIT ?",
+                (key, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def open_position_for(self, symbol: str) -> OpenPosition | None:
         """The currently-open (exit_ts IS NULL) position for `symbol`, if
@@ -108,11 +242,13 @@ class JournalStore:
     def create(self, position: OpenPosition) -> OpenPosition:
         cur = self._conn.execute(
             "INSERT INTO trades (symbol, entry_ts, entry_price, "
-            "high_water_mark, stop_level, setup_type, factors) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "high_water_mark, stop_level, setup_type, factors, "
+            "trail_pct_used, volume_threshold_used) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (position.symbol.upper(), position.entry_ts, position.entry_price,
              position.high_water_mark, position.stop_level, position.setup_type,
-             json.dumps(position.factors) if position.factors is not None else None),
+             json.dumps(position.factors) if position.factors is not None else None,
+             position.trail_pct, position.volume_threshold_used),
         )
         self._conn.commit()
         return replace(position, id=cur.lastrowid)
@@ -171,12 +307,21 @@ class JournalStore:
         return cur.rowcount
 
 
+# The dataclass's own default, not a re-typed literal -- a pre-migration
+# row (trail_pct_used NULL) resumes using whatever OpenPosition itself
+# considers "no value given," so the two can never silently drift apart.
+_DEFAULT_TRAIL_PCT = OpenPosition.__dataclass_fields__["trail_pct"].default
+
+
 def _row_to_position(row: sqlite3.Row) -> OpenPosition:
     return OpenPosition(
         id=row["id"], symbol=row["symbol"], entry_ts=row["entry_ts"],
         entry_price=row["entry_price"], high_water_mark=row["high_water_mark"],
         stop_level=row["stop_level"], setup_type=row["setup_type"],
         factors=json.loads(row["factors"]) if row["factors"] is not None else None,
+        trail_pct=(row["trail_pct_used"] if row["trail_pct_used"] is not None
+                   else _DEFAULT_TRAIL_PCT),
+        volume_threshold_used=row["volume_threshold_used"],
     )
 
 

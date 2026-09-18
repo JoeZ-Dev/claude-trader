@@ -345,3 +345,57 @@ def test_volume_confirm_threshold_wired_through_create_app_blocks_a_real_entry(t
         assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
         time.sleep(0.1)
         assert store.open_position_for("AEHL") is None
+
+
+# -- specs.md section 8: strategy_params are live-tunable, no restart -----
+
+def test_changing_trail_pct_via_api_takes_effect_on_the_next_entry_no_restart(tmp_path):
+    store = JournalStore(tmp_path / "journal.db",
+                         default_params={"trail_pct": 0.05,
+                                         "volume_confirm_threshold": 0.0})
+    fetch = FakeFetch({"AEHL": [_entry_bars()]})
+
+    with _client(fetch, journal_store=store) as c:
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        first = store.open_position_for("AEHL")
+        assert first.trail_pct == 0.05
+        assert first.stop_level == round(9.1 * (1 - 0.05), 10)
+
+        # Change the LIVE value via the real API -- same process, no
+        # restart -- then unwatch/re-watch to drive a second, independent
+        # entry and confirm it picks up the new value immediately.
+        r = c.post("/api/strategy_params", json={"trail_pct": 0.20})
+        assert r.status_code == 200
+
+        c.post("/api/unwatch", data={"symbol": "AEHL"})
+        fetch2 = FakeFetch({"AEHL": [_entry_bars()]})
+        with _client(fetch2, journal_store=store) as c2:
+            assert _wait_until(lambda: _sym(c2, "AEHL").get("bar_count") == 15)
+            second = store.open_position_for("AEHL")
+            assert second.trail_pct == 0.20            # picked up the new value
+            assert second.stop_level == round(9.1 * (1 - 0.20), 10)
+
+
+def test_a_parameter_change_after_entry_does_not_affect_the_open_positions_ratchet(tmp_path):
+    store = JournalStore(tmp_path / "journal.db",
+                         default_params={"trail_pct": 0.05,
+                                         "volume_confirm_threshold": 0.0})
+    fetch = FakeFetch({"AEHL": [_entry_bars(), _ratchet_bars()]})
+
+    with _client(fetch, journal_store=store) as c:
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        opened = store.open_position_for("AEHL")
+        assert opened.trail_pct == 0.05
+
+        # Change the live value WHILE this position is still open.
+        r = c.post("/api/strategy_params", json={"trail_pct": 0.50})
+        assert r.status_code == 200
+
+        _resync(c)  # _ratchet_bars -- this position's own next decision
+        ratcheted = store.open_position_for("AEHL")
+        assert ratcheted.id == opened.id
+        assert ratcheted.trail_pct == 0.05  # still the value locked in at ITS entry
+        # high after ratchet_bars is 9.2 (see _ratchet_bars) -- stop must
+        # reflect the LOCKED 0.05, not the new global 0.50, or this
+        # assertion would read 9.2*0.5=4.6 instead.
+        assert ratcheted.stop_level == round(9.2 * (1 - 0.05), 10)

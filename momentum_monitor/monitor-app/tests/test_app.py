@@ -126,7 +126,8 @@ def _sym_state(client, symbol):
 def test_api_state_shape_has_symbols_recent_closed_poll_enabled_max_symbols():
     with _client(FakeFetch({"AEHL": [_bars(3)]})) as c:
         body = c.get("/api/state").json()
-        assert set(body) == {"symbols", "recent_closed", "poll_enabled", "max_symbols"}
+        assert set(body) == {"symbols", "recent_closed", "poll_enabled",
+                             "max_symbols", "strategy_params"}
         assert isinstance(body["symbols"], dict)
         assert isinstance(body["recent_closed"], list)
         assert body["max_symbols"] == 4
@@ -304,6 +305,12 @@ def test_post_watch_eviction_force_closes_the_evicted_symbols_open_position():
 
         def recent_closed(self, limit=10):
             return []
+
+        def get_param(self, key, default):
+            return default
+
+        def all_params(self):
+            return {}
 
     from journal_logic import OpenPosition
 
@@ -593,6 +600,81 @@ def test_poll_control_resumes_and_resyncs_what_was_dropped_while_paused():
         assert r.json()["poll_enabled"] is True
         assert _sym_state(c, "AEHL")["bar_count"] == 4  # resync_all() caught it up
         assert _sym_state(c, "AEHL")["last_price"] == round(dropped["close"], 4)
+
+
+# -- live-tunable strategy parameters, specs.md section 8 ------------------
+
+def _client_with_real_store(fetch, tmp_path, *, symbol="AEHL", default_params=None):
+    from journal_store import JournalStore
+    store = JournalStore(tmp_path / "journal.db", default_params=default_params or {
+        "trail_pct": 0.05, "volume_confirm_threshold": 1.5,
+    })
+    return _client(fetch, symbol=symbol, journal_store=store), store
+
+
+def test_get_strategy_params_lists_current_values_and_history(tmp_path):
+    c, store = _client_with_real_store(FakeFetch({}), tmp_path)
+    with c:
+        body = c.get("/api/strategy_params").json()
+        assert body["params"]["trail_pct"]["value"] == 0.05
+        assert body["params"]["volume_confirm_threshold"]["value"] == 1.5
+        assert body["history"] == []
+
+
+def test_post_strategy_params_updates_a_value_and_is_reflected_on_get(tmp_path):
+    c, store = _client_with_real_store(FakeFetch({}), tmp_path)
+    with c:
+        r = c.post("/api/strategy_params", json={"trail_pct": 0.08})
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+        assert r.json()["updated"] == {"trail_pct": 0.08}
+
+        body = c.get("/api/strategy_params").json()
+        assert body["params"]["trail_pct"]["value"] == 0.08
+
+
+def test_post_strategy_params_records_the_change_in_history(tmp_path):
+    c, store = _client_with_real_store(FakeFetch({}), tmp_path)
+    with c:
+        c.post("/api/strategy_params", json={"trail_pct": 0.08})
+        history = c.get("/api/strategy_params").json()["history"]
+        assert len(history) == 1
+        assert history[0]["key"] == "trail_pct"
+        assert history[0]["old_value"] == 0.05
+        assert history[0]["new_value"] == 0.08
+        assert history[0]["changed_at"] is not None
+
+
+def test_post_strategy_params_rejects_an_invalid_value_and_changes_nothing(tmp_path):
+    c, store = _client_with_real_store(FakeFetch({}), tmp_path)
+    with c:
+        r = c.post("/api/strategy_params", json={"trail_pct": -1.0})
+        assert r.status_code == 409
+        assert r.json()["ok"] is False
+        assert "trail_pct" in r.json()["rejected"]
+
+        body = c.get("/api/strategy_params").json()
+        assert body["params"]["trail_pct"]["value"] == 0.05  # unchanged
+        assert body["history"] == []  # no trail left by a rejected change
+
+
+def test_post_strategy_params_can_update_multiple_keys_in_one_call(tmp_path):
+    c, store = _client_with_real_store(FakeFetch({}), tmp_path)
+    with c:
+        r = c.post("/api/strategy_params",
+                   json={"trail_pct": 0.08, "volume_confirm_threshold": 2.0})
+        assert r.status_code == 200
+        body = c.get("/api/strategy_params").json()
+        assert body["params"]["trail_pct"]["value"] == 0.08
+        assert body["params"]["volume_confirm_threshold"]["value"] == 2.0
+
+
+def test_root_page_displays_current_strategy_params_read_only(tmp_path):
+    c, store = _client_with_real_store(FakeFetch({"AEHL": [_bars(3)]}), tmp_path)
+    with c:
+        page = c.get("/").text
+        assert "id=\"strategy-params\"" in page or "id='strategy-params'" in page
+        assert "trail_pct=0.0500" in page
 
 
 def test_apply_bar_push_reaches_state_the_instant_its_awaited():

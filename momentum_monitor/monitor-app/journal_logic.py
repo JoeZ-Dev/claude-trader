@@ -86,6 +86,16 @@ class OpenPosition:
     # this existed.
     setup_type: str | None = None
     factors: dict | None = None
+    # trail_pct LOCKED IN at entry from the live-tunable strategy_params
+    # value in effect at that moment (added 2026-09-18, see specs.md
+    # section 8) -- apply_bar_to_open_position always reads THIS field,
+    # never a freshly-looked-up global, so a parameter change made while
+    # this position is open never affects it; only a NEW entry picks up
+    # the new value. volume_threshold_used is the matching snapshot for
+    # entry's own volume gate (exits are never volume-gated, so it has
+    # no ongoing use after entry -- captured for the trade record only).
+    trail_pct: float = 0.05
+    volume_threshold_used: float | None = None
 
 
 @dataclass(frozen=True)
@@ -141,7 +151,7 @@ def should_enter(*, newly_confirmed_type: str | None, relative_volume: float,
 
 
 def apply_bar_to_open_position(
-    position: OpenPosition, bar: dict, trail_pct: float,
+    position: OpenPosition, bar: dict,
 ) -> tuple[OpenPosition, ExitEvent | None]:
     """Ratchet high_water_mark up from this bar's high (never down), then
     check this bar's low against the freshly-ratcheted stop_level --
@@ -151,11 +161,18 @@ def apply_bar_to_open_position(
     "stops fire fast, no exceptions." Returns the updated position and an
     ExitEvent if the stop was breached this bar, else None.
 
+    Always uses `position.trail_pct` -- the value locked in at THIS
+    position's own entry (2026-09-18: strategy_params is live-tunable,
+    but an open position's trail_pct is deliberately NOT re-read from the
+    current global on every bar, so a parameter change mid-trade can
+    never move an already-open position's stop math; see specs.md
+    section 8) -- never a separately-passed value.
+
     exit_price on a breach is the stop_level itself, not the bar's low --
     a virtual/simulated-fill modeling choice (assume the stop fills at the
     stop price), not a claim about real fill behavior."""
     new_hwm = max(position.high_water_mark, bar["high"])
-    new_stop = initial_stop_level(new_hwm, trail_pct)
+    new_stop = initial_stop_level(new_hwm, position.trail_pct)
     updated = replace(position, high_water_mark=new_hwm, stop_level=new_stop)
     if bar["low"] < new_stop:
         return updated, ExitEvent(exit_ts=bar["ts"], exit_price=new_stop,
@@ -183,6 +200,14 @@ def advance_journal(
     shaped like setup_types.SetupCandidate (setup_type, trigger_price,
     distance, hold, factors), already sorted ascending by distance.
     `relative_volume` is that same state's session.relative_volume.
+
+    `trail_pct`/`volume_confirm_threshold` here are the CURRENT live
+    strategy_params values (2026-09-18, see specs.md section 8) -- used
+    ONLY to price a brand-new entry and get locked onto it
+    (OpenPosition.trail_pct/volume_threshold_used). An already-open
+    `position` ratchets using ITS OWN locked-in trail_pct
+    (apply_bar_to_open_position reads position.trail_pct, not this
+    parameter) -- a mid-trade parameter change never reaches it.
     """
     current = position
     updated = None
@@ -191,7 +216,7 @@ def advance_journal(
     for bar in new_bars:
         if current is None:
             break
-        current, exit_event = apply_bar_to_open_position(current, bar, trail_pct)
+        current, exit_event = apply_bar_to_open_position(current, bar)
         if exit_event is not None:
             closed = (current, exit_event)
             current = None
@@ -232,6 +257,8 @@ def advance_journal(
                     "trigger_price": candidate["trigger_price"],
                     "relative_volume": relative_volume,
                 },
+                trail_pct=trail_pct,
+                volume_threshold_used=volume_confirm_threshold,
             )
 
     return JournalTick(opened=opened, updated=updated, closed=closed,

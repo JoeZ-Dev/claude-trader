@@ -97,7 +97,7 @@ def test_high_water_mark_ratchets_up_on_new_high():
     pos = OpenPosition(id=None, symbol="X", entry_ts=0, entry_price=100.0,
                        high_water_mark=100.0, stop_level=95.0)
     updated, exit_event = apply_bar_to_open_position(
-        pos, _bar(10, high=110.0, low=105.0, close=108.0), TRAIL_PCT)
+        pos, _bar(10, high=110.0, low=105.0, close=108.0))
     assert updated.high_water_mark == 110.0
     assert updated.stop_level == 110.0 * (1 - TRAIL_PCT)
     assert exit_event is None
@@ -109,7 +109,7 @@ def test_high_water_mark_never_moves_down_on_a_pullback():
     # a bar that pulls back (high stays below the existing 120 high-water
     # mark, so no ratchet; low stays above the existing 120*0.95=114 stop)
     updated, exit_event = apply_bar_to_open_position(
-        pos, _bar(10, high=118.0, low=116.0, close=117.0), TRAIL_PCT)
+        pos, _bar(10, high=118.0, low=116.0, close=117.0))
     assert updated.high_water_mark == 120.0          # unchanged, not 115
     assert updated.stop_level == 120.0 * (1 - TRAIL_PCT)  # unchanged
     assert exit_event is None
@@ -119,7 +119,7 @@ def test_stop_level_recomputed_every_ratchet_from_the_new_high_water_mark():
     pos = OpenPosition(id=None, symbol="X", entry_ts=0, entry_price=100.0,
                        high_water_mark=100.0, stop_level=95.0)
     updated, _ = apply_bar_to_open_position(
-        pos, _bar(10, high=200.0, low=190.0, close=195.0), TRAIL_PCT)
+        pos, _bar(10, high=200.0, low=190.0, close=195.0))
     assert updated.stop_level == 200.0 * (1 - TRAIL_PCT)
 
 
@@ -134,7 +134,7 @@ def test_stop_exit_fires_immediately_on_low_crossing_stop_no_confirmation_bars()
     pos = OpenPosition(id=None, symbol="X", entry_ts=0, entry_price=100.0,
                        high_water_mark=100.0, stop_level=95.0)
     updated, exit_event = apply_bar_to_open_position(
-        pos, _bar(10, high=96.0, low=94.0, close=94.5), TRAIL_PCT)
+        pos, _bar(10, high=96.0, low=94.0, close=94.5))
     assert exit_event is not None
     assert exit_event.exit_reason == "trailing_stop"
     # A single breaching bar is enough -- there is no "required_bars"-style
@@ -152,7 +152,7 @@ def test_stop_exit_uses_the_freshly_ratcheted_stop_not_the_pre_bar_one():
     # high=110 -> new stop = 110*0.95 = 104.5; low=100 breaches 104.5 but
     # NOT the old stop of 95.
     updated, exit_event = apply_bar_to_open_position(
-        pos, _bar(10, high=110.0, low=100.0, close=105.0), TRAIL_PCT)
+        pos, _bar(10, high=110.0, low=100.0, close=105.0))
     assert exit_event is not None
     assert updated.high_water_mark == 110.0
 
@@ -162,7 +162,7 @@ def test_no_exit_when_low_stays_above_stop():
                        high_water_mark=100.0, stop_level=95.0)
     # high=101 ratchets the stop to 101*0.95=95.95; low=96.5 stays above it
     updated, exit_event = apply_bar_to_open_position(
-        pos, _bar(10, high=101.0, low=96.5, close=100.5), TRAIL_PCT)
+        pos, _bar(10, high=101.0, low=96.5, close=100.5))
     assert exit_event is None
 
 
@@ -173,7 +173,7 @@ def test_exit_price_is_the_stop_level_not_the_bar_low():
     pos = OpenPosition(id=None, symbol="X", entry_ts=0, entry_price=100.0,
                        high_water_mark=100.0, stop_level=95.0)
     _, exit_event = apply_bar_to_open_position(
-        pos, _bar(10, high=96.0, low=90.0, close=91.0), TRAIL_PCT)
+        pos, _bar(10, high=96.0, low=90.0, close=91.0))
     assert exit_event.exit_price == 95.0
 
 
@@ -185,12 +185,13 @@ _ALL_FOUR_TYPES = ("resistance_breakout", "micro_breakout",
 
 def _advance(*, position=None, new_bars, setups, was_confirmed_types=frozenset(),
             relative_volume=HIGH_VOLUME,
-            volume_confirm_threshold=VOLUME_CONFIRM_THRESHOLD, symbol="AEHL"):
+            volume_confirm_threshold=VOLUME_CONFIRM_THRESHOLD, symbol="AEHL",
+            trail_pct=TRAIL_PCT):
     return advance_journal(
         position=position, new_bars=new_bars, setups=setups,
         was_confirmed_types=was_confirmed_types, relative_volume=relative_volume,
         volume_confirm_threshold=volume_confirm_threshold,
-        trail_pct=TRAIL_PCT, symbol=symbol,
+        trail_pct=trail_pct, symbol=symbol,
     )
 
 
@@ -333,6 +334,37 @@ def test_advance_journal_records_setup_type_and_merged_factors_on_entry():
     assert tick.opened.factors["distance"] == 1.25
     assert tick.opened.factors["trigger_price"] == 11.45
     assert tick.opened.factors["relative_volume"] == 1.8
+
+
+# -- live-tunable strategy_params: locked in at entry, not re-read live ---
+
+def test_new_entry_uses_the_current_trail_pct_and_locks_it_onto_the_position():
+    tick = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[_setup("resistance_breakout", confirmed=True)],
+        trail_pct=0.10,  # NOT the module TRAIL_PCT=0.05 default
+    )
+    assert tick.opened.trail_pct == 0.10
+    assert tick.opened.stop_level == 10.2 * (1 - 0.10)
+    assert tick.opened.volume_threshold_used == VOLUME_CONFIRM_THRESHOLD
+
+
+def test_open_positions_ratchet_uses_its_own_locked_trail_pct_not_a_new_global():
+    # Position entered under trail_pct=0.05 (10.0 * 0.95 = 9.5). A
+    # parameter change to 0.20 happens (simulated: advance_journal is
+    # called with the NEW global) while this position is still open --
+    # its own ratchet math must still use 0.05, never 0.20, per specs.md
+    # section 8's "not affected by subsequent parameter changes."
+    pos = OpenPosition(id=1, symbol="AEHL", entry_ts=0, entry_price=10.0,
+                       high_water_mark=10.0, stop_level=9.5, trail_pct=0.05)
+    tick = _advance(
+        position=pos,
+        new_bars=[_bar(10, high=11.0, low=10.6, close=10.9)],
+        setups=[], trail_pct=0.20,  # a changed global, must be ignored here
+    )
+    assert tick.updated.high_water_mark == 11.0
+    assert tick.updated.stop_level == 11.0 * (1 - 0.05)  # locked 0.05, not 0.20
+    assert tick.updated.trail_pct == 0.05
 
 
 def test_advance_journal_updates_open_position_across_multiple_new_bars():

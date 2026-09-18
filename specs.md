@@ -1190,7 +1190,105 @@ generalized, volume-gated entries — read it as a record of the OLD
 resistance-only rule, not as comparable performance data for the
 current one.
 
-### 7. Roadmap / phases
+### 7. Known gaps, identified 2026-09-18, not yet built
+
+Recorded here as an explicit backlog, not fixed by this section's
+existence — each is a real, named gap in either what gets recorded
+about a trade or what the strategy itself accounts for, not yet closed.
+
+**Data collection gaps:**
+- Catalyst/context note at add-time. The original recorder design
+  explicitly called this "impossible to reconstruct later" — it did not
+  survive into the current web UI's plain "add symbol" box. This is the
+  highest-priority gap: no trade record currently captures why a symbol
+  was worth watching, only what happened technically.
+- Reverse-split history flag — proposed early, never built. Public,
+  checkable data; would have been directly relevant on BIAF, QCLS, and
+  RETO.
+- Continuation-vs-fresh-day flag (Day 1 gap vs. Day 2+ runner) — also
+  proposed early, also never built.
+- Market backdrop (broad-market direction that day) — no data pipeline
+  exists for this at all yet.
+- Human review/labeling — no way to mark a trade as "real signal" vs.
+  "worked by chance" after the fact.
+
+**Strategy gaps:**
+- Position sizing does not exist. The journal tracks entry/exit price
+  and percentage P&L only — no share count, no dollar risk, no
+  account-size concept.
+- No portfolio-level risk cap across the 4 concurrent symbol slots.
+- `TRAIL_PCT` was one global value despite volatility varying hugely
+  across candidates — section 8 below is the first step toward fixing
+  that (live-tunable, not yet per-symbol or volatility-adjusted).
+- Breakdown-below variants of the three phase-3.5 setup types remain
+  deliberately deferred.
+
+### 8. Live-tunable strategy parameters
+
+**Principle, decided 2026-09-18.** Strategy parameters must be
+live-tunable, not baked into code/env config. `TRAIL_PCT` living in
+`.env` had the exact same failure shape as every stale-config incident
+already hit in this project (see section 4's reconnect-storm and
+companion-auth entries) — a value silently drifting out of sync with
+intent, discovered late. Worse: real tuning based on accumulating trade
+outcomes requires changing these often, and a redeploy cycle per change
+discourages that. Every trade snapshots the actual parameter values in
+effect at its own entry — never a live reference to "whatever's
+current" — or it becomes impossible to later attribute an outcome to
+the value that produced it.
+
+**The build.** `TRAIL_PCT` and `VOLUME_CONFIRM_THRESHOLD` moved out of
+env/code constants into `journal_store.py`'s SQLite file: a
+`strategy_params` table (`key`, `value`, `updated_at`), seeded from the
+env-derived values ONLY on the first-ever run against a given
+`journal.db` (`JournalStore.__init__`'s `default_params` — an
+already-tuned value already on disk is never reset back to the env
+default on a later restart, since `main.py` passes the same defaults in
+every single startup, tuned or not). `Poller._update_journal` reads
+`journal_store.get_param(...)` on EVERY journal decision from then on,
+never the env var directly — a change takes effect on the very next
+decision, no redeploy. Every change is appended to a separate
+`strategy_params_history` table (`key`, `old_value`, `new_value`,
+`changed_at`) — never an in-place overwrite with no trail.
+
+**Locked at entry, not re-read live, once a position is open.** This is
+the subtle half of the requirement: `journal_logic.OpenPosition` gained
+a `trail_pct` field, set ONCE from the live value at the moment of
+entry and never touched again. `apply_bar_to_open_position` (the
+ratchet + stop-breach check that runs on every bar for an open
+position) reads `position.trail_pct` exclusively — never a freshly
+looked-up global — so a parameter change made while a position is open
+can never move that position's own stop math; only a brand-new entry
+picks up the new value. `volume_threshold_used` is captured the same
+way at entry (exits were never volume-gated to begin with, so it has no
+ongoing use after entry — captured purely for the trade record).
+`trades` gained matching `trail_pct_used`/`volume_threshold_used`
+columns, migrated in place via the same `_ADDED_COLUMNS` mechanism the
+setup_type/factors columns used (specs.md's own "assumed fresh, wasn't"
+lesson, hit multiple times already — migrated explicitly again here,
+not assumed away).
+
+**API, deliberately minimal this pass.** `GET /api/strategy_params` →
+`{"params": {key: {"value", "updated_at"}}, "history": [...]}`.
+`POST /api/strategy_params` with one or more `{key: value}` pairs in
+one call; each validated independently against a `(lower, upper]`
+bound per key (`trail_pct`: `(0, 0.5]`; `volume_confirm_threshold`:
+`(0, 20]` — an unrecognized key is rejected outright, not silently
+accepted with no bounds check) — a rejected key changes nothing for
+that key and the response reports exactly which keys succeeded vs.
+were rejected, not an all-or-nothing failure over one bad value among
+several. No settings UI this pass beyond a read-only current-values
+line on the page itself (`#strategy-params`, updated live on every
+push same as everything else) — the adjustment mechanism is API-only
+(`curl`) for now; a proper settings UI is a natural, separate
+follow-up once this core mechanism is proven.
+
+Live verification pending deploy (this section will be updated with the
+real result, per this project's own "confirm live, don't just claim it"
+standard, not left describing an outcome that was never actually
+checked against the running system).
+
+### 9. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,

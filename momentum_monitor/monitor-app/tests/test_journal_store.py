@@ -60,6 +60,49 @@ def test_opens_a_pre_migration_db_missing_setup_type_and_factors_columns(tmp_pat
     assert created.factors == {"vwap": 19.9}
 
 
+_PARTS_A_D_SCHEMA = """
+CREATE TABLE trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    entry_ts INTEGER NOT NULL,
+    entry_price REAL NOT NULL,
+    high_water_mark REAL NOT NULL,
+    stop_level REAL NOT NULL,
+    exit_ts INTEGER,
+    exit_price REAL,
+    exit_reason TEXT,
+    realized_pnl_pct REAL,
+    setup_type TEXT,
+    factors TEXT
+)
+"""
+
+
+def test_migrates_a_parts_a_d_db_missing_trail_pct_and_volume_threshold_used(tmp_path):
+    # Some trades may have fired under the Parts A-D schema (setup_type/
+    # factors, but no trail_pct_used/volume_threshold_used yet) before this
+    # build landed -- migrate those rows explicitly rather than assuming a
+    # fresh table (this project has hit exactly the "assumed fresh, wasn't"
+    # bug multiple times already, see specs.md).
+    db_path = tmp_path / "journal.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(_PARTS_A_D_SCHEMA)
+    conn.execute(
+        "INSERT INTO trades (symbol, entry_ts, entry_price, high_water_mark, "
+        "stop_level, setup_type, factors) VALUES "
+        "('AEHL', 100, 10.0, 10.0, 9.5, 'round_number_reclaim', '{}')",
+    )
+    conn.commit()
+    conn.close()
+
+    store = JournalStore(db_path)  # must not raise
+    resumed = store.open_position_for("AEHL")
+    assert resumed is not None
+    assert resumed.setup_type == "round_number_reclaim"
+    assert resumed.trail_pct == 0.05          # pre-migration row: dataclass default
+    assert resumed.volume_threshold_used is None
+
+
 def _position(symbol="AEHL", entry_ts=100, entry_price=10.0,
              high_water_mark=10.0, stop_level=9.5):
     return OpenPosition(id=None, symbol=symbol, entry_ts=entry_ts,
@@ -280,3 +323,161 @@ def test_delete_symbol_switched_returns_zero_when_none_exist(tmp_path):
                                         exit_reason="trailing_stop"))
     assert store.delete_symbol_switched() == 0
     assert len(store.recent_closed()) == 1
+
+
+# -- trail_pct_used / volume_threshold_used persisted on the trade row ----
+
+def test_create_persists_trail_pct_used_and_volume_threshold_used(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    pos = OpenPosition(id=None, symbol="AEHL", entry_ts=100, entry_price=10.0,
+                       high_water_mark=10.0, stop_level=9.3,
+                       trail_pct=0.07, volume_threshold_used=2.0)
+    created = store.create(pos)
+    assert created.trail_pct == 0.07
+    assert created.volume_threshold_used == 2.0
+
+    found = store.open_position_for("AEHL")
+    assert found.trail_pct == 0.07
+    assert found.volume_threshold_used == 2.0
+
+
+def test_trail_pct_used_retrievable_on_a_closed_trade(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    pos = OpenPosition(id=None, symbol="AEHL", entry_ts=100, entry_price=10.0,
+                       high_water_mark=10.0, stop_level=9.3,
+                       trail_pct=0.07, volume_threshold_used=2.0)
+    created = store.create(pos)
+    store.close_position(created, ExitEvent(exit_ts=200, exit_price=9.3,
+                                            exit_reason="trailing_stop"))
+    (closed,) = store.recent_closed()
+    assert closed["trail_pct_used"] == 0.07
+    assert closed["volume_threshold_used"] == 2.0
+
+
+# -- live-tunable strategy_params (specs.md section 8) ---------------------
+
+def test_seeds_params_from_defaults_on_first_run(tmp_path):
+    store = JournalStore(tmp_path / "journal.db",
+                         default_params={"trail_pct": 0.05,
+                                         "volume_confirm_threshold": 1.5})
+    assert store.get_param("trail_pct", default=0.99) == 0.05
+    assert store.get_param("volume_confirm_threshold", default=0.99) == 1.5
+
+
+def test_reopening_the_store_does_not_re_seed_over_a_changed_value(tmp_path):
+    db_path = tmp_path / "journal.db"
+    store1 = JournalStore(db_path, default_params={"trail_pct": 0.05})
+    store1.set_param("trail_pct", 0.10)
+    del store1
+
+    # A fresh JournalStore over the SAME file, passing the SAME defaults
+    # again (exactly what main.py does on every restart) -- must not
+    # silently reset the tuned value back to the env-var default.
+    store2 = JournalStore(db_path, default_params={"trail_pct": 0.05})
+    assert store2.get_param("trail_pct", default=0.99) == 0.10
+
+
+def test_get_param_returns_the_given_default_when_key_never_set(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    assert store.get_param("trail_pct", default=0.05) == 0.05
+
+
+def test_set_param_updates_the_live_value(tmp_path):
+    store = JournalStore(tmp_path / "journal.db",
+                         default_params={"trail_pct": 0.05})
+    store.set_param("trail_pct", 0.08)
+    assert store.get_param("trail_pct", default=0.99) == 0.08
+
+
+def test_set_param_records_old_new_and_timestamp_in_history(tmp_path):
+    store = JournalStore(tmp_path / "journal.db",
+                         default_params={"trail_pct": 0.05},
+                         now_fn=lambda: 1_800_000_000)
+    store.set_param("trail_pct", 0.08)
+    history = store.param_history()
+    assert len(history) == 1
+    entry = history[0]
+    assert entry["key"] == "trail_pct"
+    assert entry["old_value"] == 0.05
+    assert entry["new_value"] == 0.08
+    assert entry["changed_at"] == 1_800_000_000
+
+
+def test_set_param_history_accumulates_across_multiple_changes(tmp_path):
+    store = JournalStore(tmp_path / "journal.db",
+                         default_params={"trail_pct": 0.05})
+    store.set_param("trail_pct", 0.08)
+    store.set_param("trail_pct", 0.10)
+    history = store.param_history()
+    assert [h["new_value"] for h in history] == [0.10, 0.08]  # most recent first
+    assert history[0]["old_value"] == 0.08
+
+
+def test_set_param_first_ever_change_has_null_old_value(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")  # no default_params seeded
+    store.set_param("trail_pct", 0.08)
+    history = store.param_history()
+    assert history[0]["old_value"] is None
+    assert history[0]["new_value"] == 0.08
+
+
+def test_all_params_lists_current_values_with_updated_at(tmp_path):
+    store = JournalStore(tmp_path / "journal.db",
+                         default_params={"trail_pct": 0.05,
+                                         "volume_confirm_threshold": 1.5},
+                         now_fn=lambda: 1_800_000_000)
+    params = store.all_params()
+    assert params["trail_pct"]["value"] == 0.05
+    assert params["trail_pct"]["updated_at"] == 1_800_000_000
+    assert params["volume_confirm_threshold"]["value"] == 1.5
+
+
+def test_set_param_rejects_zero():
+    import pytest
+    from journal_store import InvalidParamError
+    store = JournalStore(":memory:")
+    with pytest.raises(InvalidParamError):
+        store.set_param("trail_pct", 0.0)
+
+
+def test_set_param_rejects_negative():
+    import pytest
+    from journal_store import InvalidParamError
+    store = JournalStore(":memory:")
+    with pytest.raises(InvalidParamError):
+        store.set_param("trail_pct", -0.05)
+
+
+def test_set_param_rejects_absurdly_large_trail_pct():
+    import pytest
+    from journal_store import InvalidParamError
+    store = JournalStore(":memory:")
+    with pytest.raises(InvalidParamError):
+        store.set_param("trail_pct", 5.0)  # 500% is not a trailing stop
+
+
+def test_set_param_rejects_absurdly_large_volume_threshold():
+    import pytest
+    from journal_store import InvalidParamError
+    store = JournalStore(":memory:")
+    with pytest.raises(InvalidParamError):
+        store.set_param("volume_confirm_threshold", 500.0)
+
+
+def test_set_param_rejects_unknown_key():
+    import pytest
+    from journal_store import InvalidParamError
+    store = JournalStore(":memory:")
+    with pytest.raises(InvalidParamError):
+        store.set_param("not_a_real_param", 1.0)
+
+
+def test_a_rejected_set_param_does_not_change_the_live_value_or_history(tmp_path):
+    import pytest
+    from journal_store import InvalidParamError
+    store = JournalStore(tmp_path / "journal.db",
+                         default_params={"trail_pct": 0.05})
+    with pytest.raises(InvalidParamError):
+        store.set_param("trail_pct", -1.0)
+    assert store.get_param("trail_pct", default=0.99) == 0.05
+    assert store.param_history() == []
