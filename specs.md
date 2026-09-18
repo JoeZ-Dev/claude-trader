@@ -940,26 +940,89 @@ state (which symbol is watched, the accumulated bar list), not pure
 market analysis, even though `journal_logic.py` keeps the same "no I/O"
 discipline `core/` uses for the same reason `core/` does (see section 3).
 
-**Entry.** Fires exactly once per `hold.confirmed` False→True transition
-on the nearest-above resistance level already computed and displayed on
-the page (`state["levels"]["resistance"]["hold"]["confirmed"]`, from
-`core/levels.py`'s `evaluate_hold`) — no new entry-signal logic invented.
-`entry_price` is the close of the bar the transition is observed at (in
-practice: the latest bar in the poll cycle where the transition is first
-seen — the finest granularity available without re-running
-`evaluate_hold` per-bar inside a single poll, which would itself be
-inventing new entry logic). At most one open virtual position PER SYMBOL
-(phase 2: up to 4 symbols can each have their own independently open
-position at once, not one global position for whichever symbol happens
-to be watched); if a position is already open for a symbol, a continued
-or repeated `True` reading for that same symbol does not fire a
-duplicate. `journal_logic.py`/`journal_store.py` needed no changes for
-multi-symbol — audited specifically for a single-global-position
-assumption and found none: every lookup was already scoped by symbol
-(`open_position_for`) or by the specific row id
-(`update_trailing`/`close_position`). The single-position assumption that
-did exist lived in `Poller`'s own state, fixed by giving each watched
-symbol its own `_SymbolSlot` (section 5).
+**Entry, generalized to all four setup types + volume-gated (2026-09-17
+— see below for the original, narrower phase-4 design this replaces).**
+Fires on ANY of the four setup types' (resistance breakout, micro
+breakout, VWAP pullback-reclaim, round-number reclaim — section 3.5)
+OWN `hold.confirmed` False→True transition, tracked independently PER
+TYPE (a set of confirmed setup-type strings, not one collapsed
+boolean) — "closest" (`state["setups"][0]`, the one shown with the most
+visual weight on the page) is `setup_types.evaluate_setups()`'s own
+comparison metric for what to display/watch, not a requirement for a
+confirmation to count as a real entry signal; a type sitting confirmed
+from earlier does not block a DIFFERENT type confirming fresh later. If
+more than one type transitions in the same tick, the closest wins (the
+setups list is pre-sorted ascending by distance) — a deterministic
+tie-break, not arbitrary. Also requires `relative_volume` (session-level,
+`core/indicators.py`) to clear `VOLUME_CONFIRM_THRESHOLD` (env var,
+default `1.5`) AT THE SAME MOMENT as the confirmation — a starting
+point to tune against real logged data, same treatment as `TRAIL_PCT`,
+not a validated number. Reasoning for `1.5`: high enough to filter the
+specific false-breakout pattern volume confirmation exists to catch (a
+low-conviction drift through a level on unremarkable volume), not so
+high it requires an extreme spike that would filter out most real
+breakouts too — `1.5` means the confirming bar's volume is 50% above
+its own trailing 20-bar average, a moderate bar, not an extreme one. A
+type that confirms on volume below threshold does not fire, and does
+NOT get re-checked on a later tick while it stays confirmed with the
+same unremarkable volume — the gate applies at the moment of
+confirmation, not as a standing condition re-evaluated every tick.
+Exits are deliberately NEVER volume-gated — same asymmetry
+core/'s hold-confirmation has always used (entries need sustained
+confirmation, now also real volume; stops fire fast and unconditionally,
+no exceptions), applied here too, not a new rule. `entry_price` is the
+close of the bar the transition is observed at (in practice: the latest
+bar in the poll cycle where the transition is first seen — the finest
+granularity available without re-running `evaluate_hold` per-bar inside
+a single poll, which would itself be inventing new entry logic). At most
+one open virtual position PER SYMBOL (phase 2: up to 4 symbols can each
+have their own independently open position at once, not one global
+position for whichever symbol happens to be watched); if a position is
+already open for a symbol, a continued or repeated confirmed reading
+for that same symbol does not fire a duplicate. `journal_logic.py`/
+`journal_store.py` needed no changes for multi-symbol — audited
+specifically for a single-global-position assumption and found none:
+every lookup was already scoped by symbol (`open_position_for`) or by
+the specific row id (`update_trailing`/`close_position`). The single-
+position assumption that did exist lived in `Poller`'s own state, fixed
+by giving each watched symbol its own `_SymbolSlot` (section 5).
+
+`setup_type` (which of the four fired) and `factors` (a dict: the
+type-specific detail from `SetupCandidate.factors`, plus `distance`,
+`trigger_price`, and `relative_volume` at that moment) are captured on
+the trade record at the instant of entry, not re-derived later from
+whatever happens to be displayed — see "Schema" below.
+
+**Original phase-4 design, superseded above (kept for history, not
+current behavior):** entry fired exactly once per `hold.confirmed`
+False→True transition on the nearest-above resistance level only
+(`state["levels"]["resistance"]["hold"]["confirmed"]`) — written before
+phase 3.5's multi-scenario `setups` evaluation existed, and never
+generalized to the other three types until now. No volume condition
+existed at all.
+
+**A real bug found generalizing this (2026-09-17), fixed alongside it:**
+`Poller._update_journal` dispatched a `JournalTick`'s `opened`/
+`updated`/`closed` via `if`/`elif`/`elif` — meaning if a tick carried
+BOTH a `closed` (a stop-out, mid-batch) AND an `opened` (a fresh entry
+on a newly-confirmed type, later in the SAME batch of new bars), only
+the `opened` branch ran and the close was silently never persisted to
+`journal_store` — the closed position's row stayed open in SQLite
+forever, orphaned, while `Poller`'s in-memory state had already moved
+on to the new position. This shape existed in the ORIGINAL narrower
+design too (`journal_logic.advance_journal` always computed `opened`
+independently of `closed`), but the original resistance-only fixtures
+never happened to produce it — generalizing entry to include
+`round_number_reclaim` (which, being "always present," per section 3.5,
+readily re-confirms on the very next round-number grid point right
+after a stop-out) made it a real, reachable sequence, not a
+hypothetical one. Fixed: `closed` is now applied unconditionally
+whenever present, independent of whether `opened` is ALSO set on the
+same tick (`opened`/`updated` stay mutually exclusive by construction,
+per `journal_logic.py`'s own guarantee — only `closed`+`opened`
+together needed the fix). Regression-tested directly
+(`test_advance_journal_can_both_close_and_reopen_within_one_batch`,
+`journal_logic.py`'s own test suite).
 
 **Exit — trailing stop only, no fixed target, by design.** A fixed R:R
 target was explicitly rejected for this project: it capped winners in the
@@ -1033,12 +1096,22 @@ pattern, different storage choice, on purpose.
 Schema (`trades` table): `id`, `symbol`, `entry_ts`, `entry_price`,
 `high_water_mark` (updated live while open), `stop_level` (updated live
 while open), `exit_ts`, `exit_price`, `exit_reason` (nullable while
-open), `realized_pnl_pct` (nullable while open).
+open), `realized_pnl_pct` (nullable while open), `setup_type` (added
+2026-09-17 — which of the four setup types fired; nullable, a position
+opened before this existed has none), `factors` (added 2026-09-17 —
+JSON-encoded dict of the factors behind that entry at the moment it
+happened, see "Entry" above; nullable, same reason).
 
 **Page/API.** `GET /api/state`'s JSON gains a `"journal"` key (open
 position + live unrealized P&L%, plus up to 10 recent closed trades, all
 symbols, most recent first); the HTML page gets a matching plain-table
 section, same style as the existing levels tables — no new framework.
+`entry_ts`/`exit_ts` (added 2026-09-17 — existed in the schema since
+this section's first version, never shown until now) render human-
+readable in the closed-trades table, America/New_York (the same
+exchange-local timezone `state.py` already anchors session VWAP to —
+see section 3 — not a new timezone convention invented for this), never
+raw epoch.
 
 **Deleting closed-trade rows (added 2026-09-17).** Trade history is
 real, permanent SQLite data — journal noise from testing was piling up
