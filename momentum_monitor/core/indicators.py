@@ -116,8 +116,18 @@ def relative_volume(bars: list[dict], lookback: int = 20) -> list[float]:
     return out
 
 
-def relative_volume_time_aware(bars: list[dict], lookback_seconds: float = 200.0) -> list[float]:
-    """Time-aware relative_volume (specs.md section 15, phase 3.6 stage 1):
+def _bar_duration(bars: list[dict], i: int, reference_interval_seconds: float) -> float:
+    """A bar's own real width: the gap to whatever bar comes right after
+    it, or `reference_interval_seconds` for the newest bar in the list
+    (no next bar exists yet to measure from -- assume live cadence)."""
+    if i + 1 < len(bars):
+        return bars[i + 1]["ts"] - bars[i]["ts"]
+    return reference_interval_seconds
+
+
+def relative_volume_time_aware(bars: list[dict], lookback_seconds: float = 200.0,
+                               reference_interval_seconds: float = 10.0) -> list[float]:
+    """Time-aware relative_volume (specs.md sections 15/16, phase 3.6):
     the rolling comparison window is a real elapsed-time span
     (`lookback_seconds`) rather than a fixed bar count, so it selects the
     same real history regardless of gaps in cadence. `lookback=20` bars at
@@ -131,18 +141,44 @@ def relative_volume_time_aware(bars: list[dict], lookback_seconds: float = 200.0
     "Not enough history yet" is judged by real elapsed time since the
     first bar (`b["ts"] - bars[0]["ts"] < lookback_seconds`), the direct
     time-based analog of the bar-count version's `i < lookback` check.
+
+    Mixed-cadence weighting (specs.md section 16): when every bar in the
+    window has EXACTLY `reference_interval_seconds` width, this compares
+    raw per-bar volume, bit-identical to stage 1 (and to `relative_
+    volume` on uniform cadence -- proven in section 15). Once widths
+    actually vary (a 60s backfilled bar alongside 10s live bars), raw
+    per-bar volume is the wrong thing to average -- a 60s bar naturally
+    carries ~6x a 10s bar's volume at the SAME underlying rate, so
+    averaging them as equals misreads a normal rate as unusually high or
+    low depending on how many wide bars happen to be in the window.
+    Comparing volume RATES (volume / duration) instead -- both for the
+    window's aggregate average and for the current bar itself -- fixes
+    this, and still reduces to the exact same ratio as raw-volume
+    comparison on uniform data (dividing both sides by the same constant
+    duration cancels out), which is why the uniform branch below is kept
+    as its own bit-exact path rather than relying on that algebraic
+    cancellation to hold under floating point.
     """
     out = []
     for i, b in enumerate(bars):
         if b["ts"] - bars[0]["ts"] < lookback_seconds:
             out.append(1.0)
             continue
-        window = [w for w in bars[:i] if b["ts"] - lookback_seconds <= w["ts"] < b["ts"]]
-        if not window:
+        window_idxs = [j for j in range(i)
+                       if b["ts"] - lookback_seconds <= bars[j]["ts"] < b["ts"]]
+        if not window_idxs:
             out.append(1.0)
             continue
-        avg = sum(w["volume"] for w in window) / len(window)
-        out.append(b["volume"] / avg if avg > 0 else 1.0)
+        durations = [_bar_duration(bars, j, reference_interval_seconds) for j in window_idxs]
+        if all(d == reference_interval_seconds for d in durations):
+            avg = sum(bars[j]["volume"] for j in window_idxs) / len(window_idxs)
+            cur_rate = b["volume"]
+        else:
+            total_vol = sum(bars[j]["volume"] for j in window_idxs)
+            total_dur = sum(durations)
+            avg = total_vol / total_dur
+            cur_rate = b["volume"] / _bar_duration(bars, i, reference_interval_seconds)
+        out.append(cur_rate / avg if avg > 0 else 1.0)
     return out
 
 

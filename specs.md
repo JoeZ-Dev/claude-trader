@@ -2310,7 +2310,165 @@ other module, confirming zero impact on any existing call site. Stage 2
 (mixed-cadence improvement) and stage 3 (call-site migration) are
 separate future work, not started.
 
-### 15. Roadmap / phases
+### 15. Time-aware core functions — phase 3.6, stage 2 (genuine improvement)
+
+Stage 1 (section 14) proved `ema_time_aware`/`relative_volume_time_aware`/
+`evaluate_hold_time_aware`/`swing_points_time_aware` are bit-exact with
+the bar-count versions on real uniform-cadence data. Stage 2's job is
+different and stricter: prove the time-aware functions are genuinely
+BETTER on the actual case that motivated this whole effort — real
+backfilled bars (coarser, irregular) followed by live 10s bars, with a
+real gap inside the backfilled portion itself. Still purely additive:
+no existing call site is touched. Stage 3 (migration) remains separate,
+not started.
+
+**The precise claim, proven algebraically first.** A bar's contribution
+to `ema_time_aware` must scale PROPORTIONALLY to its real width — not
+treated as equal to a 10s bar (naive equal-weighting), and not excluded
+entirely (today's `live_cadence_tail` stopgap). Concretely: a single
+60-second step landing on close `V`, from a prior ema value `P`, must be
+mathematically IDENTICAL to six consecutive hypothetical 10-second steps
+that each feed in `V`. Proof: expanding the standard recursion
+`out_n = k*V + (1-k)*out_{n-1}` for `n` steps that all feed the same `V`
+gives, by the geometric-series identity `k*sum_{j=0}^{n-1}(1-k)^j =
+1-(1-k)^n`:
+
+```
+out_n = V*(1 - (1-k)**n) + (1-k)**n * P
+```
+
+For n=6: `out_6 = V*(1-(1-k)**6) + (1-k)**6 * P`. `ema_time_aware`'s
+single 60s step computes `k_eff(60) = 1-(1-k)**(60/10) = 1-(1-k)**6`, so
+`out_A = k_eff(60)*V + (1-k_eff(60))*P = V*(1-(1-k)**6) + (1-k)**6*P` —
+the IDENTICAL expression, term for term. `test_ema_time_aware_single_
+60s_step_equals_six_10s_steps_to_same_value` confirms this bit-for-bit
+(`out_a[1] == out_b[6]`, not merely `pytest.approx`), using real-shaped
+numbers (period=9, P/V taken from the actual AIFF ema level and close
+used in the live evidence below).
+
+**Two real necessary fixes this stage found** (both are the actual
+subject of this stage's break-then-fix tests below — this is not a
+cosmetic addition, stage 1's versions of these two functions did not yet
+satisfy the proportional-weighting claim on mixed cadence):
+
+1. `relative_volume_time_aware` (stage 1) selected its window by real
+   time but still averaged RAW per-bar volume within it — correct only
+   because stage 1's tests were all uniform-cadence, where dividing both
+   sides of the ratio by the same constant duration cancels out. Once
+   widths actually vary, raw-volume averaging is wrong: a 60s bar
+   naturally carries ~6x a 10s bar's volume at the SAME underlying rate,
+   so treating them as equal-weight readings misreads a normal rate as
+   unusually high or low depending on how many wide bars happen to be in
+   the window. Fixed by comparing volume RATES (volume/duration) — both
+   the window's aggregate rate (`sum(volume)/sum(duration)`) and the
+   current bar's own rate — whenever the window's bars don't all share
+   `reference_interval_seconds` width; the uniform-width case is kept as
+   its own bit-exact raw-volume path (not merely relying on the rate
+   formula's algebraic cancellation to hold under floating point),
+   preserving every stage 1 equivalence test unchanged.
+2. `evaluate_hold_time_aware` (stage 1) added a FIXED
+   `reference_interval_seconds` for every bar's own width, correct only
+   because every stage 1 test used uniform 10s bars where the assumption
+   and reality happened to coincide. Fixed to use each bar's ACTUAL
+   width — `bars[i+1]["ts"] - bars[i]["ts"]` when a next bar exists,
+   falling back to `reference_interval_seconds` only for the newest bar
+   in the list (no next bar exists yet to measure from). This still
+   reduces to stage 1's exact formula on uniform data (the next bar is
+   always exactly `reference_interval_seconds` away), so every stage 1
+   test is unaffected.
+
+**Real mixed-cadence data**, pulled from `schwab-connector`'s actual
+`data/bars/AIFF.jsonl` store — AIFF's real first watched session,
+2026-09-17 07:50:00–14:40:10 (236 bars: 228 backfilled 60s-cadence bars,
+then a genuine transition to 8 live 10s bars), containing BOTH required
+irregularities in one real symbol's real day:
+
+**1. Backfill-to-live transition** (real boundary: bar 227, 14:38:00,
+close 1.3051 → bar 228, 14:39:00, close 1.3091 → bar 229, 14:39:10,
+close 1.32 — `live_cadence_tail`'s actual boundary, confirmed by running
+the real production function, lands at bar 228, since that bar's gap to
+*the next* bar is only 10s even though bar 228 is itself a 60s-wide
+backfilled bar):
+
+   - `ema` (period=9): OLD (cold-started on the 8-bar live tail alone)
+     `1.309100` at bar 228, `1.311280` at bar 229, `1.307024` at bar
+     230, `1.299559` at bar 231, `1.293787` at bar 232. NEW (full
+     236-bar backfill+live history) `1.304932`, `1.307945`, `1.304356`,
+     `1.297425`, `1.292080` at the same five bars — a real, persistent
+     divergence, not a rounding artifact: OLD restarts from nothing the
+     instant streaming begins (its first value is always exactly that
+     bar's own close, by construction), discarding the entire day's
+     real decayed trend; NEW carries it forward correctly.
+   - `relative_volume` (lookback=20/200s): OLD returns exactly `1.0` for
+     all 8 live bars — "not enough history," even though real volume
+     history plainly exists, it's just on the wrong side of
+     `live_cadence_tail`'s cutoff. NEW returns `0.025235`, `0.140512`,
+     `0.061211`, `0.074476`, `0.096600` at the same five bars —
+     correctly reflecting that these bars are quiet relative to the
+     REAL recent volume surge in the backfilled data just before the
+     transition (bar 227's 60s bar alone carried 260,425 shares). OLD's
+     flat `1.0` here isn't merely less informative, it's actively
+     misleading — it reads as "perfectly average volume" when the real
+     comparison says these bars are unusually quiet.
+   - `evaluate_hold` (level_price=1.30, direction="above"): OLD, seeing
+     only the 8-bar live tail, never confirms (`consecutive_bars=0`,
+     `confirmed=False`, `failed_attempts=2` — the tail's own brief
+     pokes above 1.30 each break before reaching 3 bars). NEW, walking
+     the full real history, confirms exactly at bar 228 (14:39:00) —
+     traced by re-running with progressively more of the real day
+     included until `confirmed` first flips true, landing precisely on
+     that bar, not an unrelated earlier point in the day. This is the
+     real, structural case the whole effort exists for: bars 227 and
+     228 are two consecutive 60s bars both closing above 1.30 — a
+     genuine 60+ real seconds held above the level — which
+     `live_cadence_tail` mostly excludes and which bar-count logic,
+     even for the one backfilled bar it does let through, can't
+     recognize as anything more than "1 bar, need 2 more."
+
+**2. A real internal backfill gap** (08:23:00, close 0.9445 →
+08:29:00, close 0.927 — a genuine 360-second/6-minute gap, Schwab
+skipping 5 zero-volume minutes, confirmed present in the real stored
+data, not manufactured): `ema_time_aware` (period=9) retains
+`(1-k)**36 = 3.245×10⁻⁴` of the pre-gap ema value across this single
+step — compare a naive equal-weighting treatment (crediting the gap as
+one ordinary step) which would retain `(1-k)**1 = 0.8`, roughly **2,465×
+too much** memory of stale pre-gap data. The computation itself runs
+cleanly on the irregular spacing (`0.927005` immediately after the
+gap, no exception, no special-casing needed) — real proof the gap is
+treated as genuinely elapsed time, not silently mishandled.
+
+**Deliberate break-then-fix, both stage-2-specific tests**
+(`test_relative_volume_time_aware_uses_rate_not_raw_volume_across_mixed_
+widths`, `test_evaluate_hold_time_aware_uses_actual_bar_width_not_fixed_
+reference_interval`), same standard as stage 1:
+- `relative_volume_time_aware`: reverted the rate-based branch back to
+  always averaging raw per-bar volume (stage 1's version). Result:
+  the mixed-width test failed immediately with the exact predicted
+  wrong value (`0.6874999999999999` instead of `1.0` — a normal-rate
+  bar misread as 31% below average purely because of how many wide
+  bars happened to be in the window). Reverted; full suite green again.
+- `evaluate_hold_time_aware`: reverted the actual-next-bar-width
+  calculation back to stage 1's fixed `reference_interval_seconds`.
+  Result: the bar-width test failed immediately (`confirmed=True`
+  instead of the correct `False` — over-confirming after only 23
+  real seconds because the fixed assumption over-counted an
+  interior bar's real 2-second width as a full 10 seconds). Reverted;
+  full suite green again.
+
+**Explicit scope note:** `swing_points_time_aware` (the fourth stage-1
+function) is NOT addressed by this stage — the "prove genuine
+improvement" instruction for this stage named only
+`ema_time_aware`/`relative_volume_time_aware`/`evaluate_hold_time_aware`
+explicitly; `detect_levels`' mixed-cadence swing-window behavior remains
+unproven on irregular data and is deferred, not silently assumed fine.
+
+**Status:** stage 2 complete. `core/tests/test_core.py`: 31 tests
+passing (27 from stage 1 plus 4 new for this stage); `core` suite
+overall: 44 tests passing; full project suite: 276 tests passing,
+unchanged in every other module. Stage 3 (migrating call sites) remains
+separate, later, explicitly-gated work — not started.
+
+### 16. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,
@@ -2347,11 +2505,23 @@ separate future work, not started.
    uniform-cadence data; no existing call site touched. `macd`'s own
    time-aware version deferred to a later stage (composable directly from
    `ema_time_aware` once needed, not required by stage 1's explicit
-   scope). Stage 2 (proving genuine improvement on mixed-cadence data)
-   and stage 3 (migrating call sites) remain future work. Touches
-   `core/`'s public function signatures and its authoritative test suite
-   — a real redesign, not a quick patch, which is why it's a separate
-   phase rather than bundled into the backfill work that motivated it.
+   scope). **Stage 2 (built, 2026-09-18) — see section 15:** proved
+   genuine improvement on real mixed-cadence data (a real backfill-to-
+   live transition and a real internal backfill gap, both from AIFF's
+   actual first watched session) — algebraically (a 60s ema step is
+   proven identical to six compounded 10s steps) and live (real ema/
+   relative_volume/evaluate_hold values, current production vs. time-
+   aware, side by side). Found and fixed two real proportional-weighting
+   gaps stage 1 hadn't yet closed: `relative_volume_time_aware` now
+   compares volume RATES, not raw per-bar volume, once bar widths
+   actually vary; `evaluate_hold_time_aware` now uses each bar's actual
+   observed width instead of a fixed assumed one. `swing_points_time_
+   aware`'s mixed-cadence behavior was NOT in this stage's explicit
+   scope and remains unproven on irregular data. Stage 3 (migrating call
+   sites) remains future work, not started. Touches `core/`'s public
+   function signatures and its authoritative test suite — a real
+   redesign, not a quick patch, which is why it's a separate phase
+   rather than bundled into the backfill work that motivated it.
 4. **(built)** Virtual trade journal — logs what the system would have
    done (entry, trailing stop) without placing anything, for end-of-day
    review against the user's own judgment. See section 6 for the full

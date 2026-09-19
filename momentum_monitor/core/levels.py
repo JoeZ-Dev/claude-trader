@@ -295,7 +295,7 @@ def evaluate_hold_time_aware(
     required_seconds: float = 30.0,
     reference_interval_seconds: float = 10.0,
 ) -> HoldStateTimeAware:
-    """Time-aware `evaluate_hold` (specs.md section 15, phase 3.6 stage 1):
+    """Time-aware `evaluate_hold` (specs.md section 15/16, phase 3.6):
     tracks real ELAPSED SECONDS on the required side of the level, rather
     than a bar count. `required_bars=3` at the live 10s cadence is
     `required_seconds=30.0` (3 * 10s) -- confirmation still fires on
@@ -304,14 +304,19 @@ def evaluate_hold_time_aware(
     test_evaluate_hold_time_aware_exactly_equals_bar_count_version_on_uniform_cadence).
 
     Boundary, made explicit (this was left implicit in the bar-count
-    version): elapsed time is measured as of the END of the current bar's
-    own interval, not its start timestamp -- a bar's own
-    `reference_interval_seconds` of width counts in full toward the
-    streak once that bar closes on the right side. Concretely,
-    `elapsed_seconds = (current_bar_ts - streak_start_ts) +
-    reference_interval_seconds`: the gap between the streak's first bar's
-    start and the current bar's start, PLUS the current bar's own
-    assumed width. This is why `required_seconds=30.0`, not `20.0` --
+    version): elapsed time is measured as of the END of a bar's own
+    interval, not its start timestamp -- a bar's own width counts in full
+    toward the streak once that bar closes on the right side. A bar's own
+    width is `bars[i+1]["ts"] - bars[i]["ts"]` when a next bar exists
+    (the bar's REAL observed width, whatever it actually was -- a 60s
+    backfilled bar counts as 60s, not a fixed assumption), or
+    `reference_interval_seconds` for the newest/last bar in the list,
+    where no next bar exists yet to measure from (specs.md section 16:
+    stage 1 used a FIXED `reference_interval_seconds` for every bar,
+    which only happened to be correct because every stage-1 test used
+    uniform 10s bars -- section 16 shows this over-counts real elapsed
+    time, and can wrongly confirm early, once bar widths actually vary).
+    This is why `required_seconds=30.0`, not `20.0`, on uniform data --
     "3 consecutive bars" means 3 FULL bar-widths of confirmed time, not
     the gap between the 1st and 3rd bar starts.
     """
@@ -321,13 +326,14 @@ def evaluate_hold_time_aware(
     elapsed_seconds = 0.0
     was_attempting = False
 
-    for b in bars:
+    for i, b in enumerate(bars):
         on_side = b["close"] > level_price if direction == "above" else b["close"] < level_price
         if on_side:
             if streak_start_ts is None:
                 streak_start_ts = b["ts"]
             was_attempting = True
-            elapsed_seconds = (b["ts"] - streak_start_ts) + reference_interval_seconds
+            bar_end_ts = bars[i + 1]["ts"] if i + 1 < len(bars) else b["ts"] + reference_interval_seconds
+            elapsed_seconds = bar_end_ts - streak_start_ts
             if elapsed_seconds >= required_seconds:
                 confirmed = True
         else:

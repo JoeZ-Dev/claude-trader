@@ -338,6 +338,111 @@ def test_evaluate_hold_time_aware_exactly_equals_bar_count_version_on_uniform_ca
     assert new.elapsed_seconds == old.consecutive_bars * 10.0
 
 
+# -- Phase 3.6 stage 2: genuine improvement on mixed cadence (specs.md ----
+# section 16). Distinct from stage 1's uniform-cadence equivalence tests
+# above -- these deliberately use IRREGULAR spacing (real backfill widths
+# and a real internal gap) and prove the time-aware functions weight a
+# bar PROPORTIONALLY to its real width, neither treating it as equal to a
+# 10s bar (naive equal-weighting) nor excluding it entirely (the current
+# live_cadence_tail stopgap).
+
+def test_ema_time_aware_single_60s_step_equals_six_10s_steps_to_same_value():
+    # Retention-of-old-value algebra (specs.md section 16): a single dt=60s
+    # step landing on close V must retain EXACTLY (1-k)**6 of the prior EMA
+    # value -- bit-identical to compounding six standard 10s-reference
+    # steps that each feed in the SAME value V. Real-shaped numbers
+    # (period=9, matching macd's fast leg; P/V from an actual AIFF EMA
+    # level and its following close -- see the live evidence in the
+    # report/specs.md for where these came from).
+    period = 9
+    k = 2.0 / (period + 1)
+    P = 7.6483   # prior ema level
+    V = 7.74     # the 60s bar's own close
+    # Method A: one time-aware step, dt=60s, reference=10s.
+    values_a = [P, V]
+    timestamps_a = [0, 60]
+    out_a = ema_time_aware(values_a, timestamps_a, period, reference_interval_seconds=10.0)
+    # Method B: six standard (bar-count) EMA steps, each fed the SAME
+    # value V (isolates the retained-fraction-of-P comparison).
+    values_b = [P] + [V] * 6
+    out_b = ema(values_b, period)
+    assert out_a[1] == out_b[6]
+    # And both must equal the closed-form V*(1-(1-k)**6) + (1-k)**6 * P
+    # (approx here only because this closed form recomputes (1-k)**6
+    # independently rather than reusing k_eff, which can differ in the
+    # last float bit from a different order of operations -- the exact,
+    # bit-for-bit claim is out_a[1] == out_b[6] above, already proven).
+    closed_form = V * (1 - (1 - k) ** 6) + (1 - k) ** 6 * P
+    assert out_a[1] == pytest.approx(closed_form, rel=1e-12)
+
+
+def test_ema_time_aware_heavily_discounts_history_across_a_real_gap():
+    # A real 360s internal backfill gap (AIFF, 08:23:00 -> 08:29:00, a
+    # genuine 5-skipped-minute Schwab gap -- see specs.md section 16)
+    # must retain only (1-k)**36 of the pre-gap ema, not (1-k)**1 (what
+    # naively treating the gap as one ordinary step would do).
+    period = 9
+    k = 2.0 / (period + 1)
+    values = [0.9445, 0.927]  # real closes either side of the gap
+    timestamps = [0, 360]
+    result = ema_time_aware(values, timestamps, period, reference_interval_seconds=10.0)
+    retained_fraction = (result[1] - values[1]) / (values[0] - values[1])
+    assert retained_fraction == pytest.approx((1 - k) ** 36, rel=1e-12)
+    # Sanity: this is a MUCH smaller retained weight than one ordinary
+    # 10s step would leave -- the gap is genuinely, heavily discounted.
+    assert retained_fraction < (1 - k) * 0.01
+
+
+def test_relative_volume_time_aware_uses_rate_not_raw_volume_across_mixed_widths():
+    # Mixed cadence, SAME underlying rate throughout (10 shares/second):
+    # three real-shaped 60s backfilled bars (volume=600) then ten 10s live
+    # bars (volume=100), then a current 10s bar also at volume=100/10s.
+    # Correct (rate-based) answer: relative volume of the current bar is
+    # exactly 1.0, since every bar in the window shares the identical
+    # rate. A naive raw-per-bar average would instead average 600s and
+    # 100s together, making a normal-rate bar look artificially low.
+    bars = []
+    ts = 0
+    for _ in range(3):
+        bars.append(bar(ts, 1, 1, 1, 1, 600)); ts += 60
+    for _ in range(10):
+        bars.append(bar(ts, 1, 1, 1, 1, 100)); ts += 10
+    current = bar(ts, 1, 1, 1, 1, 100)
+    bars.append(current)
+    result = relative_volume_time_aware(bars, lookback_seconds=200.0,
+                                        reference_interval_seconds=10.0)
+    assert result[-1] == pytest.approx(1.0, rel=1e-9)
+    # A naive raw-volume average over the SAME time window (what stage 1's
+    # window-selection-only version would have computed) is NOT 1.0 --
+    # confirms this is a real, not cosmetic, difference.
+    window = [w for w in bars[:-1] if current["ts"] - 200.0 <= w["ts"] < current["ts"]]
+    naive_avg = sum(w["volume"] for w in window) / len(window)
+    naive_result = current["volume"] / naive_avg
+    assert naive_result != pytest.approx(1.0, rel=1e-9)
+
+
+def test_evaluate_hold_time_aware_uses_actual_bar_width_not_fixed_reference_interval():
+    # Stage 1's formula (elapsed = (ts - streak_start) + a FIXED
+    # reference_interval_seconds) is only correct for an INTERIOR bar
+    # when that bar's own real width genuinely equals the reference --
+    # true for every stage-1 test (uniform 10s bars) but not in general.
+    # Here bar1's real width (to bar2, 2s later) is far SMALLER than the
+    # fixed 10s stage-1 assumed -- stage 1's formula over-counts real
+    # elapsed time by 8s at bar1 (21+10=31, wrongly clearing
+    # required_seconds=30), while the corrected version, using bar1's
+    # ACTUAL next-bar width, correctly measures only 23s of real elapsed
+    # time and does NOT confirm -- a genuine over-confirmation bug this
+    # stage exists to catch, not a cosmetic difference.
+    bars = [
+        bar(0, 8.5, 8.6, 8.4, 8.72, 100_000),   # streak starts
+        bar(21, 8.72, 8.9, 8.6, 8.85, 100_000),  # real width to next bar: 2s
+        bar(23, 8.72, 8.9, 8.0, 8.1, 100_000),   # closes below level, ends streak
+    ]
+    new = evaluate_hold_time_aware(bars, level_price=8.69, direction="above",
+                                   required_seconds=30.0, reference_interval_seconds=10.0)
+    assert new.confirmed is False  # only 23s of real elapsed time ever accrued
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
