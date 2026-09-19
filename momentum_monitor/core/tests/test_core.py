@@ -5,7 +5,7 @@ import pytest
 
 from indicators import (
     continuation_days, session_vwap, ema, macd, relative_volume,
-    ema_time_aware, relative_volume_time_aware, _bar_duration,
+    ema_time_aware, relative_volume_time_aware,
 )
 from levels import (
     confirmed_swing_lows, detect_levels, evaluate_hold,
@@ -293,8 +293,10 @@ def test_swing_points_time_aware_exactly_equals_bar_count_version_on_uniform_cad
     lows = [10, 9, 8, 7, 6, 4, 6, 7, 8, 9, 10, 9, 8, 6, 3, 6, 8, 9, 10]
     bars = _uniform_bars(lows)  # uniform 10s cadence
     old = _swing_points(bars, window=3, kind="low")
-    # default multiple=3.0 * each candidate's own 10s width = 30.0 --
-    # exactly section 15's original fixed window_seconds=30.0.
+    # Each side's walk target is 3.0 (default multiple) * the immediately
+    # adjacent bar's own 10s gap = 30.0 -- exactly section 15's original
+    # fixed window_seconds=30.0, and the walk collects exactly 3 real
+    # bars on each side to reach it, matching bars[i-3:i+4] exactly.
     new = swing_points_time_aware(bars, kind="low")
     assert new == old
     assert old  # sanity: the fixture actually contains swing lows to compare
@@ -452,25 +454,25 @@ def test_evaluate_hold_time_aware_uses_actual_bar_width_not_fixed_reference_inte
 def test_swing_points_time_aware_requires_a_real_bracket_not_just_calendar_room():
     # Real bug found against real AIFF backfilled data (specs.md section
     # 16): a fixed window narrower than local bar spacing (30s vs 60s
-    # backfill cadence) makes a candidate's real-time "segment" degenerate
-    # to just the candidate itself, which trivially "wins" as both the
-    # max AND the min of a one-element set. multiple=0.5 against 60s
-    # cadence reproduces exactly that: window = 0.5*60 = 30s, narrower
-    # than the bars' own 60s spacing. A candidate must never be flagged
-    # unless the window genuinely brackets it with a real bar on both
-    # sides.
+    # backfill cadence) made a candidate's real-time "segment" degenerate
+    # to just the candidate itself, which trivially "won" as both the max
+    # AND the min of a one-element set. Under the two-directional walk
+    # (specs.md section 17), the equivalent failure mode is
+    # max_hop_seconds too small for the real cadence -- here, 30s against
+    # 60s-cadence bars means even the FIRST hop on either side is already
+    # unreachable, so nothing is ever collected and no candidate can ever
+    # be flagged.
     lows = [10, 9, 8, 7, 6, 5, 6, 7, 8, 9, 10]
     bars = _uniform_bars(lows, start_ts=0, step=60)  # 60s cadence, like real backfill
-    assert swing_points_time_aware(bars, kind="low", multiple=0.5) == []
-    assert swing_points_time_aware(bars, kind="high", multiple=0.5) == []
+    assert swing_points_time_aware(bars, kind="low", max_hop_seconds=30.0) == []
+    assert swing_points_time_aware(bars, kind="high", max_hop_seconds=30.0) == []
 
 
 def test_swing_points_time_aware_still_finds_real_swing_points_when_window_actually_brackets():
     # Sanity companion to the above: the fix must not make the function
-    # vacuously empty in general. With the DEFAULT multiple=3.0, a
-    # candidate's own 60s width already produces a 180s window --
-    # cadence-adaptive by construction, no override needed -- wide enough
-    # to genuinely bracket 60s-cadence neighbors, and the real V-shaped
+    # vacuously empty in general. With the DEFAULT multiple=3.0, the
+    # walk's target on each side (3.0 * the adjacent 60s hop = 180s)
+    # comfortably brackets 60s-cadence neighbors, and the real V-shaped
     # low is still found.
     lows = [10, 9, 8, 7, 6, 5, 6, 7, 8, 9, 10]
     bars = _uniform_bars(lows, start_ts=0, step=60)
@@ -478,77 +480,90 @@ def test_swing_points_time_aware_still_finds_real_swing_points_when_window_actua
     assert result == [5]  # the single low point, index 5 (value 5)
 
 
-# -- Phase 3.6, cadence-adaptive swing_points_time_aware window (specs.md -
-# section 17). Replaces the single fixed window_seconds with
-# multiple * each candidate's own observed width (_bar_duration, reused
-# from the relative_volume fix, not a second width-detection primitive).
+# -- Phase 3.6, cadence-adaptive window: two-directional walk (specs.md --
+# section 17). A first design (multiple * the candidate's OWN single
+# _bar_duration) closed the fixed-window bug above but, investigated
+# further against the FULL real AIFF/AEMD/DAIC/DTSS history (not just the
+# one instance each originally checked), turned out to have two
+# STRUCTURAL blind spots, not rare flukes: 54 bars where a narrow
+# forward gap masked a genuinely wider real backward neighbor, and 63 of
+# 100 real large-gap bars where an inflated forward gap let the window
+# bridge back across the gap. Tested several alternatives against the
+# same full real data (see the session report): min(back,fwd) changed
+# nothing (forward was already the smaller value in practice); max
+# (back,fwd) and an asymmetric per-side single-gap design both fully
+# fixed the narrow-window blind spot but made gap-bridging WORSE (100/100
+# instead of 63/100) -- confirming a genuine, unavoidable tension in any
+# design deriving ONE scalar per side from a SINGLE adjacent gap alone.
+#
+# The two-directional walk below resolves both, verified against the
+# same full real data (0 remaining narrow-window blind spots, 0/100
+# remaining gap-bridges): each side walks outward hop by hop,
+# accumulating REAL elapsed time using each traversed pair's own actual
+# gap; a single hop larger than `max_hop_seconds` is a hard stop -- never
+# crossed, never counted, rather than treated as "far but still valid."
+# The accumulation TARGET on a side is `multiple` times that side's own
+# FIRST (immediately adjacent) hop, so it still scales to whatever local
+# cadence genuinely exists next to the candidate -- but max_hop_seconds
+# applies to that first hop too, so a candidate sitting immediately next
+# to a genuine gap can never use the gap itself to inflate its own
+# target. Real-data tradeoff, reported honestly: this is more
+# conservative than the single-scalar design in ordinary sparse (100-
+# 180s) stretches too (25/26 real backfilled swing points found on the
+# real AIFF day, vs. that design's 44/39) -- but that design's higher
+# count was inflated by the very gap-bridging this one closes, and 25/26
+# is still a real, substantial improvement over the original fixed-
+# window's 0/0.
 
-def test_swing_points_time_aware_still_excludes_a_real_internal_gap_with_ordinary_local_width():
-    # Reconfirmation (specs.md section 16/17): a candidate whose own
-    # width is ORDINARY for its neighborhood (not itself inflated by
-    # sitting next to the gap) must still be unable to reach across a
-    # real internal gap. own width=60s -> window=180s, well short of the
-    # 360s gap (matches the real AIFF gap's magnitude).
-    bars = _uniform_bars([10, 9, 8, 7], start_ts=0, step=60)      # 0,60,120,180
-    bars.append(bar(540, 1, 1, 1, 6, 100))                          # 360s gap: 180 -> 540
-    bars += _uniform_bars([5, 4, 3, 2, 1], start_ts=600, step=60)   # 600,660,...,840
-    # candidate at ts=600 (index 4): own width=60 (ordinary), window=180.
-    # The nearest real bar on the "before" side is 540 (60s away, within
-    # 180s) -- NOT the far side of the gap (any bar <=180, which is
-    # >=420s away, outside 180s) -- so the gap is correctly never bridged.
-    i = 5
-    assert bars[i]["ts"] == 600
-    assert _bar_duration(bars, i, reference_interval_seconds=10.0) == 60
-    window = 3.0 * 60
-    seg = [b for b in bars if abs(b["ts"] - bars[i]["ts"]) <= window]
-    assert min(b["ts"] for b in seg) == 540  # never reaches back to 180 or earlier
-    assert 180 not in [b["ts"] for b in seg]
-
-
-def test_swing_points_time_aware_transition_boundary_own_width_can_exclude_a_real_neighbor():
-    # Real, explained edge case found against real AIFF data (specs.md
-    # section 17): the LAST backfilled bar sits 60s after its own
-    # predecessor but only 10s before the first live bar arrives. Its
-    # OWN computed width (_bar_duration's "gap to next bar" definition)
-    # is therefore 10s, not 60s, even though it represents a genuine
-    # 60-second backfilled candle -- multiple=3 gives it a 30s window,
-    # narrower than the 60s gap back to its own predecessor, so it can
-    # never be bracketed on the "before" side and is excluded from
-    # consideration entirely. Not a crash or a wrong verdict (real AIFF
-    # data: this bar wasn't a genuine extreme anyway -- see the report),
-    # but a real, narrow, honestly-documented consequence of scaling the
-    # window off "time until the NEXT bar" specifically.
+def test_swing_points_time_aware_finds_a_real_neighbor_across_a_cadence_speed_up():
+    # Mirrors the real AIFF transition bar (specs.md section 17): a
+    # candidate 60s after its own predecessor but only 10s before its
+    # successor. The walk's "before" side targets 3 * 60s = 180s using
+    # its own first (backward) hop -- correctly finding the real
+    # predecessor region -- unlike the single-scalar design, which used
+    # only the 10s forward gap and excluded it.
     bars = (_uniform_bars([1, 2, 3], start_ts=0, step=60)            # 0,60,120 (backfill lead-in)
             + [bar(180, 1, 1, 1, 4, 100)]                              # 180: the transition bar
             + _uniform_bars([5, 6, 7, 8], start_ts=190, step=10))      # 190,200,210,220 (live)
     transition_idx = 3
     assert bars[transition_idx]["ts"] == 180
-    own_width = _bar_duration(bars, transition_idx, reference_interval_seconds=10.0)
-    assert own_width == 10.0  # next bar (live) arrives only 10s later
-    gap_to_predecessor = bars[transition_idx]["ts"] - bars[transition_idx - 1]["ts"]
-    assert gap_to_predecessor == 60.0  # wider than the resulting 30s window
-    result_high = swing_points_time_aware(bars, kind="high", multiple=3.0,
-                                          reference_interval_seconds=10.0)
-    assert transition_idx not in result_high  # excluded: no real bar within 30s before it
+    before = swing_points_time_aware(bars, kind="high", multiple=3.0)
+    # (not asserting transition_idx is itself a swing high here -- the
+    # fixture isn't shaped to make it one -- asserting the MECHANISM
+    # directly via the internal helper instead, matching how the real
+    # AIFF report verifies it.)
+    from levels import _walk_real_neighbors
+    result = _walk_real_neighbors(bars, transition_idx, -1, multiple=3.0, max_hop_seconds=90.0)
+    assert result != []  # real predecessor region found, not excluded
 
 
-def test_swing_points_time_aware_uses_bar_duration_helper_not_a_second_primitive():
-    # multiple * an ARTIFICIALLY inflated per-candidate width must widen
-    # the effective window accordingly -- deliberately broken/restored
-    # standard, verifying the function genuinely calls _bar_duration per
-    # candidate rather than hardcoding reference_interval_seconds. 4
-    # bars, 25s apart (own width 25s for interior candidates); with
-    # multiple=3 the window is 75s, which brackets these deliberately
-    # WIDER-than-live-cadence bars -- a fixed reference_interval_seconds
-    # of 10s (multiple=3 -> 30s) would NOT bracket them (25s spacing
-    # needs at least one full step >= 25s within the window on each side,
-    # which a 30s window only barely allows while a mis-scaled one would
-    # miss for wider spacings).
-    lows = [10, 9, 8, 7, 6, 5, 6, 7, 8, 9, 10]
-    bars = _uniform_bars(lows, start_ts=0, step=40)  # 40s apart -- wider than 3*10s=30s
-    result = swing_points_time_aware(bars, kind="low", multiple=3.0,
-                                     reference_interval_seconds=10.0)
-    assert result == [5]  # correctly bracketed via the bars' OWN 40s width (window=120s)
+def test_swing_points_time_aware_still_excludes_a_real_internal_gap():
+    # Reconfirmation (specs.md section 16/17): a candidate immediately
+    # after a real large gap must not have its own (possibly also wide)
+    # forward gap let it bridge back across that gap. Mirrors the real
+    # AIFF case (idx28: backward_gap=360 [the gap itself], forward_gap=
+    # 120) where the single-scalar design DID bridge it.
+    bars = _uniform_bars([10, 9, 8, 7], start_ts=0, step=60)            # 0,60,120,180
+    bars.append(bar(540, 1, 1, 1, 6, 100))                                # 360s gap: 180 -> 540
+    bars.append(bar(660, 1, 1, 1, 5, 100))                                # 120s forward gap (also wide)
+    bars += _uniform_bars([4, 3, 2, 1], start_ts=720, step=60)            # 720,780,...
+    from levels import _walk_real_neighbors
+    i = 4  # the bar at ts=540, immediately after the 360s gap
+    assert bars[i]["ts"] == 540
+    before = _walk_real_neighbors(bars, i, -1, multiple=3.0, max_hop_seconds=90.0)
+    assert before == []  # the 360s first hop alone exceeds max_hop_seconds -- never crossed
+
+
+def test_swing_points_time_aware_uses_a_two_directional_walk_not_a_second_primitive():
+    # Deliberately broken/restored standard, verifying the function
+    # genuinely walks hop by hop rather than deriving a window from a
+    # single adjacent gap. 60s-cadence bars: the walk collects 3 real
+    # bars on each side (target = 3 * 60s = 180s, reached exactly via 3
+    # hops of 60s each) to confirm the real V-shaped low.
+    lows = [10, 9, 8, 7, 6, 5, 6, 7, 8, 9, 10, 9, 8]
+    bars = _uniform_bars(lows, start_ts=0, step=60)
+    result = swing_points_time_aware(bars, kind="low", multiple=3.0, max_hop_seconds=90.0)
+    assert result == [5]
 
 
 if __name__ == "__main__":

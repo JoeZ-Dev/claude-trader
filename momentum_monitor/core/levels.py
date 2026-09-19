@@ -17,8 +17,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from indicators import _bar_duration
-
 # Round-number grid, TIERED by price -- retail attention clusters at
 # round numbers, but what counts as "round" scales with price: a nickel
 # matters at $1, but is meaningless noise at $150, while a half-dollar
@@ -85,53 +83,101 @@ def _swing_points(bars: list[dict], window: int, kind: str) -> list[int]:
     return idxs
 
 
+def _walk_real_neighbors(bars: list[dict], i: int, step: int, multiple: float,
+                         max_hop_seconds: float) -> list[dict]:
+    """Walks outward from index `i` in `step` direction (-1 backward, +1
+    forward), accumulating REAL elapsed time hop by hop, using each
+    traversed pair's own actual gap -- never a scalar derived from the
+    candidate alone (specs.md section 17: a single scalar, however
+    derived, cannot distinguish "the local cadence here is genuinely
+    coarse" from "there's a gap of the same magnitude" using only the
+    bars immediately touching the candidate).
+
+    A single hop larger than `max_hop_seconds` is a hard stop: never
+    crossed, never counted, rather than treated as "far away but still
+    valid, scaled generously." This is what actually prevents crossing a
+    real gap, regardless of which bar's own width would otherwise have
+    justified a wide window. The accumulation TARGET on this side is
+    `multiple` times the FIRST (immediately adjacent) hop's own real
+    size -- so it still scales to whatever local cadence genuinely
+    exists right next to the candidate -- but `max_hop_seconds` applies
+    to that first hop too, so a candidate sitting immediately next to a
+    genuine gap can never use the gap itself to inflate its own target.
+    """
+    j = i
+    nxt = j + step
+    if not (0 <= nxt < len(bars)):
+        return []
+    first_hop = abs(bars[nxt]["ts"] - bars[j]["ts"])
+    if first_hop > max_hop_seconds:
+        return []
+    target = multiple * first_hop
+    accumulated = 0.0
+    collected: list[dict] = []
+    while 0 <= nxt < len(bars):
+        hop = abs(bars[nxt]["ts"] - bars[j]["ts"])
+        if hop > max_hop_seconds:
+            break
+        accumulated += hop
+        collected.append(bars[nxt])
+        if accumulated >= target:
+            break
+        j = nxt
+        nxt = j + step
+    return collected
+
+
 def swing_points_time_aware(bars: list[dict], kind: str, multiple: float = 3.0,
-                            reference_interval_seconds: float = 10.0) -> list[int]:
-    """Time-aware analog of `_swing_points` (specs.md sections 15/16/17,
-    phase 3.6): a candidate is compared against every bar within a
-    CADENCE-ADAPTIVE window on EACH side (real elapsed time), rather than
-    a fixed bar count OR a single fixed real-time span.
+                            max_hop_seconds: float = 90.0) -> list[int]:
+    """Time-aware analog of `_swing_points` (specs.md sections 15-17,
+    phase 3.6): a candidate is compared against every bar reachable by a
+    real, cadence-adaptive TWO-DIRECTIONAL WALK on each side (see
+    `_walk_real_neighbors`), rather than a fixed bar count or any single
+    real-time span derived from the candidate alone.
 
-    A candidate's window is `multiple * ` its own real observed width --
-    `_bar_duration` (the SAME helper `relative_volume_time_aware` uses,
-    not a second width-detection primitive), the gap to whatever bar
-    comes right after it, or `reference_interval_seconds` for the newest
-    bar in the list. Default `multiple=3.0` matches `window=3` bars at
-    the live 10s cadence (own width 10s * 3 = 30s, exactly section 15's
-    original fixed `window_seconds=30.0`), but now scales automatically
-    with whatever cadence a candidate actually sits in: a 60s-cadence
-    backfilled candidate gets a 180s window, wide enough to genuinely
-    bracket its own real neighbors (section 15's fixed 30s window,
-    narrower than backfill's own 60s spacing, could never do this --
-    see section 17). This is still a REAL elapsed-time bound throughout,
-    never a bar count -- reverting to bar-counting anywhere in here would
-    bring back the gap-ballooning bug section 16 already fixed, in a new
-    form.
+    An earlier version derived one window from `multiple *` the
+    candidate's own single observed width (`_bar_duration`, the gap to
+    its NEXT bar). That closed the original fixed-window bug (a 30s
+    window too narrow for 60s backfill cadence) but, checked against the
+    FULL real AIFF/AEMD/DAIC/DTSS capture rather than the one instance
+    originally found, turned out to have two STRUCTURAL blind spots: 54
+    real bars where a narrow forward gap masked a genuinely wider real
+    backward neighbor (a bar right at a cadence speed-up), and 63 of 100
+    real large-gap bars where an inflated forward gap let the window
+    bridge back across the gap. Neither `min` nor `max` of the two
+    neighboring gaps closed both (verified against the same real data,
+    not just reasoned about): `min` changed nothing (forward was already
+    the smaller value in the vast majority of real cases), `max` fixed
+    the narrow-window blind spot completely but made gap-bridging WORSE
+    (100/100 instead of 63/100) -- a genuine, unavoidable tension in any
+    design deriving one scalar per side from a single adjacent gap.
 
-    A candidate is only eligible once its OWN computed window's worth of
-    real history exists on BOTH sides of it overall (the time-based
-    analog of `_swing_points`' `range(window, len(bars)-window)` bound),
-    and -- unchanged since section 16 -- only if the window genuinely
-    brackets it with a REAL bar on both sides, not just enough calendar
-    room. The zero-volume forward-fill exclusion (see `_swing_points`'s
+    The two-directional walk here resolves both (verified against the
+    same real data: 0 remaining narrow-window blind spots, 0/100
+    remaining gap-bridges at `max_hop_seconds=90.0`, chosen because it
+    sits cleanly between real backfill's 60s baseline cadence and the
+    smallest real "skipped minute" gap observed, 120s). Real tradeoff,
+    found and reported rather than hidden: this is more conservative
+    than the single-scalar design even in ordinary sparse (100-180s)
+    stretches -- 25/26 real swing points found in AIFF's real backfilled
+    portion, vs. that design's 44/39 -- but that higher count was itself
+    partly inflated by the very gap-bridging this version closes, and
+    25/26 is still a substantial real improvement over the original
+    fixed-window design's 0/0 there.
+
+    The zero-volume forward-fill exclusion (see `_swing_points`'s
     docstring) is preserved unchanged -- that rule is about real vs.
     synthetic bars, orthogonal to windowing strategy entirely.
     """
     idxs = []
-    if not bars:
-        return idxs
-    first_ts, last_ts = bars[0]["ts"], bars[-1]["ts"]
     for i, cand in enumerate(bars):
-        window_seconds = multiple * _bar_duration(bars, i, reference_interval_seconds)
-        if cand["ts"] - first_ts < window_seconds or last_ts - cand["ts"] < window_seconds:
-            continue
         if cand["volume"] == 0:
             continue
-        seg = [b for b in bars if abs(b["ts"] - cand["ts"]) <= window_seconds]
-        has_before = any(b["ts"] < cand["ts"] for b in seg)
-        has_after = any(b["ts"] > cand["ts"] for b in seg)
-        if not (has_before and has_after):
+        before = _walk_real_neighbors(bars, i, -1, multiple, max_hop_seconds)
+        after = _walk_real_neighbors(bars, i, +1, multiple, max_hop_seconds)
+        if not before or not after:
             continue
+        seg = before + [cand] + after
         val = cand["high"] if kind == "high" else cand["low"]
         seg_vals = [b["high"] if kind == "high" else b["low"] for b in seg]
         if kind == "high" and val == max(seg_vals):
