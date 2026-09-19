@@ -2690,16 +2690,178 @@ gap, returning 4 bars instead of `[]`), and the narrow-max_hop test also
 failed (a spurious swing point reappeared). Reverted both; full suite
 green again, no leftover markers.
 
+**A third correction, found during phase 3.6 stage 3's migration
+downstream regression (specs.md section 18), superseding the 25/26
+figure above.** Migrating `detect_levels`/`confirmed_swing_lows` to this
+function and running `setup_types.py`'s full existing test suite
+surfaced a real bug this section's own tests never exercised:
+`_walk_real_neighbors` returned whatever PARTIAL collection it had
+gathered when it ran out of real bars (near either end of `bars`) or hit
+an uncrossable hop BEFORE reaching its own `target` — accepting an
+incomplete bracket as if it were sufficient. `setup_types.py`'s own
+`test_micro_breakout_finds_a_level_the_main_window_misses` (a 5-bar
+fixture built specifically so the main `swing_window=3` window has too
+few bars to ever confirm anything) failed: the candidate was wrongly
+confirmed using a partial 2-bar collection on each side, instead of
+correctly finding nothing. Fixed: `_walk_real_neighbors` now returns
+`[]` whenever the walk ends without reaching `target`, whether from
+running out of bars or hitting a real gap partway through — matching
+the bar-count design's actual intent (a genuinely adequate bracket on
+both sides, not merely "some"). Proven directly in `core/tests/
+test_core.py` (`test_swing_points_time_aware_requires_reaching_the_full_
+target_not_a_partial_walk`) and via break-then-fix (reverting to
+`return collected` mid-loop reproduced both the new core test's failure
+and the original `setup_types.py` failure that caught this; reverted,
+green again). Re-verified this doesn't regress anything already proven:
+AEMD uniform equivalence still 210/210 and 192/192; the Finding-1/
+Finding-2 full-history structural scan still 0 and 0/100. The AIFF real
+mixed-cadence improvement number drops further, honestly reported: 11
+lows and 12 highs total (10 and 12 genuinely inside the backfilled
+portion), down from 25/26 — because several of those 25/26 were
+themselves confirmed using an incomplete bracket the fix above no longer
+accepts. Still a real, if now smaller, improvement over the original
+fixed-window design's 0/0, and — more importantly — now the FIRST
+version of this function whose confirmations are backed by a genuinely
+complete real-time bracket in every case, not merely "no known gap
+crossed."
+
 **Status:** phase 3.6's design/proof work is now complete for all four
 functions, with the swing-point windowing specifically re-verified
-against a FULL real-history structural scan, not a single sampled
-instance. `core/tests/test_core.py`: 36 tests passing; `core` suite
-overall: 49 tests passing; full project suite: 276 tests passing,
-unchanged elsewhere. Stage 3 (migrating call sites, including retiring
+against a FULL real-history structural scan (not a single sampled
+instance) THREE times over — the original fixed-window bug, the
+gap/transition structural scan, and this partial-walk correction found
+by downstream migration testing. `core/tests/test_core.py`: 37 tests
+passing; `core` suite overall: 50 tests passing; full project suite: 276
+tests passing, unchanged elsewhere. Stage 3 (migrating call sites,
+including retiring `live_cadence_tail`) remains separate, later,
+explicitly-gated work — not started as of this section; see section 18
+for stage 3 part 1 (`detect_levels`/`confirmed_swing_lows`).
+
+### 18. Phase 3.6 stage 3, part 1 — migrate detect_levels/confirmed_swing_lows
+
+The first real PRODUCTION change in phase 3.6 — everything in sections
+14-17 was additive/comparison only. Scoped narrowly, same discipline as
+every prior stage: `detect_levels` and `confirmed_swing_lows` only, not
+`ema`/`relative_volume`/`evaluate_hold` (those three currently share
+`live_cadence_tail` as one mechanism — see section 3 — and retiring it
+only makes sense once all three no longer need it; that's a separate,
+later prompt). `detect_levels` and `confirmed_swing_lows` were the
+natural first migration because they already see the FULL
+backfilled+live series today (`state.py`: "detect_levels... deliberately
+keep seeing the full backfilled+live series") — no `live_cadence_tail`
+filtering to untangle, purely a window-logic swap.
+
+**The change.** Both functions' internal `_swing_points(bars, window,
+kind)` call is replaced with `swing_points_time_aware(bars, kind=kind,
+multiple=float(window))` (sections 15-17's cadence-adaptive, gap-safe
+two-directional walk). Public signatures are UNCHANGED —
+`detect_levels(bars, swing_window=3, ...)` and `confirmed_swing_lows(
+bars, window=3)` still take a plain int, now interpreted as `multiple`
+rather than a bar count; every existing caller (`setup_types.py`'s
+`_breakout_candidate` for both `resistance_breakout` (swing_window=3)
+and `micro_breakout` (`MICRO_SWING_WINDOW=1`), `monitor-app/app.py`'s
+swing-low-anchored stop, `state.py`'s plain `detect_levels(bars)`) needed
+zero changes.
+
+**A third real bug in `swing_points_time_aware` itself, found by this
+migration's own downstream regression** (not by anything new written for
+this stage) — documented in full in section 17, summarized here since it
+directly affects this migration's real numbers: `_walk_real_neighbors`
+was accepting a PARTIAL walk (ran out of bars, or hit a gap, before
+reaching its own target) as if it were a sufficient bracket.
+`setup_types.py`'s own pre-existing `test_micro_breakout_finds_a_level_
+the_main_window_misses` — built specifically so a 5-bar fixture gives
+the main `swing_window=3` window too few real bars to ever confirm
+anything — failed the instant the migration landed, catching this
+directly. Fixed (section 17 has the full fix and re-verification); this
+migration's own before/after numbers below are against the corrected
+version.
+
+**Real before/after, on the same real AIFF mixed-cadence day used
+throughout sections 14-17** (236 bars: 228 backfilled 60s-cadence, then
+8 live 10s bars):
+
+- `detect_levels`: OLD (bar-count) finds 24 levels total — top 5 by
+  strength: support 1.0401 (13 touches), support 1.0205 (11), resistance
+  1.0300 (9), support 1.1175 (8), support 0.9259 (6). NEW (migrated)
+  finds 15 levels total — top 5: support 1.1192 (6 touches), resistance
+  1.1000 (3), resistance 1.1500 (2), resistance 1.1999 (1), support
+  1.1023 (1). The drop (24→15) is the DIRECT, expected consequence of
+  sections 16/17's fixes actually taking effect here: several of OLD's
+  higher-touch-count levels (13, 11, 9 touches) were themselves built
+  from swing points confirmed via degenerate single-bar brackets and
+  gap-bridging bugs already proven wrong on this exact data — NEW's
+  lower, "less impressive-looking" numbers are the more trustworthy
+  ones, not a regression.
+- `confirmed_swing_lows`: OLD finds 47 confirmed lows, NEW finds 11.
+  First few OLD entries (08:03, 08:11, 08:12, 08:16, 08:17, all clustered
+  around a stale 0.926 price) are exactly the kind of gap/degenerate-
+  bracket artifacts sections 16/17 diagnosed; NEW's first few entries
+  (08:03, then 09:35, 13:43, 13:48, 13:49) are more sparsely and, per
+  the underlying data, more genuinely spaced.
+
+**Regression check: purely uniform-cadence data must be unaffected**,
+re-confirmed directly (not assumed from sections 15-17 still holding) —
+AEMD's real 2026-09-18 regular session (2,340 bars, strictly 10s
+cadence): `detect_levels` — 21 levels, byte-for-byte identical
+(kind/price/touch_count) between OLD and NEW. `confirmed_swing_lows` —
+210 lows, identical entry-for-entry.
+
+**Full downstream regression**, both suites that directly consume these
+two functions: `core/tests/test_setup_types.py` (all four setup types
+depend on `detect_levels`' output) and `monitor-app/tests/
+test_journal_logic.py` + `test_journal_wiring.py` (the swing-low-anchored
+stop depends on `confirmed_swing_lows`) — 135 tests passing together
+(98 baseline + the new section-17 core test + the fix already covered
+above), zero silently-adjusted tests: the one downstream test that did
+fail (`test_micro_breakout_finds_a_level_the_main_window_misses`)
+surfaced a real bug in the migrated function itself, which was fixed at
+the root (section 17), not worked around by changing the test's
+expectation. Full project suite: 276 tests passing, unchanged elsewhere.
+
+**Production deployment: held, not performed.** `monitor-app/data/
+journal.db` has one open position at the time of this migration (AEMD,
+id 52, entered 2026-09-18, no `exit_ts`) — restarting `monitor-app`
+would drop its in-memory per-symbol state for a live open trade, the
+same risk this project has avoided all session. Per that standing
+practice, the actual deploy is held; verification instead ran as an
+ISOLATED check against the real, currently-running, already-live
+`schwab-connector` (no production container touched, no restart, no
+write): pulled DAIC's real live bar history directly from the running
+`schwab-connector`'s own `/bars/DAIC` endpoint (13,540 real bars, freshest
+one 27 seconds old at fetch time — genuinely live, not a snapshot),
+and ran both OLD and NEW `detect_levels`/`confirmed_swing_lows` against
+it locally. Result: the top 5 levels by strength are IDENTICAL between
+OLD and NEW (DAIC's captured history is almost entirely live-cadence,
+so little room for the migration to matter at the top) — support 4.7395
+(96 touches), resistance 5.3437 (80), support 3.6552 (80), resistance
+4.7688 (72), resistance 3.6957 (63) — with small, expected differences
+further down the list (96 vs 93 total levels, 1,159 vs 1,153 confirmed
+swing lows). This confirms the migrated code runs cleanly against real,
+currently-streaming production data and produces sensible output,
+without the risk of restarting a process holding a live position.
+
+**Rollback awareness, stated plainly whether or not it's needed.** This
+is the first change in phase 3.6 touching live trading decisions. If
+anything looks wrong once this DOES get deployed (a level that doesn't
+make sense, a setup type behaving unexpectedly) the correct response is
+reverting this commit immediately and re-diagnosing from a clean state —
+not attempting a live fix under pressure. Nothing wrong was observed in
+the evidence above, but the option was explicitly considered, and the
+deploy itself is deliberately deferred until AEMD's open position
+clears, specifically so that if a problem DOES show up after deploy, the
+response isn't complicated by an already-in-flight live position riding
+on the change.
+
+**Status:** `core/tests/test_core.py`: 37 tests passing; `core` suite:
+50 tests passing; `setup_types.py` + `journal_logic.py` + `journal_
+wiring.py`: 135 tests passing; full project suite: 276 tests passing.
+Deploy held pending AEMD's open position clearing. Stage 3 part 2
+(migrating `ema`/`relative_volume`/`evaluate_hold` together and retiring
 `live_cadence_tail`) remains separate, later, explicitly-gated work —
 not started.
 
-### 18. Roadmap / phases
+### 19. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,
@@ -2790,14 +2952,37 @@ not started.
    swing points found, a real, substantial improvement over the
    fixed-window version's 0/0, honestly reported as more conservative
    than the superseded design's 44/39 — a figure that was itself
-   partly inflated by the very gap-bridging this version closes). Phase
-   3.6's design/proof work is complete for all four functions. Stage 3
-   (actually migrating call sites, including retiring
-   `live_cadence_tail`) remains a separate, later, explicitly-gated
-   prompt. Touches `core/`'s public function signatures and its
+   partly inflated by the very gap-bridging this version closes). A
+   THIRD bug (accepting a partial walk that ran out of bars/hit a gap
+   before reaching target) was then found by stage 3's own downstream
+   regression, not by anything in this section's original tests — see
+   below. Phase 3.6's design/proof work is complete for all four
+   functions. Touches `core/`'s public function signatures and its
    authoritative test suite — a real redesign, not a quick patch, which
    is why it's a separate phase rather than bundled into the backfill
    work that motivated it.
+   **Stage 3, part 1 (built, 2026-09-18) — see section 18:** the first
+   real PRODUCTION change in this phase — migrated `detect_levels` and
+   `confirmed_swing_lows` (both already see the full backfilled+live
+   series, no `live_cadence_tail` entanglement) to the cadence-adaptive
+   walk. Public signatures unchanged, zero caller edits needed. This
+   migration's own full downstream regression (`setup_types.py`,
+   `journal_logic.py`) caught the third bug above directly (a pre-
+   existing test built to prove a window is too narrow to confirm
+   anything wrongly confirmed one via a partial walk) — fixed at the
+   root, not worked around. Real before/after on the same real AIFF
+   mixed-cadence day: `detect_levels` 24→15 levels, `confirmed_swing_
+   lows` 47→11, the drop being sections 16/17/18's fixes actually taking
+   effect (OLD's higher counts were built from swing points already
+   proven wrong on this exact data). Uniform-cadence AEMD data unaffected
+   (byte-for-byte identical). Deploy HELD: `journal.db` has one open
+   position (AEMD) at migration time, so verification ran isolated
+   against the real, currently-live `schwab-connector` instead of
+   restarting production — confirmed sensible against real live DAIC
+   data (top 5 levels by strength identical old vs. new). Stage 3 part 2
+   (migrating `ema`/`relative_volume`/`evaluate_hold` together and
+   retiring `live_cadence_tail`) remains a separate, later, explicitly-
+   gated prompt.
 4. **(built)** Virtual trade journal — logs what the system would have
    done (entry, trailing stop) without placing anything, for end-of-day
    review against the user's own judgment. See section 6 for the full

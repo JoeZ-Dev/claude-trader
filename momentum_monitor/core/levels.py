@@ -103,6 +103,16 @@ def _walk_real_neighbors(bars: list[dict], i: int, step: int, multiple: float,
     exists right next to the candidate -- but `max_hop_seconds` applies
     to that first hop too, so a candidate sitting immediately next to a
     genuine gap can never use the gap itself to inflate its own target.
+    Reaching the FULL `target` is required for success -- running out of
+    real bars (near either end of `bars`) or hitting an uncrossable hop
+    before `target` is reached returns `[]`, the same as never finding a
+    bracket at all. This matters at the edges of a short real bar list
+    (found during phase 3.6 stage 3's migration: a naive version that
+    returned whatever partial context it collected, even short of
+    target, made a candidate too close to the START of `bars` eligible
+    using only 2 real bars where the bar-count design correctly required
+    a full `window`-bars-worth before ever considering it -- see
+    specs.md section 18).
     """
     j = i
     nxt = j + step
@@ -117,14 +127,14 @@ def _walk_real_neighbors(bars: list[dict], i: int, step: int, multiple: float,
     while 0 <= nxt < len(bars):
         hop = abs(bars[nxt]["ts"] - bars[j]["ts"])
         if hop > max_hop_seconds:
-            break
+            return []
         accumulated += hop
         collected.append(bars[nxt])
         if accumulated >= target:
-            break
+            return collected
         j = nxt
         nxt = j + step
-    return collected
+    return []
 
 
 def swing_points_time_aware(bars: list[dict], kind: str, multiple: float = 3.0,
@@ -188,21 +198,34 @@ def swing_points_time_aware(bars: list[dict], kind: str, multiple: float = 3.0,
 
 
 def confirmed_swing_lows(bars: list[dict], window: int = 3) -> list[dict]:
-    """Every CONFIRMED swing low in `bars` (a local minimum with `window`
-    bars fully bracketing it on both sides, per `_swing_points` -- reused
-    directly, not reimplemented) as `{"ts", "price"}` dicts, oldest first.
+    """Every CONFIRMED swing low in `bars` (a local minimum genuinely
+    bracketed on both sides by real elapsed time, per
+    `swing_points_time_aware` -- reused directly, not reimplemented) as
+    `{"ts", "price"}` dicts, oldest first.
+
+    Migrated (specs.md section 18, phase 3.6 stage 3 part 1) from the
+    bar-count `_swing_points` to the cadence-adaptive time-aware version
+    proven in sections 15-17: `window` is now passed through as
+    `multiple` (bit-identical on uniform cadence -- `window=3` bars at
+    the live 10s cadence and `multiple=3.0` produce the exact same 30s
+    per-side target), but on real mixed cadence (a position held across
+    a backfill-to-live transition, or spanning a real intraday data gap)
+    this now correctly scales the confirmation window to each candidate's
+    own real observed cadence, and never lets it bridge a genuine gap
+    (`_walk_real_neighbors`'s `max_hop_seconds`, default 90.0) the way
+    the bar-count version's fixed-count reach could.
 
     Exposed as its own public function, separate from `detect_levels`'
     clustered/scored `Level` output, because the virtual journal's early-
     phase exit (specs.md section 12, the swing-low-anchored stop) needs
     the raw sequence of confirmed lows -- including the SAME real
-    confirmation delay `_swing_points` already imposes (a low isn't
-    "confirmed" until `window` bars have printed after it) -- not a level
+    confirmation delay this imposes (a low isn't "confirmed" until real
+    bars have printed bracketing it on both sides) -- not a level
     clustered and scored for resistance/support display. `bars` is used
     exactly as given; a caller wanting "since a position's entry" slices
     to that range itself, the same way every other function in this
     module takes bars as-is with no concept of a caller-specific window."""
-    idxs = _swing_points(bars, window, kind="low")
+    idxs = swing_points_time_aware(bars, kind="low", multiple=float(window))
     return [{"ts": bars[i]["ts"], "price": bars[i]["low"]} for i in idxs]
 
 
@@ -251,10 +274,19 @@ def detect_levels(
     by touch count, volume concentration, and round-number proximity.
     Deliberately NOT scored by recency-only "nearest to current price" -
     that's the exact behavior that let noise through before.
+
+    Migrated (specs.md section 18, phase 3.6 stage 3 part 1) from the
+    bar-count `_swing_points` to the cadence-adaptive time-aware
+    `swing_points_time_aware` proven in sections 15-17: `swing_window` is
+    passed through as `multiple` (bit-identical on uniform cadence), but
+    now correctly scales to each candidate's own real observed cadence on
+    real mixed backfilled+live data, and never bridges a genuine gap. No
+    change here to the clustering/scoring logic below -- only which raw
+    swing-point indices feed it.
     """
     levels: list[Level] = []
     for kind, point_kind in (("resistance", "high"), ("support", "low")):
-        idxs = _swing_points(bars, swing_window, point_kind)
+        idxs = swing_points_time_aware(bars, kind=point_kind, multiple=float(swing_window))
         touches = [
             (bars[i]["high"] if kind == "resistance" else bars[i]["low"], bars[i])
             for i in idxs

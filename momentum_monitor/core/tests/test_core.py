@@ -566,6 +566,27 @@ def test_swing_points_time_aware_uses_a_two_directional_walk_not_a_second_primit
     assert result == [5]
 
 
+def test_swing_points_time_aware_requires_reaching_the_full_target_not_a_partial_walk():
+    # Real bug found during phase 3.6 stage 3's migration (specs.md
+    # section 18): a candidate too close to the START/END of `bars`, or
+    # too close to a real gap, could still be "eligible" with a walk that
+    # ran out of real bars (or hit a gap) before reaching its own target
+    # -- a PARTIAL collection, shorter than the design calls for, was
+    # being accepted as if it were a genuine bracket. This is the exact
+    # scenario setup_types.py's own test suite caught downstream (a
+    # 5-bar fixture where multiple=3 has only 2 real bars available on
+    # each side of the middle candidate -- 120s accumulated, short of the
+    # 180s target). The walk must return `[]`, not the partial 2-bar
+    # collection, when the array runs out before reaching target.
+    lows = [10, 9, 8, 9, 10]  # a clean V, the low at index 2
+    bars = _uniform_bars(lows, start_ts=0, step=60)  # only 5 bars, 60s apart
+    # multiple=3 needs 180s on each side; only 2 hops (120s) fit before
+    # the array ends on either side of the middle candidate (index 2).
+    assert swing_points_time_aware(bars, kind="low", multiple=3.0) == []
+    # multiple=1 only needs 60s -- one real hop away, well within reach.
+    assert swing_points_time_aware(bars, kind="low", multiple=1.0) == [2]
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
