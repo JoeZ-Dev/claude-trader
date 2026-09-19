@@ -8,6 +8,7 @@ sys.path.insert(0, _APP_DIR)
 
 import pytest
 
+import journal_logic
 from journal_logic import (
     ExitEvent,
     OpenPosition,
@@ -521,6 +522,72 @@ def test_advance_journal_still_guards_against_a_duplicate_open_position():
     )
     assert tick.opened is None
     assert tick.updated is not None  # the existing position just ratcheted
+
+
+# -- breakdown-type structural safety proof (specs.md section 22) ----------
+# Breakdown-below setup types (support_breakdown, micro_breakdown,
+# vwap_breakdown, round_number_breakdown -- core/setup_types.py's
+# evaluate_breakdown_setups) are warning/context signals only, NEVER a
+# trade trigger. Structurally they never reach this module at all in the
+# real app (monitor-app/state.py's build_state keeps them in a separate
+# `breakdown_setups` key, never merged into `setups`, and app.py's
+# _update_journal never passes that key to advance_journal) -- but these
+# tests prove the SECOND, defense-in-depth layer (_ENTRY_ELIGIBLE_SETUP_
+# TYPES in journal_logic.py) actually works on its own, by adversarially
+# constructing a `setups` list that puts a confirmed breakdown type in as
+# the closest/first-sorted candidate, exactly as if the structural
+# separation had somehow failed.
+
+def test_advance_journal_skips_a_breakdown_type_even_as_the_closest_setup():
+    # The breakdown candidate is closest (distance=0.01, first in the
+    # pre-sorted list) -- if the allowlist check were missing or came
+    # after the confirmed/fresh checks, THIS is the one that would fire.
+    # It must be skipped entirely, falling through to the next eligible
+    # (bullish) type instead of blocking entry outright -- ineligibility
+    # is not the same as "nothing confirmed."
+    tick = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[
+            _setup("support_breakdown", confirmed=True, distance=0.01),  # closest
+            _setup("resistance_breakout", confirmed=True, distance=5.0),
+        ],
+    )
+    assert tick.opened is not None
+    assert tick.opened.setup_type == "resistance_breakout"
+
+
+@pytest.mark.parametrize("breakdown_type", [
+    "support_breakdown", "micro_breakdown", "vwap_breakdown", "round_number_breakdown",
+])
+def test_advance_journal_never_opens_on_any_breakdown_type_alone(breakdown_type):
+    tick = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[_setup(breakdown_type, confirmed=True)],
+    )
+    assert tick.opened is None
+
+
+def test_breakdown_type_allowlist_break_then_fix(monkeypatch):
+    # Deliberately widen the allowlist to prove this test suite can catch
+    # a regression here, not just that it currently passes -- mirrors this
+    # session's established break-then-fix rigor for every safety-critical
+    # gate (see test_confirmation_freshness_gate_break_then_fix below).
+    monkeypatch.setattr(
+        journal_logic, "_ENTRY_ELIGIBLE_SETUP_TYPES",
+        journal_logic._ENTRY_ELIGIBLE_SETUP_TYPES | {"support_breakdown"},
+    )
+    broken = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[_setup("support_breakdown", confirmed=True)],
+    )
+    assert broken.opened is not None  # wrongly fires -- the allowlist is broken here
+
+    monkeypatch.undo()
+    fixed = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[_setup("support_breakdown", confirmed=True)],
+    )
+    assert fixed.opened is None  # correctly blocked once restored
 
 
 # -- Part B: volume confirmation gates entries only, never exits -----------

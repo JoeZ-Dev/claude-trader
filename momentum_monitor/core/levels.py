@@ -255,6 +255,21 @@ def nearest_round_number_above(price: float, increment: float | None = None) -> 
     return round(candidate, 4)
 
 
+def nearest_round_number_below(price: float, increment: float | None = None) -> float:
+    """Largest round-number grid point STRICTLY BELOW `price`, on the
+    grid tier `price` itself falls into -- the floor mirror of
+    `nearest_round_number_above` (specs.md section 22's breakdown-below
+    setup variants: round-number breakdown needs the next grid line
+    DOWN, the same way round-number reclaim needs the next one up). Same
+    float-precision guard, same "not expected to loop more than once in
+    practice" reasoning, just flipped direction."""
+    inc = increment if increment is not None else _round_number_increment(price)
+    candidate = (math.ceil(price / inc) - 1) * inc
+    while candidate >= price:
+        candidate -= inc
+    return round(candidate, 4)
+
+
 def _round_number_bonus(price: float) -> float:
     """Small bonus for proximity to a round-number grid point (tiered by
     price -- see `_round_number_increment`) - retail attention tends to

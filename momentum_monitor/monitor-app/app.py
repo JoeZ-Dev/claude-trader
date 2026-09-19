@@ -1126,6 +1126,13 @@ _SETUP_TYPE_LABELS = {
     "round_number_reclaim": "Round-number reclaim",
 }
 
+_BREAKDOWN_TYPE_LABELS = {
+    "support_breakdown": "Support breakdown",
+    "micro_breakdown": "Micro-breakdown",
+    "vwap_breakdown": "VWAP breakdown",
+    "round_number_breakdown": "Round-number breakdown",
+}
+
 
 def _humanize_key(key: str) -> str:
     return key.replace("_", " ")
@@ -1160,15 +1167,25 @@ def _setup_hold_and_factor_rows_html(setup: dict) -> str:
     return "".join(rows)
 
 
-def _closest_setup_html(setup: dict | None) -> str:
+def _closest_setup_html(setup: dict | None, position_open: bool = False) -> str:
     """The single closest (smallest dollar-distance-to-trigger) setup
     candidate, same visual weight as the resistance/support tables below
-    it -- the headline read, not a footnote."""
+    it -- the headline read, not a footnote.
+
+    `position_open` (specs.md section 22, Part 2): should_enter already
+    correctly refuses a fresh entry while a position is open for this
+    symbol, but the callout's wording didn't reflect that -- it read like
+    a live, actionable signal regardless. When a position is already
+    open, the heading is relabeled to make plain this is context, not a
+    currently-actionable signal; the data itself is left showing (still
+    useful to see), only the framing changes."""
     if setup is None:
         return "<h3>Closest setup</h3><p class='muted'>none currently watchable</p>"
     label = _SETUP_TYPE_LABELS.get(setup["setup_type"], setup["setup_type"])
+    prefix = ("Setup context (position already open, not a new signal)"
+             if position_open else "Closest setup")
     return (
-        f"<h3>Closest setup: {html.escape(label)} @ {_fmt(setup['trigger_price'], 2)} "
+        f"<h3>{prefix}: {html.escape(label)} @ {_fmt(setup['trigger_price'], 2)} "
         f"(${_fmt(setup['distance'], 2)} away)</h3>"
         "<table class='detail'>"
         f"{_setup_hold_and_factor_rows_html(setup)}"
@@ -1199,6 +1216,39 @@ def _setup_chips_html(symbol: str, others: list[dict]) -> str:
         parts.append(
             f"<button type='button' class='setup-chip' data-key='{key}'>"
             f"{html.escape(label)} &middot; ${_fmt(setup['distance'], 2)}</button>"
+            "<div class='setup-detail' hidden><table class='detail'>"
+            f"{_setup_hold_and_factor_rows_html(setup)}"
+            "</table></div>"
+        )
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def _breakdown_setups_html(symbol: str, breakdown_setups: list[dict]) -> str:
+    """Breakdown-below variants (specs.md section 22) -- bearish/warning
+    CONTEXT only, never a trade opportunity: these are structurally
+    incapable of firing an entry (see monitor-app/journal_logic.py's
+    _ENTRY_ELIGIBLE_SETUP_TYPES allowlist and its own adversarial test).
+    Rendered as its own clearly-labeled section, entirely separate from
+    the bullish closest-setup/setup-chips display above -- not folded
+    into that ranking, and not itself ranked by "closest," since these
+    are for the user's own judgment, not something to chase. Reuses the
+    same click-to-expand chip markup/CSS classes and data-key convention
+    as _setup_chips_html, so the existing delegated click handler on
+    #symbols already works here with no new JS wiring."""
+    if not breakdown_setups:
+        return ""
+    parts = [
+        "<div class='breakdown-setups'>"
+        "<h3>&#9888; Bearish signals (context only, not a trade opportunity)</h3>"
+    ]
+    for setup in breakdown_setups:
+        label = _BREAKDOWN_TYPE_LABELS.get(setup["setup_type"], setup["setup_type"])
+        key = html.escape(f"{symbol}:breakdown:{setup['setup_type']}")
+        parts.append(
+            f"<button type='button' class='setup-chip breakdown-chip' data-key='{key}'>"
+            f"{html.escape(label)} @ {_fmt(setup['trigger_price'], 2)} "
+            f"&middot; ${_fmt(setup['distance'], 2)} away</button>"
             "<div class='setup-detail' hidden><table class='detail'>"
             f"{_setup_hold_and_factor_rows_html(setup)}"
             "</table></div>"
@@ -1441,6 +1491,8 @@ def _symbol_card_html(symbol: str, state: dict) -> str:
     hist_cls = _sign_class(s["macd"]["histogram"])
     setups = state.get("setups") or []
     closest, others = (setups[0], setups[1:]) if setups else (None, [])
+    breakdown_setups = state.get("breakdown_setups") or []
+    position_open = state["journal"]["open"] is not None
     return f"""
 <section class="card" data-symbol="{sym}">
   <div class="hero">
@@ -1462,8 +1514,9 @@ def _symbol_card_html(symbol: str, state: dict) -> str:
     <tr><th>MACD histogram</th><td class="{hist_cls}">{_fmt(s['macd']['histogram'], 6)}</td></tr>
     <tr><th>Relative volume</th><td>{_fmt(s['relative_volume'], 2)}</td></tr>
   </table>
-  {_closest_setup_html(closest)}
+  {_closest_setup_html(closest, position_open)}
   {_setup_chips_html(symbol, others)}
+  {_breakdown_setups_html(symbol, breakdown_setups)}
   <h3>Virtual position</h3>
   {_journal_open_html(state["journal"]["open"])}
   {_level_chips_html(symbol, state["levels"]["resistance"], state["levels"]["support"])}
@@ -1707,6 +1760,12 @@ var SETUP_TYPE_LABELS = {
   vwap_reclaim: 'VWAP pullback-reclaim',
   round_number_reclaim: 'Round-number reclaim',
 };
+var BREAKDOWN_TYPE_LABELS = {
+  support_breakdown: 'Support breakdown',
+  micro_breakdown: 'Micro-breakdown',
+  vwap_breakdown: 'VWAP breakdown',
+  round_number_breakdown: 'Round-number breakdown',
+};
 function humanizeKey(k) {
   return k.split('_').join(' ');
 }
@@ -1727,12 +1786,37 @@ function setupHoldAndFactorRows(setup) {
   });
   return rows;
 }
-function closestSetupHtml(setup) {
+function closestSetupHtml(setup, positionOpen) {
+  // Mirrors _closest_setup_html's position_open wording change (specs.md
+  // section 22, Part 2) -- same data, relabeled heading only.
   if (!setup) return '<h3>Closest setup</h3><p class="muted">none currently watchable</p>';
   const label = SETUP_TYPE_LABELS[setup.setup_type] || setup.setup_type;
-  return '<h3>Closest setup: ' + esc(label) + ' @ ' + fmt(setup.trigger_price, 2) +
+  const prefix = positionOpen
+    ? 'Setup context (position already open, not a new signal)'
+    : 'Closest setup';
+  return '<h3>' + prefix + ': ' + esc(label) + ' @ ' + fmt(setup.trigger_price, 2) +
     ' ($' + fmt(setup.distance, 2) + ' away)</h3>' +
     '<table class="detail">' + setupHoldAndFactorRows(setup) + '</table>';
+}
+function breakdownSetupsHtml(symbol, breakdownSetups) {
+  // Mirrors _breakdown_setups_html (Python side) -- bearish/warning
+  // context only, never a trade opportunity, kept in its own clearly-
+  // labeled section separate from the bullish closest-setup/setup-chips
+  // display (specs.md section 22).
+  if (!breakdownSetups || !breakdownSetups.length) return '';
+  let out = '<div class="breakdown-setups">' +
+    '<h3>\\u26a0 Bearish signals (context only, not a trade opportunity)</h3>';
+  breakdownSetups.forEach(function (setup) {
+    const label = BREAKDOWN_TYPE_LABELS[setup.setup_type] || setup.setup_type;
+    const key = esc(symbol + ':breakdown:' + setup.setup_type);
+    out += '<button type="button" class="setup-chip breakdown-chip" data-key="' + key + '">' +
+      esc(label) + ' @ ' + fmt(setup.trigger_price, 2) +
+      ' &middot; $' + fmt(setup.distance, 2) + ' away</button>' +
+      '<div class="setup-detail" hidden><table class="detail">' +
+      setupHoldAndFactorRows(setup) + '</table></div>';
+  });
+  out += '</div>';
+  return out;
 }
 function setupChipsHtml(symbol, others) {
   if (!others || !others.length) return '';
@@ -1808,6 +1892,8 @@ function symbolCardHtml(symbol, state) {
   const setups = state.setups || [];
   const closest = setups.length ? setups[0] : null;
   const others = setups.length ? setups.slice(1) : [];
+  const breakdownSetups = state.breakdown_setups || [];
+  const positionOpen = state.journal.open !== null;
   return '<section class="card" data-symbol="' + sym + '">' +
     '<div class="hero"><div class="hero-symbol">' + sym + '</div>' +
     '<div class="hero-price ' + priceCls + '">' + fmt(state.last_price, 2) + '</div>' +
@@ -1824,8 +1910,9 @@ function symbolCardHtml(symbol, state) {
     '<tr><th>MACD histogram</th><td class="' + histCls + '">' + fmt(s.macd.histogram, 6) + '</td></tr>' +
     '<tr><th>Relative volume</th><td>' + fmt(s.relative_volume, 2) + '</td></tr>' +
     '</table>' +
-    closestSetupHtml(closest) +
+    closestSetupHtml(closest, positionOpen) +
     setupChipsHtml(symbol, others) +
+    breakdownSetupsHtml(symbol, breakdownSetups) +
     '<h3>Virtual position</h3>' + journalOpenHtml(state.journal.open) +
     levelChipsHtml(symbol, state.levels.resistance, state.levels.support) +
     '</section>';
@@ -2169,6 +2256,9 @@ table.detail th{color:var(--muted);font-weight:500;width:45%}
 .setup-chip:disabled:hover{border-color:var(--border)}
 .setup-detail{margin:.25rem 0 .5rem;padding:.4rem .5rem;
   background:var(--bg);border:1px solid var(--border);border-radius:.4rem}
+.breakdown-setups{margin:.3rem 0 .5rem}
+.breakdown-setups h3{color:var(--neg);font-size:.85rem;margin:.3rem 0 .3rem}
+.breakdown-chip{border-color:var(--neg)}
 .row-housekeeping td{color:var(--muted)}
 .journal-delete-btn{padding:.15rem .45rem;font-size:.68rem}
 .footer{color:var(--muted);font-size:.8rem;margin-top:1rem}

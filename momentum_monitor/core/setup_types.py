@@ -44,7 +44,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from levels import Level, HoldStateTimeAware, detect_levels, evaluate_hold_time_aware, nearest_round_number_above
+from levels import (
+    Level, HoldStateTimeAware, detect_levels, evaluate_hold_time_aware,
+    nearest_round_number_above, nearest_round_number_below,
+)
 
 REQUIRED_HOLD_SECONDS = 30.0
 
@@ -99,6 +102,15 @@ def _nearest_above(levels: list[Level], current_price: float) -> Level | None:
     lines, not a real duplication risk."""
     above = [l for l in levels if l.kind == "resistance" and l.price > current_price]
     return max(above, key=lambda l: l.strength_score) if above else None
+
+
+def _nearest_below(levels: list[Level], current_price: float) -> Level | None:
+    """Strongest support level priced below current_price -- the floor
+    mirror of `_nearest_above` (specs.md section 22's breakdown-below
+    setup variants). Same picking logic as monitor-app/state.py's
+    select_levels."""
+    below = [l for l in levels if l.kind == "support" and l.price < current_price]
+    return max(below, key=lambda l: l.strength_score) if below else None
 
 
 def _breakout_candidate(setup_type: str, bars: list[dict],
@@ -217,6 +229,138 @@ def evaluate_setups(
                             MICRO_SWING_WINDOW, watch_added_ts),
         _vwap_reclaim_candidate(bars, current_price, vwap, watch_added_ts),
         _round_number_reclaim_candidate(bars, current_price, watch_added_ts),
+    ]
+    present = [c for c in candidates if c is not None]
+    return sorted(present, key=lambda c: c.distance)
+
+
+# -- Breakdown-below variants (specs.md section 22) -------------------------
+#
+# Exact downside mirrors of the four functions above -- same detect_levels/
+# evaluate_hold_time_aware primitives, same required-hold duration, same
+# "absent, not a null placeholder, when not currently watchable" contract.
+# INFORMATIONAL / WARNING SIGNALS ONLY: evaluate_breakdown_setups() is a
+# completely SEPARATE function from evaluate_setups() above, returning a
+# completely separate list -- never merged into it, never passed to
+# monitor-app/journal_logic.py's should_enter/advance_journal (which only
+# ever receive evaluate_setups()' own bullish-only list; see
+# monitor-app/state.py's build_state and app.py's _update_journal). There
+# is no code path by which a breakdown candidate can reach entry-decision
+# logic -- it is a structurally separate list, not a filtered view of one
+# shared list. journal_logic.py additionally never accepts a "breakdown
+# setups" parameter of any kind (audited, specs.md section 22) and
+# _first_newly_confirmed only ever considers setup_type strings from an
+# explicit bullish allowlist -- defense in depth on top of the structural
+# separation here, not the only thing preventing a breakdown type from
+# ever firing a trade.
+
+def _breakdown_candidate(setup_type: str, bars: list[dict],
+                         current_price: float, swing_window: int,
+                         watch_added_ts: float | None) -> SetupCandidate | None:
+    """Floor mirror of `_breakout_candidate`: support_breakdown
+    (swing_window=3) and micro_breakdown (swing_window=MICRO_SWING_
+    WINDOW) share this, exactly the same way resistance_breakout/
+    micro_breakout share `_breakout_candidate` above."""
+    levels = detect_levels(bars, swing_window=swing_window)
+    level = _nearest_below(levels, current_price)
+    if level is None:
+        return None
+    hold = evaluate_hold_time_aware(bars, level.price, direction="below",
+                                    required_seconds=REQUIRED_HOLD_SECONDS,
+                                    watch_added_ts=watch_added_ts)
+    return SetupCandidate(
+        setup_type=setup_type,
+        trigger_price=round(level.price, 4),
+        distance=round(current_price - level.price, 4),
+        hold=_hold_dict(hold),
+        factors={
+            "strength_score": round(level.strength_score, 4),
+            "touch_count": level.touch_count,
+            "total_touch_volume": level.total_touch_volume,
+            "round_number_bonus": round(level.round_number_bonus, 4),
+        },
+    )
+
+
+def _vwap_breakdown_candidate(bars: list[dict], current_price: float,
+                              vwap: float | None,
+                              watch_added_ts: float | None) -> SetupCandidate | None:
+    """Floor mirror of `_vwap_reclaim_candidate`: trend is price AT/BELOW
+    session VWAP (a downtrend), pullback is a relief rally UP toward VWAP
+    within the same `VWAP_PULLBACK_THRESHOLD_PCT`, and the "breakdown" is
+    `evaluate_hold_time_aware` treating VWAP as the level price needs to
+    hold BELOW (a rejection back down, not a reclaim back up)."""
+    if vwap is None or vwap <= 0:
+        return None
+    is_downtrend = current_price <= vwap
+    distance_pct = abs(current_price - vwap) / vwap
+    is_pullback = distance_pct <= VWAP_PULLBACK_THRESHOLD_PCT
+    if not (is_downtrend and is_pullback):
+        return None
+    hold = evaluate_hold_time_aware(bars, vwap, direction="below",
+                                    required_seconds=REQUIRED_HOLD_SECONDS,
+                                    watch_added_ts=watch_added_ts)
+    return SetupCandidate(
+        setup_type="vwap_breakdown",
+        trigger_price=round(vwap, 4),
+        distance=round(vwap - current_price, 4),
+        hold=_hold_dict(hold),
+        factors={
+            "vwap": round(vwap, 4),
+            "distance_from_vwap_pct": round(distance_pct * 100.0, 4),
+            "trend_is_below_vwap": is_downtrend,
+        },
+    )
+
+
+def _round_number_breakdown_candidate(bars: list[dict], current_price: float,
+                                      watch_added_ts: float | None) -> SetupCandidate | None:
+    """Floor mirror of `_round_number_reclaim_candidate`:
+    `nearest_round_number_below()` instead of `..._above()`. Always
+    present, same reasoning as the reclaim version -- there is always a
+    next round-number grid point below any positive price."""
+    trigger = nearest_round_number_below(current_price)
+    hold = evaluate_hold_time_aware(bars, trigger, direction="below",
+                                    required_seconds=REQUIRED_HOLD_SECONDS,
+                                    watch_added_ts=watch_added_ts)
+    return SetupCandidate(
+        setup_type="round_number_breakdown",
+        trigger_price=round(trigger, 4),
+        distance=round(current_price - trigger, 4),
+        hold=_hold_dict(hold),
+        factors={
+            "nearest_round_price": round(trigger, 4),
+            "requires_prior_touches": False,
+        },
+    )
+
+
+def evaluate_breakdown_setups(
+    bars: list[dict],
+    current_price: float,
+    vwap: float | None,
+    main_swing_window: int = 3,
+    watch_added_ts: float | None = None,
+) -> list[SetupCandidate]:
+    """All FOUR breakdown-below candidates currently watchable, sorted
+    ascending by dollar distance to trigger -- the exact downside mirror
+    of `evaluate_setups()`, and STRUCTURALLY SEPARATE from it (see this
+    section's module-level comment above): this function's output must
+    never be merged into `evaluate_setups()`'s list or passed to
+    monitor-app/journal_logic.py's should_enter/advance_journal. These
+    are warning/context signals for the user's own judgment, never a
+    trade trigger -- `setup_type` strings ("support_breakdown",
+    "micro_breakdown", "vwap_breakdown", "round_number_breakdown") are
+    deliberately distinct from all four bullish ones so the two lists
+    can never be confused even if ever accidentally concatenated
+    somewhere downstream."""
+    candidates = [
+        _breakdown_candidate("support_breakdown", bars, current_price,
+                             main_swing_window, watch_added_ts),
+        _breakdown_candidate("micro_breakdown", bars, current_price,
+                             MICRO_SWING_WINDOW, watch_added_ts),
+        _vwap_breakdown_candidate(bars, current_price, vwap, watch_added_ts),
+        _round_number_breakdown_candidate(bars, current_price, watch_added_ts),
     ]
     present = [c for c in candidates if c is not None]
     return sorted(present, key=lambda c: c.distance)

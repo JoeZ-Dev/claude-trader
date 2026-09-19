@@ -234,10 +234,28 @@ def _phase1_anchor(candidate_anchor: float, entry_price: float) -> float:
     return min(candidate_anchor, entry_price)
 
 
+# The ONLY setup types should_enter/advance_journal ever treat as a real
+# entry signal (specs.md section 3.5's four bullish types). Explicit
+# defense in depth, not just "we never wire breakdown setups into this
+# list" (specs.md section 22): monitor-app/state.py's build_state keeps
+# evaluate_breakdown_setups()' output in a completely separate
+# `breakdown_setups` key, never merged into the `setups` list this
+# function actually receives -- that structural separation is the FIRST
+# line of defense. This allowlist is the second: even if a breakdown-
+# type candidate ever ended up in `setups` by some future mistake, it
+# still could not fire a trade, because should_enter/advance_journal
+# have no concept of "direction" at all and would otherwise treat ANY
+# confirmed, not-yet-seen setup_type string as a valid fresh signal.
+_ENTRY_ELIGIBLE_SETUP_TYPES = frozenset({
+    "resistance_breakout", "micro_breakout", "vwap_reclaim", "round_number_reclaim",
+})
+
+
 def _first_newly_confirmed(setups: list[dict], was_confirmed_types: frozenset[str],
                            now_ts: float, confirmation_freshness_seconds: float) -> dict | None:
     """The first (closest -- setups is pre-sorted ascending by distance,
-    per setup_types.evaluate_setups' own contract) setup whose type just
+    per setup_types.evaluate_setups' own contract) setup whose type is
+    entry-eligible (`_ENTRY_ELIGIBLE_SETUP_TYPES` above) and just
     transitioned hold.confirmed False->True AND whose confirmation is
     still FRESH. None if none qualify. A type that's confirmed but was
     ALSO confirmed last tick doesn't count -- that's not a fresh
@@ -272,7 +290,8 @@ def _first_newly_confirmed(setups: list[dict], was_confirmed_types: frozenset[st
     types` bookkeeping below (unaffected by this function), are
     untouched either way."""
     for s in setups:
-        if (s["hold"]["confirmed"] and s["setup_type"] not in was_confirmed_types
+        if (s["setup_type"] in _ENTRY_ELIGIBLE_SETUP_TYPES
+                and s["hold"]["confirmed"] and s["setup_type"] not in was_confirmed_types
                 and s["hold"]["confirmed_at_ts"] is not None
                 and now_ts - s["hold"]["confirmed_at_ts"] <= confirmation_freshness_seconds):
             return s

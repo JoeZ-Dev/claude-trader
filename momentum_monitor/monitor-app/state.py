@@ -47,7 +47,7 @@ if _CORE not in sys.path:
 
 from indicators import ema_time_aware, macd_time_aware, relative_volume_time_aware, session_vwap  # noqa: E402
 from levels import detect_levels, evaluate_hold_time_aware  # noqa: E402
-from setup_types import evaluate_setups  # noqa: E402
+from setup_types import evaluate_setups, evaluate_breakdown_setups  # noqa: E402
 
 _NY = ZoneInfo("America/New_York")
 REQUIRED_HOLD_SECONDS = 30.0
@@ -147,6 +147,17 @@ def build_state(bars: list[dict], symbol: str | None = None,
     setups = [asdict(c) for c in
               evaluate_setups(bars, last_price, vwap, watch_added_ts=watch_added_ts)]
 
+    # Breakdown-below variants (specs.md section 22) -- warning/context
+    # signals only, NEVER a trade trigger. Deliberately kept in a
+    # completely separate key, never merged into `setups` above: app.py's
+    # _update_journal only ever reads `setups` when calling advance_journal,
+    # so a breakdown candidate has no code path into entry-decision logic
+    # at all (see monitor-app/journal_logic.py's _ENTRY_ELIGIBLE_SETUP_TYPES
+    # for the second, defense-in-depth layer on top of this separation).
+    breakdown_setups = [asdict(c) for c in
+                       evaluate_breakdown_setups(bars, last_price, vwap,
+                                                 watch_added_ts=watch_added_ts)]
+
     return {
         "status": "ok",
         "symbol": symbol,
@@ -171,4 +182,5 @@ def build_state(bars: list[dict], symbol: str | None = None,
             "support": _level_block(bars, picked["support"], "below", watch_added_ts),
         },
         "setups": setups,
+        "breakdown_setups": breakdown_setups,
     }

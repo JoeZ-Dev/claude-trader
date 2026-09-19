@@ -3245,7 +3245,135 @@ untouched).
 feature); full project suite 449 tests passing. No `journal_logic.py`
 changes at all.
 
-### 22. Roadmap / phases
+### 22. Breakdown-below setup variants + closest-setup/open-position display fix
+
+Two independent pieces: (1) four downside-mirror setup types, informational/
+warning signals only, structurally incapable of ever firing a trade; (2)
+a small wording fix to the existing closest-setup callout when a position
+is already open.
+
+**Part 1 — breakdown-below variants.** Exact downside mirrors of section
+3.5's four bullish types, reusing the SAME primitives (`detect_levels`,
+`evaluate_hold_time_aware` with `direction="below"` instead of `"above"`,
+the same `REQUIRED_HOLD_SECONDS`/`MICRO_SWING_WINDOW`/`VWAP_PULLBACK_
+THRESHOLD_PCT`) — no new detection logic invented, matching this
+project's "reuse a primitive, don't reimplement" precedent:
+
+- `support_breakdown` — nearest support level BELOW price
+  (`_nearest_below`, the floor mirror of `_nearest_above`), holding below.
+- `micro_breakdown` — same, at `MICRO_SWING_WINDOW`, mirroring
+  `micro_breakout`.
+- `vwap_breakdown` — price at/below session VWAP (a downtrend), a relief
+  rally UP toward VWAP within `VWAP_PULLBACK_THRESHOLD_PCT`, then
+  rejecting back below and holding — the downside mirror of `vwap_
+  reclaim`'s pullback-then-reclaim pattern.
+- `round_number_breakdown` — nearest round-number grid point BELOW price
+  (`nearest_round_number_below`, the floor mirror of the pre-existing
+  `nearest_round_number_above`, same tiered grid: dimes under $2,
+  quarters $2–$10, half-dollars at/above $10), holding below. Always
+  present, same reasoning as `round_number_reclaim` — there is always a
+  next grid line below any positive price.
+
+All four live in `core/setup_types.py`'s `evaluate_breakdown_setups()`, a
+function with the exact same signature/sort contract as `evaluate_setups()`
+(ascending by dollar distance to trigger) but returning a COMPLETELY
+SEPARATE list. The four new `setup_type` strings (`support_breakdown`,
+`micro_breakdown`, `vwap_breakdown`, `round_number_breakdown`) are
+deliberately distinct from all four bullish ones, proven disjoint by an
+explicit test — no downstream code could confuse the two lists even if
+they were ever accidentally concatenated.
+
+**Structural safety guarantee — proven, not assumed.** These setups must
+never be able to fire a real entry. Two independent layers, not one:
+
+1. **Structural separation.** `monitor-app/state.py`'s `build_state` calls
+   `evaluate_breakdown_setups()` into its own `breakdown_setups` state key,
+   never merged into the existing `setups` key. `app.py`'s `_update_journal`
+   — the only call site that ever passes a setups list to `advance_journal`
+   — reads `slot.state.get("setups", [])` exclusively; it has no reference
+   to `breakdown_setups` anywhere in its body. There is no code path by
+   which a breakdown candidate reaches entry-decision logic.
+2. **Defense in depth: an explicit allowlist.** Investigation during this
+   feature found `should_enter`/`_first_newly_confirmed` have ZERO
+   awareness of setup_type identity beyond "is there a confirmed,
+   not-yet-seen type" — meaning IF a breakdown-type dict were ever
+   accidentally included in a `setups` list, current logic would have
+   fired a trade on it, since nothing filtered by type name. Closed with
+   `journal_logic.py`'s `_ENTRY_ELIGIBLE_SETUP_TYPES` frozenset (the four
+   bullish types only) — `_first_newly_confirmed` now requires
+   `setup_type in _ENTRY_ELIGIBLE_SETUP_TYPES` as its first condition, so
+   even a hypothetical future wiring mistake could not let a breakdown
+   type fire.
+
+**The adversarial proof the user explicitly required:** `test_journal_
+logic.py` constructs a `setups` list with a confirmed `support_breakdown`
+candidate as the CLOSEST (lowest-distance, first-sorted) entry, alongside
+a legitimately confirmed bullish type — `advance_journal` correctly skips
+the breakdown candidate entirely and opens on the bullish one instead
+(ineligibility is not treated as "nothing confirmed," it falls through).
+A second, parametrized test proves all four breakdown types alone never
+open a position. A third test (`test_breakdown_type_allowlist_break_then_
+fix`) deliberately widens the allowlist via `monkeypatch` to include a
+breakdown type, confirms a trade WOULD wrongly fire with the check
+disabled, then restores it and confirms it's blocked again — proving this
+suite can actually catch a regression here, not just that it currently
+passes.
+
+**Display.** Breakdown setups render in their own clearly-labeled section
+— "⚠ Bearish signals (context only, not a trade opportunity)" — using the
+same click-to-expand chip markup/CSS classes as the bullish setup chips
+(`.setup-chip`/`.setup-detail`/`data-key`, so the existing delegated click
+handler needed no new JS wiring), but visually and structurally SEPARATE
+from the bullish closest-setup/setup-chips display: never mixed into that
+ranking, never itself ranked by "closest" (these are context for the
+user's own judgment, not something to chase). Both the Python renderer
+(`_breakdown_setups_html`) and its JS mirror (`breakdownSetupsHtml`) stay
+in sync, per this project's established dual-rendering pattern.
+
+**Part 2 — closest-setup callout wording when a position is open.**
+`should_enter` already correctly refuses a fresh entry while a position is
+open for a symbol, but the "Closest setup: X @ price" callout's wording
+didn't reflect that — it read like a live, actionable signal regardless of
+position state. Fixed by threading `position_open` (derived from
+`state["journal"]["open"] is not None`) into `_closest_setup_html`/the JS
+`closestSetupHtml` mirror: the heading becomes "Setup context (position
+already open, not a new signal): X @ price" when a position is open,
+"Closest setup: X @ price" otherwise. The underlying setup data is left
+showing either way — suppressing it was explicitly rejected; only the
+framing changes. Defaults to `position_open=False` so no other call site
+needed updating.
+
+**Tests:** 10 new `core/tests/test_setup_types.py` tests (each breakdown
+type detecting/confirming correctly, including a known double-bottom
+fixture proving `support_breakdown` matches the same cluster `detect_
+levels` is proven to find, plus the type-namespace-disjoint and
+ascending-sort-order proofs) — all passing on first run after
+implementation. 3 new `nearest_round_number_below` tests in `core/
+tests/test_levels.py`-equivalent coverage inside `test_setup_types.py`,
+mirroring the existing `nearest_round_number_above` tests exactly. 3 new
+`monitor-app/tests/test_journal_logic.py` safety-proof tests (the
+adversarial "closest breakdown" scenario, the per-type "alone" proof, and
+the break-then-fix demonstration). 5 new `monitor-app/tests/test_state.py`
+tests (the separate `breakdown_setups` key, the type-disjoint proof,
+sort order, `hold.direction == "below"` for all, and `watch_added_ts`
+reaching the breakdown path the same way it reaches the bullish one). 10
+new `monitor-app/tests/test_app.py` tests (the closest-setup wording
+change in both states, the empty-state case being unaffected by
+`position_open`, the breakdown section's labeling/content, and one
+real end-to-end test proving the section actually renders through the
+live FastAPI app on real oscillating-price bars, not just the unit-level
+renderer). Full project suite: 482 tests passing (`core` 71, `schwab-
+connector` 107, `monitor-app` 304).
+
+**Status: built, 2026-09-19.** Live-verified end to end through the real
+app stack (`create_app` + `TestClient`, real bars, no hand-built state):
+`breakdown_setups` correctly populated (`round_number_breakdown`,
+`support_breakdown`, `micro_breakdown` all detected on a real oscillating
+30-bar session) and rendered in the separate "Bearish signals" section on
+the actual served page, distinct from the "Closest setup" callout showing
+the bullish `round_number_reclaim` candidate.
+
+### 23. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,
@@ -3266,8 +3394,11 @@ changes at all.
    3 (`core/setup_types.py`) for the four setup types and the
    dollar-distance comparison metric, and section 5 for the grid UI.
    Bullish/breakout-ABOVE direction only for this pass, deliberately — a
-   symmetric breakdown-below version of each type is a natural future
-   extension, not built now.
+   symmetric breakdown-below version of each type was a natural future
+   extension, not built at the time. **Built 2026-09-19 — see section
+   22:** the four breakdown-below mirrors, informational/warning signals
+   only, structurally (and, in defense-in-depth, via an explicit
+   allowlist) incapable of ever firing a trade.
 3.6. **Time-aware core indicators.** Rework `ema`/`macd`/`relative_volume`/
    `evaluate_hold`/`detect_levels`'s swing-point window (section 3) to
    decay/compare/require by elapsed real time rather than by bar count,

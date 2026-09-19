@@ -238,6 +238,79 @@ def test_build_state_includes_setups_sorted_ascending_by_distance():
         }
 
 
+# -- breakdown-below variants (specs.md section 22) -------------------
+# Structurally SEPARATE from `setups` -- warning/context signals only,
+# never a trade trigger (see monitor-app/tests/test_journal_logic.py's
+# structural safety proof and monitor-app/app.py's _update_journal, which
+# only ever reads `setups`, never `breakdown_setups`).
+
+def test_build_state_includes_breakdown_setups_as_a_separate_key():
+    bars = _load_demo_session()
+    st = build_state(bars, symbol="AEHL")
+    assert "breakdown_setups" in st
+    # never overlaps the bullish `setups` list's own key set/types
+    bullish_types = {s["setup_type"] for s in st["setups"]}
+    breakdown_types = {s["setup_type"] for s in st["breakdown_setups"]}
+    assert bullish_types.isdisjoint(breakdown_types)
+
+
+def test_build_state_breakdown_setups_always_includes_round_number_breakdown():
+    # round_number_breakdown has no gating condition (mirrors round_number_
+    # reclaim's own "always present" nature) -- always watchable regardless
+    # of trend, so any "ok" session has at least this one breakdown type.
+    bars = _load_demo_session()
+    st = build_state(bars, symbol="AEHL")
+    types = {s["setup_type"] for s in st["breakdown_setups"]}
+    assert "round_number_breakdown" in types
+
+
+def test_build_state_breakdown_setups_sorted_ascending_by_distance():
+    bars = _load_demo_session()
+    breakdown_setups = build_state(bars, symbol="AEHL")["breakdown_setups"]
+    distances = [s["distance"] for s in breakdown_setups]
+    assert distances == sorted(distances)
+    for s in breakdown_setups:
+        assert set(s) == {"setup_type", "trigger_price", "distance", "hold", "factors"}
+        assert s["setup_type"] in {
+            "support_breakdown", "micro_breakdown", "vwap_breakdown", "round_number_breakdown",
+        }
+
+
+def test_build_state_breakdown_setups_hold_direction_is_below():
+    bars = _load_demo_session()
+    breakdown_setups = build_state(bars, symbol="AEHL")["breakdown_setups"]
+    assert breakdown_setups  # sanity: round_number_breakdown guarantees >= 1
+    for s in breakdown_setups:
+        assert s["hold"]["direction"] == "below"
+
+
+def test_build_state_watch_added_ts_reaches_breakdown_setups_too():
+    # Same backfill-only-confirmation guard as the bullish setups (specs.md
+    # section 19) -- must actually reach evaluate_breakdown_setups' own
+    # watch_added_ts parameter, not just setup_types.py's bullish path.
+    bars = [
+        {"ts": 0, "open": 1.3, "high": 1.35, "low": 1.25, "close": 1.29,
+         "volume": 10_000.0, "is_extended": False},
+        {"ts": 10, "open": 1.29, "high": 1.31, "low": 1.24, "close": 1.28,
+         "volume": 10_000.0, "is_extended": False},
+        {"ts": 20, "open": 1.28, "high": 1.30, "low": 1.23, "close": 1.27,
+         "volume": 10_000.0, "is_extended": False},
+        # closes back below 1.30 -- confirmation (if any) already happened
+        # by ts=20.
+        {"ts": 30, "open": 1.27, "high": 1.29, "low": 1.22, "close": 1.31,
+         "volume": 10_000.0, "is_extended": False},
+    ]
+    unrestricted = build_state(bars, symbol="X")
+    breakdown = next(s for s in unrestricted["breakdown_setups"]
+                     if s["setup_type"] == "round_number_breakdown")
+    assert breakdown["hold"]["confirmed"] is True
+
+    restricted = build_state(bars, symbol="X", watch_added_ts=25)
+    breakdown_restricted = next(s for s in restricted["breakdown_setups"]
+                                if s["setup_type"] == "round_number_breakdown")
+    assert breakdown_restricted["hold"]["confirmed"] is False
+
+
 def test_session_bars_for_vwap_slices_to_latest_ny_date():
     day1 = 1756909800            # 2025-09-03 10:30 ET
     day2 = day1 + 24 * 3600      # next day, same clock time

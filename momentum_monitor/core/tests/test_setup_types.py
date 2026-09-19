@@ -1,8 +1,8 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from setup_types import evaluate_setups
-from levels import nearest_round_number_above
+from setup_types import evaluate_setups, evaluate_breakdown_setups
+from levels import nearest_round_number_above, nearest_round_number_below
 
 
 def bar(ts, o, h, l, c, v):
@@ -153,6 +153,30 @@ def test_nearest_round_number_above_has_no_discontinuity_at_tier_boundaries():
     assert nearest_round_number_above(9.99) == 10.00
 
 
+# -- nearest_round_number_below (specs.md section 22, the floor mirror) --
+
+def test_nearest_round_number_below_always_strictly_less():
+    assert nearest_round_number_below(24.7) == 24.5
+    assert nearest_round_number_below(25.0) == 24.5  # exactly on the grid -- next one down, not itself
+
+
+def test_nearest_round_number_below_uses_the_tier_for_price():
+    # Under $2: dimes.
+    assert nearest_round_number_below(0.15) == 0.10
+    assert nearest_round_number_below(1.23) == 1.20
+    # $2 up to $10: quarters.
+    assert nearest_round_number_below(2.30) == 2.25
+    assert nearest_round_number_below(5.10) == 5.00
+    # $10 and up: half-dollars.
+    assert nearest_round_number_below(10.49) == 10.0
+    assert nearest_round_number_below(153.6) == 153.5
+
+
+def test_nearest_round_number_below_has_no_discontinuity_at_tier_boundaries():
+    assert nearest_round_number_below(2.01) == 2.00
+    assert nearest_round_number_below(10.01) == 10.00
+
+
 def test_round_number_reclaim_uses_the_dime_tier_for_a_sub_two_dollar_symbol():
     # A fixed $0.50 grid (the pre-tiered behavior) would put the trigger
     # a full 43 cents away here -- a huge, meaningless jump for a stock
@@ -210,6 +234,130 @@ def test_watch_added_ts_prevents_confirming_purely_from_pre_watch_bars():
     with_restriction = evaluate_setups(bars, current_price, vwap=None, watch_added_ts=1_000_000)
     reclaim_restricted = next(c for c in with_restriction if c.setup_type == "round_number_reclaim")
     assert reclaim_restricted.hold["confirmed"] is False
+
+
+# -- breakdown-below variants (specs.md section 22) -- exact downside ------
+# mirrors of the four bullish types above, informational/warning only,
+# never wired into entry logic (see monitor-app/tests/test_journal_logic.py
+# for the structural non-entry proof).
+
+def _double_bottom_bars(trough=6.90):
+    """Two swing lows ~6.9, mirroring _double_top_bars' shape (two swing
+    highs close enough to cluster) so support_breakdown is checked
+    against a level detect_levels is proven to find the same way
+    resistance_breakout is above."""
+    bars = []
+    ts = 0
+    for p in [8.6, 8.2, 7.6, trough, 7.5, 8.1, 8.6, 8.7, 8.5, 8.0, 7.5,
+             round(trough + 0.03, 4), 7.6, 8.1, 8.4, 8.5, 8.6, 8.7]:
+        bars.append(bar(ts, p, p + 0.05, p - 0.05, p, 50_000)); ts += 60
+    return bars
+
+
+def test_support_breakdown_candidate_matches_known_double_bottom_level():
+    bars = _double_bottom_bars()
+    current_price = 8.0  # above the ~6.9 double bottom
+    candidates = evaluate_breakdown_setups(bars, current_price, vwap=None)
+    support = next(c for c in candidates if c.setup_type == "support_breakdown")
+    assert 6.8 < support.trigger_price < 7.0
+    assert support.factors["touch_count"] == 2
+    assert support.distance == round(current_price - support.trigger_price, 4)
+    assert support.hold["direction"] == "below"
+    assert support.hold["required_seconds"] == 30.0
+
+
+def test_support_breakdown_absent_when_nothing_below_price():
+    bars = _double_bottom_bars()
+    candidates = evaluate_breakdown_setups(bars, current_price=0.01, vwap=None)
+    assert not any(c.setup_type == "support_breakdown" for c in candidates)
+
+
+def test_micro_breakdown_finds_a_level_the_main_window_misses():
+    # Mirror of test_micro_breakout_finds_a_level_the_main_window_misses:
+    # only 5 bars, main window=3 needs 7 -- structurally absent -- but
+    # MICRO_SWING_WINDOW=1 finds the single swing low at index 2.
+    bars = [
+        bar(0, 7.6, 7.65, 7.55, 7.6, 50_000),
+        bar(60, 7.3, 7.35, 7.25, 7.3, 50_000),
+        bar(120, 7.0, 7.05, 6.95, 7.0, 50_000),
+        bar(180, 7.2, 7.25, 7.15, 7.2, 50_000),
+        bar(240, 7.5, 7.55, 7.45, 7.5, 50_000),
+    ]
+    current_price = 7.6
+    candidates = evaluate_breakdown_setups(bars, current_price, vwap=None)
+    types = {c.setup_type for c in candidates}
+    assert "support_breakdown" not in types
+    micro = next(c for c in candidates if c.setup_type == "micro_breakdown")
+    assert abs(micro.trigger_price - 6.95) < 1e-9
+    assert micro.factors["touch_count"] == 1
+
+
+def test_vwap_breakdown_candidate_present_on_a_real_relief_rally():
+    vwap = 10.0
+    live_bars = [
+        bar(0, 10.1, 10.15, 9.95, 9.98, 20_000),
+        bar(60, 9.98, 10.05, 9.85, 9.92, 25_000),
+        bar(120, 9.92, 10.0, 9.8, 9.85, 22_000),
+    ]
+    current_price = 9.97  # 0.3% below vwap -- inside the pullback threshold
+    candidates = evaluate_breakdown_setups(live_bars, current_price, vwap=vwap)
+    breakdown = next(c for c in candidates if c.setup_type == "vwap_breakdown")
+    assert breakdown.trigger_price == 10.0
+    assert breakdown.distance == round(vwap - current_price, 4)
+    assert breakdown.factors["trend_is_below_vwap"] is True
+
+
+def test_vwap_breakdown_absent_when_price_has_run_away_from_vwap():
+    vwap = 10.0
+    live_bars = [bar(0, 9.5, 9.6, 9.4, 9.5, 10_000)]
+    candidates = evaluate_breakdown_setups(live_bars, current_price=9.5, vwap=vwap)
+    assert not any(c.setup_type == "vwap_breakdown" for c in candidates)
+
+
+def test_vwap_breakdown_absent_when_price_above_vwap_not_a_downtrend():
+    vwap = 10.0
+    live_bars = [bar(0, 10.1, 10.2, 10.05, 10.15, 10_000)]
+    candidates = evaluate_breakdown_setups(live_bars, current_price=10.02, vwap=vwap)
+    assert not any(c.setup_type == "vwap_breakdown" for c in candidates)
+
+
+def test_round_number_breakdown_watchable_with_zero_prior_touches():
+    live_bars = [bar(i * 10, 24.5 - i * 0.02, 24.55 - i * 0.02, 24.45 - i * 0.02,
+                     24.5 - i * 0.02, 10_000) for i in range(5)]
+    current_price = 24.7
+    candidates = evaluate_breakdown_setups(live_bars, current_price, vwap=None)
+    breakdown = next(c for c in candidates if c.setup_type == "round_number_breakdown")
+    assert breakdown.trigger_price == 24.5
+    assert breakdown.factors["requires_prior_touches"] is False
+    assert breakdown.distance == round(24.7 - 24.5, 4)
+
+
+def test_round_number_breakdown_uses_the_dime_tier_for_a_sub_two_dollar_symbol():
+    live_bars = [bar(0, 1.05, 1.1, 1.0, 1.03, 10_000)]
+    candidates = evaluate_breakdown_setups(live_bars, current_price=1.07, vwap=None)
+    breakdown = next(c for c in candidates if c.setup_type == "round_number_breakdown")
+    assert breakdown.trigger_price == 1.00
+    assert breakdown.distance == round(1.07 - 1.00, 4)
+
+
+def test_evaluate_breakdown_setups_never_returns_a_bullish_setup_type():
+    # Structural distinctness: the two setup_type namespaces must never
+    # overlap, even by accident -- monitor-app/journal_logic.py's
+    # allowlist (specs.md section 22) depends on this.
+    bars = _double_bottom_bars()
+    candidates = evaluate_breakdown_setups(bars, current_price=8.0, vwap=10.0)
+    bullish_types = {"resistance_breakout", "micro_breakout", "vwap_reclaim", "round_number_reclaim"}
+    assert all(c.setup_type not in bullish_types for c in candidates)
+    assert len(candidates) >= 1  # sanity: this fixture really is watchable
+
+
+def test_breakdown_candidates_sorted_ascending_by_dollar_distance():
+    bars = _double_bottom_bars()
+    current_price = 8.0
+    vwap = 8.05  # very close -- likely NOT a genuine downtrend/pullback, exercises real sort order regardless
+    candidates = evaluate_breakdown_setups(bars, current_price, vwap=vwap)
+    distances = [c.distance for c in candidates]
+    assert distances == sorted(distances)
 
 
 if __name__ == "__main__":

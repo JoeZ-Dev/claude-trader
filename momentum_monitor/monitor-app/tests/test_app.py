@@ -12,7 +12,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(_APP_DIR), "core"))
 import pytest
 from fastapi.testclient import TestClient
 
-from app import _journal_closed_rows_html, _journal_open_html, create_app
+from app import (
+    _breakdown_setups_html,
+    _closest_setup_html,
+    _journal_closed_rows_html,
+    _journal_open_html,
+    create_app,
+)
 
 RTH = 1756909800  # 2025-09-03 10:30:00 ET
 
@@ -1156,6 +1162,103 @@ def test_open_position_panel_reference_rows_survive_a_hand_built_block_missing_t
     html_out = _journal_open_html(open_block)
     assert "none on this side of price" in html_out
     assert "—" in html_out  # em-dash fallback for a missing target price
+
+
+# -- breakdown-below setup variants + closest-setup wording (specs.md ------
+# section 22). Breakdown types are warning/context signals only, never a
+# trade trigger (see test_journal_logic.py's structural safety proof) --
+# these tests are purely about the DISPLAY: a separate, clearly-labeled
+# section, distinct from the bullish closest-setup callout, and that
+# callout's own wording changing when a position is already open.
+
+def _setup_dict(setup_type="resistance_breakout", trigger_price=10.5,
+                distance=1.0, confirmed=True, **factors):
+    return {
+        "setup_type": setup_type,
+        "trigger_price": trigger_price,
+        "distance": distance,
+        "hold": {"direction": "above", "required_seconds": 30.0,
+                 "elapsed_seconds": 30.0, "confirmed": confirmed,
+                 "failed_attempts": 0, "confirmed_at_ts": 100.0},
+        "factors": factors or {"strength_score": 5.0, "touch_count": 2},
+    }
+
+
+def test_closest_setup_html_reads_normally_when_no_position_open():
+    html_out = _closest_setup_html(_setup_dict(), position_open=False)
+    assert "Closest setup: " in html_out
+    assert "position already open" not in html_out
+
+
+def test_closest_setup_html_changes_wording_when_position_is_open():
+    html_out = _closest_setup_html(_setup_dict(), position_open=True)
+    assert "Setup context (position already open, not a new signal)" in html_out
+    assert "<h3>Closest setup: " not in html_out
+    # the underlying setup data is still shown, just relabeled -- the
+    # user explicitly asked for context to stay visible, not suppressed.
+    assert "resistance breakout" in html_out.lower() or "Resistance breakout" in html_out
+
+
+def test_closest_setup_html_position_open_default_is_false():
+    # Existing callers (pre-this-feature) that don't pass position_open
+    # at all must keep rendering exactly as before.
+    html_out = _closest_setup_html(_setup_dict())
+    assert "Closest setup: " in html_out
+
+
+def test_closest_setup_html_empty_state_unaffected_by_position_open():
+    assert _closest_setup_html(None, position_open=True) == \
+        _closest_setup_html(None, position_open=False)
+
+
+def test_breakdown_setups_html_empty_when_none_present():
+    assert _breakdown_setups_html("AEHL", []) == ""
+
+
+def test_breakdown_setups_html_renders_a_clearly_labeled_separate_section():
+    setups = [_setup_dict("support_breakdown", trigger_price=9.0, distance=0.5,
+                          strength_score=6.0, touch_count=2)]
+    html_out = _breakdown_setups_html("AEHL", setups)
+    assert "Bearish signals" in html_out
+    assert "context only" in html_out
+    assert "not a trade opportunity" in html_out
+    assert "Support breakdown" in html_out
+    assert "breakdown-setups" in html_out  # its own section, not setup-chips alone
+
+
+def test_breakdown_setups_html_never_uses_the_closest_setup_wording():
+    # Must not be confusable with the bullish closest-setup callout --
+    # no "Closest setup" framing anywhere in this section's own output.
+    setups = [_setup_dict("round_number_breakdown", requires_prior_touches=False)]
+    html_out = _breakdown_setups_html("AEHL", setups)
+    assert "Closest setup" not in html_out
+    assert "Setup context" not in html_out
+
+
+def test_breakdown_setups_html_renders_all_four_types_with_distinct_labels():
+    types = ["support_breakdown", "micro_breakdown", "vwap_breakdown", "round_number_breakdown"]
+    setups = [_setup_dict(t) for t in types]
+    html_out = _breakdown_setups_html("AEHL", setups)
+    for expected_label in ("Support breakdown", "Micro-breakdown",
+                          "VWAP breakdown", "Round-number breakdown"):
+        assert expected_label in html_out
+
+
+def test_root_page_shows_bearish_signals_section_for_a_real_breakdown_scenario():
+    # Real, live-computed data (not a hand-built factors dict):
+    # round_number_breakdown is always watchable regardless of trend (same
+    # "always present" nature as its bullish mirror, round_number_reclaim
+    # -- see core/setup_types.py's _round_number_breakdown_candidate), so
+    # this proves the section actually renders end-to-end through
+    # build_state -> the real page, not just the unit-level renderer above.
+    fetch = FakeFetch({"AEHL": [_bars(30)]})
+    with _client(fetch, symbol="AEHL") as c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        state = _sym_state(c, "AEHL")
+        assert len(state["breakdown_setups"]) >= 1
+        page = c.get("/").text
+        assert "Bearish signals" in page
+        assert "breakdown-chip" in page
 
 
 def _double_top_bars(start=RTH, step=60):
