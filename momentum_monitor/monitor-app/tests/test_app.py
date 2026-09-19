@@ -1110,6 +1110,179 @@ def test_open_position_panel_shows_the_current_stop_phase():
     assert "flat trailing" in html_out
 
 
+# -- reference-target display, informational only (specs.md section 21) --
+# explicitly does NOT change exit logic -- see test_journal_logic.py /
+# test_journal_wiring.py, unmodified by this feature, for should_enter/
+# advance_journal's own unaffected test coverage.
+
+def _open_block(**overrides):
+    base = {"symbol": "AEHL", "entry_price": 10.0, "stop_level": 9.5,
+           "unrealized_pnl_pct": 0.0, "shares": 10,
+           "unrealized_pnl_dollars": 0.0, "exit_phase": "swing_low",
+           "nearest_resistance_above": 11.5,
+           "target_reference_pct": 0.10, "target_reference_price": 11.0}
+    base.update(overrides)
+    return base
+
+
+def test_open_position_panel_shows_nearest_resistance_reference():
+    html_out = _journal_open_html(_open_block(nearest_resistance_above=11.5))
+    assert "reference only" in html_out
+    assert "11.5" in html_out
+
+
+def test_open_position_panel_shows_none_when_no_resistance_above():
+    # Matches the existing "none on this side of price" language the
+    # levels table elsewhere on the page already uses for this same case
+    # (_level_block_html) -- not a new, inconsistent phrase.
+    html_out = _journal_open_html(_open_block(nearest_resistance_above=None))
+    assert "none on this side of price" in html_out
+
+
+def test_open_position_panel_shows_target_reference_price():
+    html_out = _journal_open_html(_open_block(target_reference_price=11.0, target_reference_pct=0.10))
+    assert "11.0" in html_out
+    assert "+10%" in html_out
+    assert "reference only" in html_out
+
+
+def test_open_position_panel_reference_rows_survive_a_hand_built_block_missing_the_new_fields():
+    # Backward compatibility: an open_block from before this feature
+    # (missing both new keys entirely) must still render, not KeyError --
+    # .get(), not direct indexing.
+    open_block = {"symbol": "AEHL", "entry_price": 10.0, "stop_level": 9.5,
+                 "unrealized_pnl_pct": 0.0, "shares": 10,
+                 "unrealized_pnl_dollars": 0.0, "exit_phase": "swing_low"}
+    html_out = _journal_open_html(open_block)
+    assert "none on this side of price" in html_out
+    assert "—" in html_out  # em-dash fallback for a missing target price
+
+
+def _double_top_bars(start=RTH, step=60):
+    """Two real swing highs (~8.69), far enough apart to be distinct
+    swing points, close enough to cluster into one resistance level --
+    the same known-good shape core/tests/test_setup_types.py's
+    _double_top_bars uses, reused here (not re-derived) so this is
+    checked against a level detect_levels is already proven to find."""
+    bars, ts = [], start
+    for p in [7.0, 7.5, 8.2, 8.69, 8.0, 7.6, 7.0, 6.9, 7.1,
+             7.4, 7.9, 8.3, 8.65, 7.9, 7.6, 7.5, 7.4, 7.3]:
+        bars.append({"ts": ts, "open": p, "high": p + 0.05, "low": p - 0.05,
+                    "close": p, "volume": 50_000.0, "is_extended": False})
+        ts += step
+    return bars
+
+
+def test_journal_open_for_nearest_resistance_is_live_not_locked_at_entry():
+    # Wired to the SAME slot.state["levels"]["resistance"] the levels
+    # table elsewhere on the page already shows -- proven here by
+    # equality against that real, independently-computed value, not a
+    # hardcoded expected price (build_state's own detect_levels
+    # correctness is already proven extensively elsewhere). Then proves
+    # it's genuinely LIVE: pushing more bars that change the real
+    # detected resistance changes this reference too, without a new
+    # entry -- unlike trail_pct_used and the position's other real
+    # "used" snapshots.
+    from app import Poller
+    from journal_logic import OpenPosition
+
+    async def run():
+        poller = Poller(fetch_bars=FakeFetch({}), watch_symbol=None,
+                        announce_watch=None, target_reference_pct=0.10)
+        await poller.add_symbol("AEHL")
+        for bar in _double_top_bars():
+            await poller.apply_bar_push("AEHL", bar)
+
+        slot = poller._slots["AEHL"]
+        slot.journal_position = OpenPosition(
+            id=1, symbol="AEHL", entry_ts=slot.bars[0]["ts"], entry_price=8.0,
+            high_water_mark=8.0, stop_level=7.6,
+        )
+
+        real_resistance = slot.state["levels"]["resistance"]
+        full = poller.full_state_for("AEHL")
+        open_block = full["journal"]["open"]
+        assert real_resistance is not None  # sanity: the double-top really was found
+        assert open_block["nearest_resistance_above"] == real_resistance["price"]
+        assert open_block["target_reference_price"] == round(8.0 * 1.10, 4)
+        assert open_block["target_reference_pct"] == 0.10
+
+        # Prove liveness directly: slot.state is rebuilt fresh on every
+        # real poll (specs.md section 3 -- "full recompute keeps the app
+        # trivially correct"), so if a LATER real recompute finds a
+        # DIFFERENT resistance, _journal_open_for must reflect it without
+        # a new entry -- unlike a snapshotted "used" field, which would
+        # keep showing the OLD value regardless of what slot.state says
+        # now. Mutating slot.state directly here (rather than fighting
+        # detect_levels' real scoring to force a different top pick)
+        # isolates exactly that: does this read slot.state live, every
+        # call, or does it cache/snapshot anything.
+        slot.state["levels"]["resistance"] = {**real_resistance, "price": real_resistance["price"] + 1.0}
+        changed_open_block = poller.full_state_for("AEHL")["journal"]["open"]
+        assert changed_open_block["nearest_resistance_above"] == round(real_resistance["price"] + 1.0, 4)
+
+    asyncio.run(run())
+
+
+def test_journal_open_for_shows_none_when_no_resistance_above_price():
+    from app import Poller
+    from journal_logic import OpenPosition
+
+    async def run():
+        poller = Poller(fetch_bars=FakeFetch({}), watch_symbol=None, announce_watch=None)
+        await poller.add_symbol("AEHL")
+        # Monotonically rising, flat bars -- no real swing high anywhere
+        # above the current price for detect_levels to find.
+        ts = RTH
+        for p in [10.0, 10.0, 10.0, 10.0, 10.0]:
+            await poller.apply_bar_push("AEHL", {
+                "ts": ts, "open": p, "high": p, "low": p, "close": p,
+                "volume": 1000.0, "is_extended": False,
+            })
+            ts += 60
+        slot = poller._slots["AEHL"]
+        slot.journal_position = OpenPosition(
+            id=1, symbol="AEHL", entry_ts=slot.bars[0]["ts"], entry_price=10.0,
+            high_water_mark=10.0, stop_level=9.5,
+        )
+        assert slot.state["levels"]["resistance"] is None  # sanity
+        open_block = poller.full_state_for("AEHL")["journal"]["open"]
+        assert open_block["nearest_resistance_above"] is None
+
+    asyncio.run(run())
+
+
+def test_journal_open_for_target_reference_reads_the_live_strategy_param(tmp_path):
+    # Live-tunable, like every other strategy_param in this project --
+    # changing it via the store (no new entry) changes the displayed
+    # value immediately, computed from the position's real entry_price.
+    from app import Poller
+    from journal_logic import OpenPosition
+    from journal_store import JournalStore
+
+    async def run():
+        store = JournalStore(tmp_path / "journal.db",
+                             default_params={"target_reference_pct": 0.10})
+        poller = Poller(fetch_bars=FakeFetch({}), watch_symbol=None,
+                        announce_watch=None, journal_store=store,
+                        target_reference_pct=0.10)
+        await poller.add_symbol("AEHL")
+        slot = poller._slots["AEHL"]
+        slot.journal_position = OpenPosition(
+            id=1, symbol="AEHL", entry_ts=0, entry_price=20.0,
+            high_water_mark=20.0, stop_level=19.0,
+        )
+        open_block = poller.full_state_for("AEHL")["journal"]["open"]
+        assert open_block["target_reference_price"] == round(20.0 * 1.10, 4)
+
+        store.set_param("target_reference_pct", 0.25)
+        updated_block = poller.full_state_for("AEHL")["journal"]["open"]
+        assert updated_block["target_reference_price"] == round(20.0 * 1.25, 4)
+        assert updated_block["entry_price"] == 20.0  # the position itself is unaffected
+
+    asyncio.run(run())
+
+
 def test_apply_bar_push_reaches_state_the_instant_its_awaited():
     # The whole point of push over poll: no sleep/wait needed to observe a
     # pushed bar land in Poller state -- see specs.md for the ~9s of

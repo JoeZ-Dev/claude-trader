@@ -109,6 +109,11 @@ services:
       # it was last genuinely reaffirmed; same seed-only treatment as
       # the params above.
       CONFIRMATION_FRESHNESS_SECONDS: "${CONFIRMATION_FRESHNESS_SECONDS:-30}"
+      # Reference-target display (specs.md section 21) -- entry_price *
+      # (1 + this) shown as an informational reference alongside the
+      # real trailing stop; never an exit trigger, same seed-only
+      # treatment as the params above.
+      TARGET_REFERENCE_PCT: "${TARGET_REFERENCE_PCT:-0.10}"
     volumes:
       - ./monitor-app/data:/data
     depends_on:

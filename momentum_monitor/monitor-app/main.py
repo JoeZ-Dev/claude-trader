@@ -63,6 +63,11 @@ Environment:
                         stays actionable for a NEW entry after it was
                         last genuinely reaffirmed (specs.md section 20)
                         -- same seed-only treatment            (default 30)
+  TARGET_REFERENCE_PCT  entry_price * (1 + this) shown as an
+                        informational reference alongside the real
+                        trailing stop -- never an exit trigger (specs.md
+                        section 21) -- same seed-only treatment
+                                                              (default 0.10)
 
 Run:  uvicorn main:app --host 0.0.0.0 --port 8012
 """
@@ -94,6 +99,7 @@ SESSION_VOLUME_MULTIPLE = float(os.environ.get("SESSION_VOLUME_MULTIPLE", "3.0")
 CONTINUATION_LOOKBACK_DAYS = float(os.environ.get("CONTINUATION_LOOKBACK_DAYS", "7"))
 CONTINUATION_THRESHOLD_PCT = float(os.environ.get("CONTINUATION_THRESHOLD_PCT", "0.5"))
 CONFIRMATION_FRESHNESS_SECONDS = float(os.environ.get("CONFIRMATION_FRESHNESS_SECONDS", "30"))
+TARGET_REFERENCE_PCT = float(os.environ.get("TARGET_REFERENCE_PCT", "0.10"))
 
 _client = httpx.AsyncClient(timeout=10.0)
 _journal_store = JournalStore(JOURNAL_DB_PATH, default_params={
@@ -107,6 +113,7 @@ _journal_store = JournalStore(JOURNAL_DB_PATH, default_params={
     "continuation_lookback_days": CONTINUATION_LOOKBACK_DAYS,
     "continuation_threshold_pct": CONTINUATION_THRESHOLD_PCT,
     "confirmation_freshness_seconds": CONFIRMATION_FRESHNESS_SECONDS,
+    "target_reference_pct": TARGET_REFERENCE_PCT,
 })
 
 
@@ -187,4 +194,5 @@ app = create_app(fetch_bars=fetch_bars, watch_symbol=WATCH_SYMBOL,
                  continuation_lookback_days=CONTINUATION_LOOKBACK_DAYS,
                  continuation_threshold_pct=CONTINUATION_THRESHOLD_PCT,
                  confirmation_freshness_seconds=CONFIRMATION_FRESHNESS_SECONDS,
+                 target_reference_pct=TARGET_REFERENCE_PCT,
                  fetch_daily_bars=fetch_daily_bars)

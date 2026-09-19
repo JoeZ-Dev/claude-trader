@@ -292,6 +292,11 @@ _PARAM_BOUNDS = {
     # legitimate use, same "wide but not unbounded" pattern as the other
     # thresholds here.
     "confirmation_freshness_seconds": (0.0, 3600.0),
+    # Reference-target display (informational only, specs.md section 21)
+    # -- entry_price * (1 + this) shown alongside the real trailing stop,
+    # never an exit trigger. 5.0 (500%) is a generous upper bound; this
+    # is display-only so there's no real-risk reason to cap it tighter.
+    "target_reference_pct": (0.0, 5.0),
 }
 
 # current_equity's own seed/reset fallback (specs.md section 7) -- "2000

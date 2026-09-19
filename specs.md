@@ -1028,7 +1028,10 @@ together needed the fix). Regression-tested directly
 target was explicitly rejected for this project: it capped winners in the
 EOD swing bot and contributed to that strategy's edge not holding up
 under proper testing. There is no target anywhere in `journal_logic.py`,
-by design, not by omission.
+by design, not by omission. (Section 21 later adds a purely
+INFORMATIONAL reference-target display next to the open position —
+never consulted by `journal_logic.py`, never a second exit mechanism —
+this decision stands unchanged.)
 - `TRAIL_PCT` (env var, default `0.05` / 5%, see `main.py`) — a starting
   point to tune against real logged data, not a validated number.
 - `high_water_mark` starts at `entry_price` and ratchets up from each new
@@ -3169,7 +3172,80 @@ all four setup types per real data, not assumed narrower. Deploy still
 held pending AEMD's open position clearing and current market hours
 (unrelated, independent blockers, unaffected by this fix).
 
-### 21. Roadmap / phases
+### 21. Reference-target display — informational only, no exit-logic change
+
+Adds two purely informational reference values to the Virtual Position
+panel, alongside the existing entry/stop/P&L rows. Does NOT change
+section 6's deliberate "trailing stop only, no fixed target" design
+decision in any way — a fixed R:R target was explicitly rejected for
+this project because it capped winners in the EOD swing bot and
+contributed to that strategy's edge not holding up under proper testing;
+there is still no target anywhere in `should_enter`/`advance_journal`/
+`apply_bar_to_open_position`, by design, not by omission. These two
+values are display context for the user's own judgment, never consulted
+by any exit or entry code path.
+
+**The two values, both live, neither snapshotted:**
+1. **Nearest-above resistance** — the SAME value already computed every
+   cycle by `detect_levels` and already shown in the levels table
+   elsewhere on the panel (`state["levels"]["resistance"]`), just
+   surfaced again next to the open position. Deliberately NOT locked at
+   entry, unlike `trail_pct_used` and this journal's other genuinely
+   risk-relevant "used" snapshots (specs.md section 7) — it's read fresh
+   from `slot.state` on every call, the same "full recompute keeps the
+   app trivially correct" principle section 3 already establishes.
+   "None on this side of price" (not a new, inconsistent phrase) when
+   none exists, matching the exact language the levels table itself
+   already uses for this case (`_level_block_html`).
+2. **Target reference** — `entry_price * (1 + TARGET_REFERENCE_PCT)`, a
+   new live-tunable strategy_param, default `0.10` (matching the user's
+   stated actual target: a further ~10% push from an already-extended
+   entry). `entry_price` itself is fixed once a position opens (it's
+   real trade history), so this value is naturally stable across a given
+   position's lifetime, but it's still computed fresh from the stored
+   `entry_price` on every call rather than itself being a second stored
+   field — if `TARGET_REFERENCE_PCT` changes live, an already-open
+   position's displayed reference updates immediately, same live-tunable
+   treatment as every other threshold in this project.
+
+**Both rows labeled and styled distinctly from the real stop** — "(reference
+only)" in both `<th>` labels, both `<td>` values rendered `muted` (the
+same de-emphasis class this page already uses for non-actionable text),
+so there is no ambiguity that these are context, not exit triggers,
+sitting right next to the real `trailing stop` row above them.
+
+**Explicitly out of scope, confirmed unaffected, not just asserted:**
+`should_enter`, `advance_journal`, and `apply_bar_to_open_position` were
+not touched — `journal_logic.py` has zero changes in this feature's
+diff. The full pre-existing `test_journal_logic.py`/`test_journal_
+wiring.py` suites (every entry/exit test in the project) pass completely
+unmodified, proving this is genuinely display-only, not assumed from
+"I didn't mean to change it." These two values are also NOT written to
+the `trades` table as new "used" snapshot fields (unlike `trail_pct_
+used` etc.) — they're live display, not risk-relevant history a later
+review needs to see exactly as it was at entry time.
+
+**Tests:** `_journal_open_html`/the JS `journalOpenHtml` mirror both
+render the reference rows correctly (present, and the "none on this
+side of price" case), and both tolerate a hand-built `open_block`
+missing the new fields entirely (`.get()`, not direct indexing — a
+caller from before this feature still renders, doesn't KeyError). A
+Poller-level test proves liveness directly: real bars produce a real
+`detect_levels` resistance level (the same known double-top shape
+`core/tests/test_setup_types.py` already proves this against), the
+displayed reference matches it exactly, and — the actual "not locked"
+proof — mutating `slot.state["levels"]["resistance"]` between two calls
+to `full_state_for` changes the displayed value immediately, with no
+new entry. A separate test proves `target_reference_pct` is read live
+from `JournalStore.get_param` (changing it via `set_param` updates the
+displayed target immediately, while the position's own `entry_price` is
+untouched).
+
+**Status:** `monitor-app` suite 284 tests passing (7 new for this
+feature); full project suite 449 tests passing. No `journal_logic.py`
+changes at all.
+
+### 22. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,

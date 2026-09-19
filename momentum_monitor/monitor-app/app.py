@@ -205,6 +205,15 @@ DEFAULT_SESSION_VOLUME_MULTIPLE = 3.0
 # 19). Seed/fallback default ONLY, same fallback-vs-live-tunable split
 # as DEFAULT_TRAIL_PCT above.
 DEFAULT_CONFIRMATION_FRESHNESS_SECONDS = 30.0
+# Reference-target display (informational only, specs.md section 21) --
+# entry_price * (1 + this) shown alongside the real trailing stop, never
+# an exit trigger (specs.md's own phase 4 design explicitly rejects a
+# fixed R:R target; this changes NOTHING about should_enter/
+# advance_journal). 0.10 matches the user's stated actual target -- a
+# further ~10% push from an already-extended entry. Seed/fallback
+# default ONLY, same fallback-vs-live-tunable split as DEFAULT_TRAIL_PCT
+# above.
+DEFAULT_TARGET_REFERENCE_PCT = 0.10
 # How many trading days of daily history to fetch (once per symbol per
 # watch, cached on _SymbolSlot.avg_daily_volume, never per-bar) for the
 # session-level volume gate's baseline.
@@ -299,6 +308,7 @@ class Poller:
                  continuation_lookback_days=DEFAULT_CONTINUATION_LOOKBACK_DAYS,
                  continuation_threshold_pct=DEFAULT_CONTINUATION_THRESHOLD_PCT,
                  confirmation_freshness_seconds=DEFAULT_CONFIRMATION_FRESHNESS_SECONDS,
+                 target_reference_pct=DEFAULT_TARGET_REFERENCE_PCT,
                  fetch_daily_bars=None,
                  now_fn=time.time, max_symbols=MAX_SYMBOLS):
         self._fetch_bars = fetch_bars
@@ -320,6 +330,7 @@ class Poller:
         self._continuation_lookback_days = continuation_lookback_days
         self._continuation_threshold_pct = continuation_threshold_pct
         self._confirmation_freshness_seconds = confirmation_freshness_seconds
+        self._target_reference_pct = target_reference_pct
         self._now_fn = now_fn
         self._max_symbols = max_symbols
         self._slots: dict[str, _SymbolSlot] = {}
@@ -511,6 +522,8 @@ class Poller:
                     "value": self._continuation_threshold_pct, "updated_at": None},
                 "confirmation_freshness_seconds": {
                     "value": self._confirmation_freshness_seconds, "updated_at": None},
+                "target_reference_pct": {
+                    "value": self._target_reference_pct, "updated_at": None},
             }
         return self._journal_store.all_params()
 
@@ -581,6 +594,21 @@ class Poller:
         # for a pre-migration position whose shares were never computed.
         unrealized_dollars = (pos.shares * (last_price - pos.entry_price)
                               if pos.shares is not None else None)
+        # Reference-target display (informational only, specs.md section
+        # 21) -- explicitly NOT locked/snapshotted at entry, unlike
+        # trail_pct_used and this journal's other genuinely risk-relevant
+        # "used" fields: both values below are read LIVE, every call,
+        # same as everything else in this method. Neither feeds
+        # should_enter/advance_journal/apply_bar_to_open_position in any
+        # way -- the actual exit mechanism (the trailing stop above)
+        # remains exactly the deliberate "no fixed target" design specs.md
+        # already documents.
+        resistance = (slot.state or {}).get("levels", {}).get("resistance")
+        nearest_resistance_above = (round(resistance["price"], 4)
+                                    if resistance is not None else None)
+        target_reference_pct = (
+            self._journal_store.get_param("target_reference_pct", self._target_reference_pct)
+            if self._journal_store is not None else self._target_reference_pct)
         return {
             "symbol": pos.symbol,
             "entry_price": round(pos.entry_price, 4),
@@ -592,6 +620,9 @@ class Poller:
             # Two-phase exit (specs.md section 12) -- which mechanism
             # currently governs this position's own stop_level above.
             "exit_phase": pos.exit_phase,
+            "nearest_resistance_above": nearest_resistance_above,
+            "target_reference_pct": round(target_reference_pct, 4),
+            "target_reference_price": round(pos.entry_price * (1 + target_reference_pct), 4),
         }
 
     async def run(self) -> None:
@@ -1248,12 +1279,31 @@ def _journal_open_html(open_block: dict | None) -> str:
                 if shares == 0 else "")
     phase = open_block.get("exit_phase")
     phase_label = _EXIT_PHASE_LABELS.get(phase, phase)
+    # Reference-target display (informational only, specs.md section 21)
+    # -- .get() (not direct indexing) so a hand-built open_block from an
+    # existing/older caller that predates these two fields still renders
+    # instead of KeyError-ing. Both rendered muted, same styling this
+    # page already uses for de-emphasized/non-actionable text, and
+    # explicitly labeled "reference only" -- visually and textually
+    # distinct from the real trailing stop above, never an exit trigger.
+    resistance_above = open_block.get("nearest_resistance_above")
+    resistance_text = (_fmt(resistance_above, 2) if resistance_above is not None
+                       else "none on this side of price")
+    target_price = open_block.get("target_reference_price")
+    target_pct = open_block.get("target_reference_pct")
+    target_text = ("—" if target_price is None else
+                   f"{_fmt(target_price, 2)}"
+                   + (f" (entry +{target_pct * 100:.0f}%)" if target_pct is not None else ""))
     return (
         "<table class='detail'>"
         f"<tr><th>symbol</th><td>{html.escape(str(open_block['symbol']))}</td></tr>"
         f"<tr><th>entry price</th><td>{_fmt(open_block['entry_price'], 2)}</td></tr>"
         f"<tr><th>trailing stop</th><td>{_fmt(open_block['stop_level'], 2)}</td></tr>"
         f"<tr><th>stop phase</th><td>{html.escape(str(phase_label))}</td></tr>"
+        f"<tr><th>nearest resistance above (reference only)</th>"
+        f"<td class='muted'>{html.escape(resistance_text)}</td></tr>"
+        f"<tr><th>target reference (reference only)</th>"
+        f"<td class='muted'>{html.escape(target_text)}</td></tr>"
         f"<tr><th>shares</th><td>{_fmt(shares)}{zero_flag}</td></tr>"
         f"<tr><th>unrealized P&amp;L %</th>"
         f"<td class='{cls}'>{_fmt(open_block['unrealized_pnl_pct'], 2)}%</td></tr>"
@@ -1599,11 +1649,24 @@ function journalOpenHtml(open) {
   const zeroFlag = open.shares === 0
     ? ' <span class="zero-size-flag">zero-size \\u2014 no real position</span>' : '';
   const phaseLabel = EXIT_PHASE_LABELS[open.exit_phase] || open.exit_phase;
+  // Reference-target display (informational only, specs.md section 21)
+  // -- never an exit trigger, see the Python-side _journal_open_html
+  // for the full reasoning; kept in sync here.
+  const resistanceAbove = open.nearest_resistance_above;
+  const resistanceText = (resistanceAbove === null || resistanceAbove === undefined)
+    ? 'none on this side of price' : fmt(resistanceAbove, 2);
+  const targetPrice = open.target_reference_price;
+  const targetPct = open.target_reference_pct;
+  const targetText = (targetPrice === null || targetPrice === undefined) ? '\\u2014' :
+    fmt(targetPrice, 2) + ((targetPct === null || targetPct === undefined) ? '' :
+      ' (entry +' + Math.round(targetPct * 100) + '%)');
   return '<table class="detail">' +
     '<tr><th>symbol</th><td>' + esc(open.symbol) + '</td></tr>' +
     '<tr><th>entry price</th><td>' + fmt(open.entry_price, 2) + '</td></tr>' +
     '<tr><th>trailing stop</th><td>' + fmt(open.stop_level, 2) + '</td></tr>' +
     '<tr><th>stop phase</th><td>' + esc(phaseLabel) + '</td></tr>' +
+    '<tr><th>nearest resistance above (reference only)</th><td class="muted">' + esc(resistanceText) + '</td></tr>' +
+    '<tr><th>target reference (reference only)</th><td class="muted">' + esc(targetText) + '</td></tr>' +
     '<tr><th>shares</th><td>' + fmt(open.shares, 0) + zeroFlag + '</td></tr>' +
     '<tr><th>unrealized P&amp;L %</th><td class="' + cls + '">' + fmt(open.unrealized_pnl_pct, 2) + '%</td></tr>' +
     '<tr><th>unrealized P&amp;L $</th><td class="' + cls + '">' + fmtDollars(open.unrealized_pnl_dollars) + '</td></tr>' +
@@ -2141,6 +2204,7 @@ def create_app(*, fetch_bars, watch_symbol=None,
                continuation_lookback_days=DEFAULT_CONTINUATION_LOOKBACK_DAYS,
                continuation_threshold_pct=DEFAULT_CONTINUATION_THRESHOLD_PCT,
                confirmation_freshness_seconds=DEFAULT_CONFIRMATION_FRESHNESS_SECONDS,
+               target_reference_pct=DEFAULT_TARGET_REFERENCE_PCT,
                fetch_daily_bars=None,
                now_fn=time.time, max_symbols=MAX_SYMBOLS) -> FastAPI:
     poller = Poller(fetch_bars=fetch_bars, watch_symbol=watch_symbol,
@@ -2158,6 +2222,7 @@ def create_app(*, fetch_bars, watch_symbol=None,
                     continuation_lookback_days=continuation_lookback_days,
                     continuation_threshold_pct=continuation_threshold_pct,
                     confirmation_freshness_seconds=confirmation_freshness_seconds,
+                    target_reference_pct=target_reference_pct,
                     fetch_daily_bars=fetch_daily_bars,
                     now_fn=now_fn, max_symbols=max_symbols)
 
