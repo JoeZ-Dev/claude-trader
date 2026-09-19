@@ -2468,7 +2468,116 @@ overall: 44 tests passing; full project suite: 276 tests passing,
 unchanged in every other module. Stage 3 (migrating call sites) remains
 separate, later, explicitly-gated work — not started.
 
-### 16. Roadmap / phases
+### 16. Time-aware core functions — phase 3.6, stage 2 completion (swing_points_time_aware)
+
+Stage 2 (section 15) explicitly left `swing_points_time_aware` out of
+scope. This closes that gap, same standard: real mixed-cadence data
+(AIFF's actual first watched session, reused from section 15 — same
+236-bar backfill+live capture, same real 360s internal gap, same real
+backfill-to-live transition), no existing call site touched.
+
+**A real bug found, not merely a design tradeoff.** `window_seconds=30`
+(calibrated to live 10s cadence: 3 bars × 10s) is NARROWER than real
+backfilled bar spacing (60s). Stage 1's implementation built each
+candidate's bracket as `[b for b in bars if abs(b.ts - cand.ts) <=
+window_seconds]` — on 60s-cadence data this degenerates to a ONE-element
+list (just the candidate itself, since its nearest real neighbors are
+60s away, outside a 30s window), and a single-element list trivially
+"wins" as both its own max AND its own min. Run against the real AIFF
+day, this flagged 228 of 236 bars as low-swing-point candidates and 228
+of 236 as high-swing-point candidates — nearly every bar, meaningless
+noise, versus the bar-count version's 47 and 39. Fixed by requiring a
+candidate's bracket to contain a REAL bar strictly before AND strictly
+after it within `window_seconds` — calendar room alone (the existing
+"far enough from the ends of the whole list" check) was never sufficient
+on its own, a genuine local bracket must exist. This doesn't touch any
+stage 1 uniform-cadence test (on uniform 10s data with a 30s window,
+every eligible candidate always has 3 real neighbors on each side, so
+the new check is always trivially satisfied there — reconfirmed, all
+stage 1 tests still pass bit-for-bit unchanged).
+
+**Real result, post-fix, on the same real AIFF day:** `swing_points_
+time_aware` finds exactly 1 low (index 231) and 1 high (index 229) —
+both inside the 8-bar live tail, none in the 228-bar backfilled portion.
+The bar-count version's 47/39 backfilled-region "finds" were never
+backed by a genuine 30-real-second bracket; they were backed by however
+many *bars* window=3 happened to reach, regardless of how much real time
+that spanned — which leads to the two required checks below.
+
+**1. Across the real internal gap** (08:23:00 → 08:29:00, the same 360s
+gap from section 15): the bar-count version's window=3 segment real span
+for candidates near the gap balloons far past its nominal ~360s (3 bars
+× 60s × 2 sides) intent — measured directly on the real data: index 24
+spans 720 real seconds, index 26 spans 900s, index 29/30 span 1,320s
+(22 real minutes) for a parameter nominally meaning "3 bars each side."
+The gap is silently absorbed into the window's real meaning without any
+signal that it happened. `swing_points_time_aware`, by construction,
+never has this problem — its bracket is always exactly `window_seconds`
+of real time, gap or no gap; post-fix, it correctly finds nothing
+confirmable at 30-second resolution across a stretch this sparse,
+because there genuinely isn't 30 real seconds of bracketing data there.
+
+**2. At the real backfill-to-live transition** (14:35:00–14:39:40, same
+transition as section 15): the bar-count version's window=3 real span,
+measured candidate by candidate straddling the boundary, shrinks
+smoothly and asymmetrically as the candidate approaches and crosses it
+— 360s (idx 224, pure backfill) → 310s (226) → 260s (227) → 210s (228)
+→ 160s (229) → 110s (230) → 60s (231, pure live) — a 6× difference in
+what "window=3" actually means in real time, purely a function of
+proximity to the transition, never signaled anywhere in the output.
+`swing_points_time_aware` has no equivalent asymmetry — its bracket
+width is a fixed real-time quantity by definition, never a function of
+which cadence regime a candidate happens to sit near.
+
+**Zero-volume exclusion, reconfirmed on real data.** AIFF's real
+backfilled portion contains ZERO zero-volume bars — Schwab's minute
+candles omit quiet minutes entirely (creating gaps, not zero-volume
+bars; the internal gap above IS this behavior), so the zero-volume
+forward-fill scenario only actually occurs in live-cadence data (real
+finding, not assumed: backfill and live-forward-fill are two genuinely
+different mechanisms for handling a quiet period). Reconfirmed instead
+against AEMD's real live-cadence session (section 14's data): 1,601 real
+zero-volume bars are present; none appear among `swing_points_time_
+aware`'s low or high results, confirmed by direct set intersection
+against the real output, not assumed carried-over from stage 1.
+
+**Deliberate break-then-fix**
+(`test_swing_points_time_aware_requires_a_real_bracket_not_just_
+calendar_room`): reverted the `has_before`/`has_after` check to
+unconditional `True`. Result: the test failed immediately, reproducing
+the exact original bug (`[1, 2, 3, 4, 5, 6, ...]` instead of `[]` on
+60s-cadence data with a 30s window). Reverted; full suite green again,
+`test_swing_points_time_aware_still_finds_real_swing_points_when_
+window_actually_brackets` confirms the fix doesn't make the function
+vacuously empty in general (widen the window to genuinely bracket the
+same 60s-cadence data and the real V-shaped low is still found).
+
+**Honest, load-bearing conclusion for stage 3 planning.** This is not
+"no material difference" (a real bug was found and fixed) but the
+larger design finding is more nuanced than section 15's other three
+functions: `swing_points_time_aware` is now MORE correct than the
+bar-count version (it never confirms a swing point without genuine
+real-time bracketing evidence), but at `window_seconds=30` — the
+value that exactly matches live cadence — it finds essentially nothing
+useful on 60s-cadence backfilled data, where the bar-count version
+happens to find plenty (just not reliably, per the asymmetries above).
+`detect_levels` currently runs its bar-count window across the FULL
+backfilled+live series deliberately (state.py: "detect_levels...
+deliberately keep seeing the full backfilled+live series"). A
+mechanical swap to `swing_points_time_aware` at `window_seconds=30`
+would NOT be a drop-in improvement for that call site — it would need a
+materially larger or cadence-adaptive window to find anything at all in
+backfilled data. This is exactly the kind of finding stage 3 (migration)
+needs before it starts, and is the reason stage 3 stays separately
+gated rather than assumed.
+
+**Status:** stage 2 now fully complete (all four stage-1 functions
+covered). `core/tests/test_core.py`: 33 tests passing (31 from before
+this stage plus 2 new); `core` suite overall: 46 tests passing; full
+project suite: 276 tests passing, unchanged elsewhere. Stage 3 remains
+separate, later, explicitly-gated work — not started.
+
+### 17. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,
@@ -2516,12 +2625,31 @@ separate, later, explicitly-gated work — not started.
    compares volume RATES, not raw per-bar volume, once bar widths
    actually vary; `evaluate_hold_time_aware` now uses each bar's actual
    observed width instead of a fixed assumed one. `swing_points_time_
-   aware`'s mixed-cadence behavior was NOT in this stage's explicit
-   scope and remains unproven on irregular data. Stage 3 (migrating call
-   sites) remains future work, not started. Touches `core/`'s public
-   function signatures and its authoritative test suite — a real
-   redesign, not a quick patch, which is why it's a separate phase
-   rather than bundled into the backfill work that motivated it.
+   aware`'s mixed-cadence behavior was explicitly deferred out of this
+   stage's scope. **Stage 2 completion (built, 2026-09-18) — see section
+   16:** closed that deferral. Found and fixed a real bug (not merely a
+   design tradeoff): `window_seconds=30`, calibrated to live 10s cadence,
+   is narrower than real 60s backfilled bar spacing, so a candidate's
+   real-time bracket could degenerate to just itself and trivially "win"
+   as both its own max and min — flagged 228 of 236 real AIFF bars as
+   swing points before the fix, 1 after. Also found and quantified two
+   real bar-count failure modes on the same real data: a real internal
+   gap silently balloons a nominal "3 bars each side" window up to 22
+   real minutes, and the real backfill-to-live transition makes the same
+   nominal window mean anywhere from 360s down to 60s of real time
+   depending on proximity to the boundary — both eliminated by
+   construction in the time-aware version. Honest complication for stage
+   3: at `window_seconds=30`, the time-aware version is more CORRECT
+   (never confirms without genuine real-time bracketing) but finds
+   almost nothing on 60s-cadence backfilled data, where `detect_levels`
+   currently runs its bar-count window deliberately across the full
+   backfilled+live series — a straight parameter swap would not be a
+   drop-in improvement there without a larger or cadence-adaptive
+   window. Stage 3 (migrating call sites) remains future work, not
+   started. Touches `core/`'s public function signatures and its
+   authoritative test suite — a real redesign, not a quick patch, which
+   is why it's a separate phase rather than bundled into the backfill
+   work that motivated it.
 4. **(built)** Virtual trade journal — logs what the system would have
    done (entry, trailing stop) without placing anything, for end-of-day
    review against the user's own judgment. See section 6 for the full

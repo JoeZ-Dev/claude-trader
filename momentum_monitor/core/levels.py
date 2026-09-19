@@ -112,6 +112,18 @@ def swing_points_time_aware(bars: list[dict], window_seconds: float, kind: str) 
         if cand["volume"] == 0:
             continue
         seg = [b for b in bars if abs(b["ts"] - cand["ts"]) <= window_seconds]
+        # A real bug on real mixed-cadence data (specs.md section 16):
+        # when bars are spaced wider than window_seconds (backfill, 60s
+        # apart, against a 30s live-calibrated window), `seg` can
+        # degenerate to just `cand` itself -- which then trivially
+        # "wins" as both the max AND the min of a one-element set. A
+        # candidate can only be judged a swing point if the window
+        # genuinely brackets it with a REAL bar on both sides -- a bar
+        # count can never confirm anything from calendar room alone.
+        has_before = any(b["ts"] < cand["ts"] for b in seg)
+        has_after = any(b["ts"] > cand["ts"] for b in seg)
+        if not (has_before and has_after):
+            continue
         val = cand["high"] if kind == "high" else cand["low"]
         seg_vals = [b["high"] if kind == "high" else b["low"] for b in seg]
         if kind == "high" and val == max(seg_vals):

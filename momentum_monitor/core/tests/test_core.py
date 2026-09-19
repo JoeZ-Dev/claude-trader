@@ -443,6 +443,38 @@ def test_evaluate_hold_time_aware_uses_actual_bar_width_not_fixed_reference_inte
     assert new.confirmed is False  # only 23s of real elapsed time ever accrued
 
 
+# -- Phase 3.6 stage 2 (completing it): swing_points_time_aware on mixed --
+# cadence (specs.md section 16). Distinct from the ema/relative_volume/
+# evaluate_hold mixed-cadence tests above.
+
+def test_swing_points_time_aware_requires_a_real_bracket_not_just_calendar_room():
+    # Real bug found against real AIFF backfilled data (specs.md section
+    # 17): window_seconds=30 is calibrated to LIVE 10s cadence, but
+    # backfilled bars are 60s apart -- narrower than their own spacing.
+    # A candidate's real-time "segment" then degenerates to just the
+    # candidate itself (no bar within 30s on EITHER side), which
+    # trivially "wins" as both the max AND the min of a one-element set --
+    # flagging nearly every backfilled bar as a swing point. A candidate
+    # must never be flagged unless the window genuinely brackets it with
+    # a real bar on both sides.
+    lows = [10, 9, 8, 7, 6, 5, 6, 7, 8, 9, 10]
+    bars = _uniform_bars(lows, start_ts=0, step=60)  # 60s cadence, like real backfill
+    assert swing_points_time_aware(bars, window_seconds=30.0, kind="low") == []
+    assert swing_points_time_aware(bars, window_seconds=30.0, kind="high") == []
+
+
+def test_swing_points_time_aware_still_finds_real_swing_points_when_window_actually_brackets():
+    # Sanity companion to the above: the fix must not make the function
+    # vacuously empty in general -- widen the window to genuinely bracket
+    # the 60s-cadence bars (matches the real AIFF live-cadence case,
+    # window=3 bars * 10s = 30s, scaled up here to 3 * 60s = 180s) and
+    # confirm the real V-shaped low is still found.
+    lows = [10, 9, 8, 7, 6, 5, 6, 7, 8, 9, 10]
+    bars = _uniform_bars(lows, start_ts=0, step=60)
+    result = swing_points_time_aware(bars, window_seconds=180.0, kind="low")
+    assert result == [5]  # the single low point, index 5 (value 5)
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
