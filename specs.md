@@ -1229,6 +1229,13 @@ about a trade or what the strategy itself accounts for, not yet closed.
   a compounding virtual account balance — not just entry/exit price and
   percentage.
 - No portfolio-level risk cap across the 4 concurrent symbol slots.
+  **Deliberately DEPRIORITIZED 2026-09-19 — see section 26.** A "loss"
+  costs nothing real in this paper-trading context, so a limit protects
+  against a risk that doesn't actually exist here; understanding whether
+  the strategy LOGIC is trustworthy matters more right now, which is
+  what section 26's evaluation view builds toward instead. Not built,
+  not abandoned — still the next strategy gap once evaluation itself is
+  trusted.
 - ~~`TRAIL_PCT` was one global value despite volatility varying hugely
   across candidates.~~ **Partially addressed 2026-09-18 — see section
   13.** Section 8's live-tunable mechanism was the first step; section
@@ -1237,8 +1244,8 @@ about a trade or what the strategy itself accounts for, not yet closed.
   aware than a flat percentage) — still not per-symbol or volatility-
   adjusted, and the flat percentage still governs once a trade is
   established, so this gap isn't fully closed, just narrowed.
-- Breakdown-below variants of the three phase-3.5 setup types remain
-  deliberately deferred.
+- ~~Breakdown-below variants of the four phase-3.5 setup types.~~
+  **Built 2026-09-19 — see section 22.**
 
 ### 8. Live-tunable strategy parameters
 
@@ -3646,7 +3653,168 @@ false positive from unrelated markup" pitfall this session's own prior
 features already documented for `id="market-backdrop"` and `Closest
 setup:`).
 
-### 25. Roadmap / phases
+### 26. Loss monitoring & evaluation view — priority shift away from the portfolio risk cap
+
+**Priority shift, decided explicitly, not silently.** Section 7's
+"strategy gaps" list has carried "no portfolio-level risk cap across the
+4 concurrent symbol slots" since the list existed. This section
+DEPRIORITIZES that gap (not abandons it — see section 7's updated entry)
+in favor of building this evaluation view first. Reasoning: a risk cap
+protects against a downside that doesn't actually exist here — this is
+paper trading, a "loss" costs nothing real, so a limit on it is solving
+a problem this project doesn't currently have. What DOES matter, and
+what this project has not yet built any way to check, is whether the
+strategy's own entry/exit LOGIC is trustworthy at all — the actual
+purpose the virtual journal (section 6) and human review labels (section
+24) were both built toward. A risk cap without first knowing whether the
+thing it would be capping is sound is solving the wrong problem first.
+
+**Standing rule, reused not reimplemented (specs.md section 6).** Every
+stat in this feature filters through `analysis.real_trades()` — the ONE
+place `REAL_TRADE_EXIT_REASONS` (currently `{"trailing_stop"}`) is
+defined; every other function in `monitor-app/analysis.py` calls it
+first, directly or transitively, none reimplements the check.
+`symbol_switched` rows (watchlist housekeeping) are excluded from
+literally every number this view shows — proven directly by test AND
+live (below) against a mixed real/housekeeping dataset with deliberately
+extreme housekeeping P&L (+900%/-99%) that must never leak into any real
+stat.
+
+**Core aggregate stats (`monitor-app/analysis.py`, pure functions, no
+I/O — same "core is pure, the app layer does I/O" separation section 3
+already establishes):**
+- `overall_stats()` — win rate and expectancy (mean `realized_pnl_pct`)
+  across every real trade. `win_rate = wins / count` (breakeven trades
+  counted in the denominator but neither wins nor losses — a trade that
+  closes exactly flat is genuinely neither, and forcing it into either
+  bucket would misstate both).
+- `breakdown_by_setup_type()` — the same win/loss/expectancy block,
+  grouped by `setup_type`, answering "which of the four entry-eligible
+  types produces the best/worst real results." A trade with no
+  `setup_type` at all (a pre-migration row) groups under an explicit
+  `"unknown"` key, never silently dropped.
+- `breakdown_by_review_label()` — grouped by `review_label` (section 24),
+  among only the REVIEWED subset of real trades (an unreviewed trade has
+  no label to group under). Reports `reviewed_count`/`total_real_count`
+  explicitly alongside the breakdown, so the reader can see how much of
+  the real history has actually been reviewed, not just how the reviewed
+  slice happens to break down. This is the actual point of the feature:
+  does `bad_signal` correlate with losses (validating the label means
+  something), and can `clean_signal` trades still lose sometimes
+  (expected and healthy — not every good signal wins)? Verified live
+  (below) on real hand-traced data: `bad_signal` trades came back 0%
+  win rate / -10.28% expectancy, `clean_signal` came back 100% win rate
+  / +14.17% expectancy in that run — a real, checkable separation, not
+  asserted from nothing (and a dedicated unit test separately proves a
+  `clean_signal` trade CAN still show a loss without that being treated
+  as a contradiction).
+
+**Losses section — the actual priority, not an afterthought
+(`losses_section()`).** Average loss size (both `%` and `$`, the latter
+honestly `None`/`—` rather than a fabricated `$0` when `realized_pnl_
+dollars` was never computed for a trade — same "unknown, not silently
+zero" treatment this project uses throughout). Then CLUSTERING across
+four dimensions — `setup_type`, `review_label`, `symbol`, and entry
+hour-of-day (America/New_York, the same exchange-local timezone
+convention `state.py` already anchors session VWAP to) — each reported
+as a per-bucket LOSS RATE compared against the overall loss rate, not
+raw loss counts. This distinction matters: a bucket with more trades
+overall will also tend to have more raw losses without that meaning
+anything about risk concentration; comparing RATES answers "does this
+bucket actually lose more often than average," the real question behind
+"is this expected noise or a sign something's wrong." A bucket is only
+ever flagged `elevated_vs_overall` when its own sample size clears
+`MIN_BUCKET_SIZE` (3) — proven by a dedicated test that a single losing
+trade in an otherwise-untested bucket (100% loss rate, n=1) is NOT
+flagged, since a coin flip isn't a pattern, and verified live: every
+by-symbol and by-hour bucket in the real demo run below had exactly 1-2
+trades and NONE were flagged elevated, even the ones showing a 50-100%
+loss rate in isolation — correctly read as "too few to assess," not a
+real signal.
+
+**Honesty requirement — explicit output, not silent omission or a
+falsely confident number (echoing this project's own EOD-swing-bot
+early-small-sample lesson, cited by name in the originating
+instruction).** Two sample-size floors, both in `analysis.py`:
+`MIN_TRADES_FOR_STATS` (10) gates a whole group's `win_rate`/
+`expectancy_pct` — below it, `sufficient_sample=False` and an explicit
+`note` string is included (e.g. `"based on only 2 trades -- too few to
+be statistically meaningful (want at least 10)"`), rendered directly in
+the table, never hidden and never silently omitted. `MIN_BUCKET_SIZE`
+(3) is a deliberately lower floor for the losses section's narrower,
+per-bucket clustering question — requiring 10 trades in every individual
+symbol/hour bucket would report nothing at all against realistically
+thin early data (confirmed live: every real bucket in the demo run below
+had 1-4 trades, well under 10). The numbers themselves are still always
+shown — the caveat sits alongside them, not in place of them; this
+project's own instruction was explicit that omitting a real number
+outright would just be a different way of hiding information, the goal
+is not presenting it as MORE confident than it is.
+
+**Display: a SEPARATE view, not crammed into the 4-panel live layout —
+a deliberate design choice, not something to ask about.** `GET
+/analysis`, linked from the live page's topbar (`href='/analysis'`),
+plain server-rendered HTML tables, computed fresh on every page load
+directly from `Poller.recent_closed(limit=None)` — the FULL closed-trade
+history, not the live page's own most-recent-10 window (`recent_closed`
+grew a `limit=None` mode for exactly this; every existing caller still
+passes an explicit int, so nothing else changed behavior). No
+EventSource/JS-mirror dual-rendering here, unlike the live page — this
+is retrospective batch analysis over accumulated history, a genuinely
+different mode from live monitoring, and nothing on this page needs
+sub-second freshness; revisiting it already recomputes from current
+data. Simple, plain tables over visually elaborate, per the feature's
+own explicit instruction — this is for genuine review, not a dashboard
+to look impressive.
+
+**Tests:** 25 new `monitor-app/analysis.py` unit tests (the exit_reason
+filter proven against a realistic mixed dataset, `overall_stats`'
+win-rate/expectancy/breakeven math, both breakdowns' correct grouping
+and "unknown"/reviewed-only handling, the losses section's average-loss
+math and honest handling of missing dollar amounts, and the clustering
+logic's elevated-vs-overall proof AND its below-the-sample-floor
+non-proof). 1 new `journal_store.py` test (`recent_closed(limit=None)`
+returns every row, ordering unchanged). 8 new `app.py`/route tests (the
+real-mixed-dataset filtering proof through the actual HTTP layer, both
+breakdown displays, the explicit insufficient-data messaging, the
+zero-real-trades clean message, the losses section's rendering, the
+nav-link reachability, and a proof that none of this feature's markup
+leaks into the live page's own `#symbols` grid). Full project suite:
+555 tests passing (`core` 71, `schwab-connector` 112, `monitor-app`
+372).
+
+**Verified live (2026-09-19), against the real FastAPI app (`create_app`
++ `TestClient`) with a real SQLite `JournalStore` and a realistic
+hand-constructed 13-row history (10 real `trailing_stop` trades across
+all four setup types, some reviewed some not, plus 3 `symbol_switched`
+housekeeping rows with deliberately extreme P&L) — every displayed
+figure independently hand-traced and confirmed exact, not just visually
+plausible.** Overall: 10 real trades (the 3 housekeeping rows correctly
+excluded — their +900%/-99% figures appear NOWHERE on the rendered
+page), win rate 50.0%, expectancy +0.53% (hand-summed: 12 - 7.5 + 18 - 8
++ 5 - 10 + 12.5 - 8.33 + 5 - 13.33 = 5.33, / 10 = 0.533, rounds to
+0.53 — exact match). By setup type: `vwap_reclaim` +5.00% (hand-computed
+(18-8)/2), `round_number_reclaim` -2.50% ((5-10)/2), `micro_breakout`
++2.08% ((12.5-8.33)/2), `resistance_breakout` -0.96% ((12-7.5+5-13.33)/4)
+— all four exact matches, all four correctly flagged insufficient (2-4
+trades each, well under 10). By review label: `bad_signal` (3 trades,
+all losses) -10.28% expectancy exactly matching hand-sum
+(-7.5-10-13.33)/3; `clean_signal` (3 trades, all wins) +14.17% exactly
+matching (12+18+12.5)/3; both correctly flagged insufficient (n=3).
+Losses: 5 of 10, average loss -9.43% (hand-sum of the 5 losing trades'
+percentages / 5), average loss in dollars correctly shown as `—`
+(`realized_pnl_dollars` was never computed for these hand-built trades —
+honestly absent, not a fabricated `$0`). Clustering: `bad_signal`
+correctly flagged `elevated vs. overall` (3/3 losses = 100% vs. the
+10-trade overall rate of 50%, n=3 clears `MIN_BUCKET_SIZE`); every
+by-symbol and by-hour-of-day bucket (each with only 1-2 trades) was
+correctly left unflagged despite several individually showing 50-100%
+loss rates in isolation — exactly the "don't mistake a coin flip for a
+pattern" behavior the sample-size floor exists to enforce, confirmed
+against real rendered output, not just asserted by a unit test in
+isolation.
+
+### 27. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,

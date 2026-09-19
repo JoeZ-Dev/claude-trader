@@ -245,6 +245,19 @@ def test_recent_closed_orders_most_recent_first_and_respects_limit(tmp_path):
     assert [c["symbol"] for c in closed] == ["S2", "S1"]
 
 
+def test_recent_closed_limit_none_returns_every_closed_trade(tmp_path):
+    # specs.md section 26's loss monitoring/evaluation view needs the
+    # FULL history, not just the live page's most-recent-10 window.
+    store = JournalStore(tmp_path / "journal.db")
+    for i in range(15):
+        pos = store.create(_position(symbol=f"S{i}", entry_ts=i))
+        store.close_position(pos, ExitEvent(exit_ts=100 + i, exit_price=10.0,
+                                            exit_reason="trailing_stop"))
+    closed = store.recent_closed(limit=None)
+    assert len(closed) == 15
+    assert closed[0]["symbol"] == "S14"  # most recent first, unchanged
+
+
 # -- restart persistence: prove it, don't assume it --------------------
 
 def test_open_position_survives_reopening_the_store_over_the_same_file(tmp_path):

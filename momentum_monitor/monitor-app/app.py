@@ -141,6 +141,8 @@ from journal_store import (MAX_WATCH_NOTE_LENGTH, InvalidEquityOverrideError,
                            InvalidParamError, InvalidReverseSplitError,
                            InvalidReviewError, InvalidWatchNoteError)
 from state import build_state
+from analysis import (breakdown_by_review_label, breakdown_by_setup_type,
+                      losses_section, overall_stats)
 
 # Same sys.path setup as state.py's own CORE_PATH -- app.py reaches into
 # core/levels.py directly for confirmed_swing_lows (specs.md section 12's
@@ -553,13 +555,16 @@ class Poller:
     def all_full_states(self) -> dict[str, dict]:
         return {sym: self.full_state_for(sym) for sym in self._slots}
 
-    def recent_closed(self, limit: int = 10) -> list[dict]:
+    def recent_closed(self, limit: int | None = 10) -> list[dict]:
         """Closed trades across ALL symbols, most recent first -- specs.md:
         "for end-of-day review", never scoped to just one symbol, even now
         that there can be up to `max_symbols` watched at once. Unaudited-
         assumption risk was here in a DIFFERENT sense than usual: the risk
         wasn't that this accidentally scopes to one symbol, it's confirming
-        it was ALREADY correctly cross-symbol and should stay that way."""
+        it was ALREADY correctly cross-symbol and should stay that way.
+        `limit=None` (specs.md section 26) returns every closed trade, for
+        the evaluation view's aggregate stats -- see JournalStore.
+        recent_closed's own docstring."""
         if self._journal_store is None:
             return []
         return self._journal_store.recent_closed(limit=limit)
@@ -2586,6 +2591,10 @@ table.detail th{color:var(--muted);font-weight:500;width:45%}
 .review-label-lucky{background:rgba(201,162,39,.18);color:var(--pending)}
 .review-form-row td{background:var(--bg)}
 .footer{color:var(--muted);font-size:.8rem;margin-top:1rem}
+.nav-link{color:var(--accent);text-decoration:none;font-size:.85rem}
+.nav-link:hover{text-decoration:underline}
+.elevated-flag{color:var(--neg);font-weight:600}
+.section-gap{margin-top:1.5rem}
 """
 
 
@@ -2595,10 +2604,172 @@ def _wrap(body: str, poll_enabled: bool) -> str:
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         "<title>momentum monitor</title>"
         f"<style>{_STYLE}</style></head><body>"
-        f"<div class='topbar'><h1>momentum monitor</h1>{_poll_toggle_html(poll_enabled)}</div>"
+        "<div class='topbar'><h1>momentum monitor</h1>"
+        f"<div style='display:flex;align-items:center;gap:1rem'>"
+        "<a class='nav-link' href='/analysis'>Loss monitoring &amp; evaluation</a>"
+        f"{_poll_toggle_html(poll_enabled)}</div></div>"
         f"{body}"
         "<p class='footer'>Read-only technical read. Not advice, not an order.</p>"
         f"<script>{_SCRIPT}</script>"
+        "</body></html>"
+    )
+
+
+# -- loss monitoring & evaluation view (specs.md section 26) ---------------
+# A SEPARATE, retrospective analysis view -- deliberately not crammed into
+# the main 4-panel live-monitoring layout above (a different mode: batch
+# analysis over accumulated history, not a live read of current price
+# action). Simple, plain server-rendered tables, computed fresh on every
+# page load directly from analysis.py's pure functions -- no EventSource/
+# JS-mirror dual-rendering here, unlike the live page: nothing on this
+# page needs sub-second freshness, it only changes when a new trade
+# closes or a review is entered, and revisiting the page already
+# recomputes it from current data. Simple and readable over visually
+# elaborate, per the feature's own explicit design instruction.
+
+def _fmt_pct_signed(v: float | None, decimals: int = 2) -> str:
+    return "—" if v is None else f"{v:+.{decimals}f}%"
+
+
+def _fmt_pct_plain(v: float | None, decimals: int = 1) -> str:
+    return "—" if v is None else f"{v * 100:.{decimals}f}%"
+
+
+def _stats_table_html(groups: dict[str, dict], first_col: str) -> str:
+    if not groups:
+        return "<p class='muted'>no data yet</p>"
+    rows = []
+    for key in sorted(groups, key=str):
+        s = groups[key]
+        note = f" <span class='muted'>{html.escape(s['note'])}</span>" if s["note"] else ""
+        rows.append(
+            f"<tr><td>{html.escape(str(key))}</td><td>{s['count']}</td>"
+            f"<td>{s['wins']}</td><td>{s['losses']}</td><td>{s['breakeven']}</td>"
+            f"<td>{_fmt_pct_plain(s['win_rate'])}</td>"
+            f"<td>{_fmt_pct_signed(s['expectancy_pct'])}</td>"
+            f"<td>{note}</td></tr>"
+        )
+    return (
+        "<table class='detail'>"
+        f"<tr><th>{html.escape(first_col)}</th><th>trades</th><th>wins</th>"
+        "<th>losses</th><th>breakeven</th><th>win rate</th><th>expectancy</th><th></th></tr>"
+        f"{''.join(rows)}</table>"
+    )
+
+
+def _cluster_table_html(buckets: dict, first_col: str) -> str:
+    if not buckets:
+        return "<p class='muted'>no data yet</p>"
+    rows = []
+    for key in sorted(buckets, key=str):
+        b = buckets[key]
+        if b["elevated_vs_overall"]:
+            flag = "<span class='elevated-flag'>elevated vs. overall</span>"
+        elif not b["sufficient_sample"]:
+            plural = "s" if b["trades"] != 1 else ""
+            flag = f"<span class='muted'>only {b['trades']} trade{plural} — too few to assess</span>"
+        else:
+            flag = ""
+        rows.append(
+            f"<tr><td>{html.escape(str(key))}</td><td>{b['trades']}</td>"
+            f"<td>{b['losses']}</td><td>{_fmt_pct_plain(b['loss_rate'])}</td>"
+            f"<td>{flag}</td></tr>"
+        )
+    return (
+        "<table class='detail'>"
+        f"<tr><th>{html.escape(first_col)}</th><th>trades</th><th>losses</th>"
+        "<th>loss rate</th><th></th></tr>"
+        f"{''.join(rows)}</table>"
+    )
+
+
+def _format_hour_buckets(by_hour: dict[int, dict]) -> dict[str, dict]:
+    """Int hour-of-day keys (America/New_York, analysis.py's own
+    convention) rendered as readable 'HH:00' labels for display only --
+    the underlying data is untouched."""
+    return {f"{hour:02d}:00": bucket for hour, bucket in by_hour.items()}
+
+
+def _overall_stats_section_html(stats: dict) -> str:
+    note = f"<p class='muted'>{html.escape(stats['note'])}</p>" if stats["note"] else ""
+    return (
+        "<h2>Overall (real trades only)</h2>"
+        "<table class='detail'>"
+        f"<tr><th>trades</th><td>{stats['count']}</td></tr>"
+        f"<tr><th>wins</th><td>{stats['wins']}</td></tr>"
+        f"<tr><th>losses</th><td>{stats['losses']}</td></tr>"
+        f"<tr><th>breakeven</th><td>{stats['breakeven']}</td></tr>"
+        f"<tr><th>win rate</th><td>{_fmt_pct_plain(stats['win_rate'])}</td></tr>"
+        f"<tr><th>expectancy</th><td>{_fmt_pct_signed(stats['expectancy_pct'])}</td></tr>"
+        "</table>"
+        f"{note}"
+    )
+
+
+def _setup_type_breakdown_section_html(breakdown: dict[str, dict]) -> str:
+    return (
+        "<h2 class='section-gap'>By setup type</h2>"
+        f"{_stats_table_html(breakdown, 'setup type')}"
+    )
+
+
+def _review_label_breakdown_section_html(result: dict) -> str:
+    header = (f"<p class='muted'>{result['reviewed_count']} of "
+             f"{result['total_real_count']} real trades reviewed so far.</p>")
+    note = f"<p class='muted'>{html.escape(result['note'])}</p>" if result["note"] else ""
+    return (
+        "<h2 class='section-gap'>By review label</h2>"
+        f"{header}{note}"
+        f"{_stats_table_html(result['breakdown'], 'review label')}"
+    )
+
+
+def _losses_section_html(section: dict) -> str:
+    note = f"<p class='muted'>{html.escape(section['note'])}</p>" if section["note"] else ""
+    return (
+        "<h2 class='section-gap'>Losses</h2>"
+        "<table class='detail'>"
+        f"<tr><th>losing trades</th><td>{section['count']} of "
+        f"{section['total_real_count']}</td></tr>"
+        f"<tr><th>overall loss rate</th><td>{_fmt_pct_plain(section['overall_loss_rate'])}</td></tr>"
+        f"<tr><th>average loss</th><td>{_fmt_pct_signed(section['avg_loss_pct'])}</td></tr>"
+        f"<tr><th>average loss ($)</th><td>{_fmt_dollars(section['avg_loss_dollars'])}</td></tr>"
+        "</table>"
+        f"{note}"
+        "<h3>Clustering — does one bucket lose more often than the overall rate?</h3>"
+        "<p class='muted'>\"elevated vs. overall\" means this bucket's OWN loss rate is "
+        "higher than the overall rate above, with enough trades in it to say so — not "
+        "just that it happens to have more raw losses than another bucket.</p>"
+        "<h4>By setup type</h4>"
+        f"{_cluster_table_html(section['by_setup_type'], 'setup type')}"
+        "<h4>By review label</h4>"
+        f"{_cluster_table_html(section['by_review_label'], 'review label')}"
+        "<h4>By symbol</h4>"
+        f"{_cluster_table_html(section['by_symbol'], 'symbol')}"
+        "<h4>By entry hour (America/New_York)</h4>"
+        f"{_cluster_table_html(_format_hour_buckets(section['by_hour_of_day']), 'hour')}"
+    )
+
+
+def _analysis_page_html(closed: list[dict]) -> str:
+    body = (
+        "<h1>Loss monitoring &amp; evaluation</h1>"
+        "<p class='muted'>Retrospective analysis of the virtual trade journal's own "
+        "accumulated history. symbol_switched rows (watchlist housekeeping, never a "
+        "real trading outcome) are excluded from every stat below.</p>"
+        f"{_overall_stats_section_html(overall_stats(closed))}"
+        f"{_setup_type_breakdown_section_html(breakdown_by_setup_type(closed))}"
+        f"{_review_label_breakdown_section_html(breakdown_by_review_label(closed))}"
+        f"{_losses_section_html(losses_section(closed))}"
+        "<p class='section-gap'><a class='nav-link' href='/'>&larr; Back to live monitor</a></p>"
+    )
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>momentum monitor — loss monitoring &amp; evaluation</title>"
+        f"<style>{_STYLE}</style></head><body>"
+        f"{body}"
+        "<p class='footer'>Read-only technical read. Not advice, not an order.</p>"
         "</body></html>"
     )
 
@@ -2701,6 +2872,15 @@ def create_app(*, fetch_bars, watch_symbol=None,
         return _page(poller.all_full_states(), poller.recent_closed(limit=10),
                     poller.poll_enabled, poller.max_symbols, poller.strategy_params(),
                     poller.current_equity(), poller.market_backdrop())
+
+    @app.get("/analysis", response_class=HTMLResponse)
+    async def analysis_page():
+        # Loss monitoring & evaluation (specs.md section 26) -- the FULL
+        # closed-trade history (limit=None), not the live page's own
+        # most-recent-10 window; a stat computed over only the 10 most
+        # recently displayed trades would silently ignore the rest of the
+        # real history the moment more than 10 have ever closed.
+        return _analysis_page_html(poller.recent_closed(limit=None))
 
     @app.post("/api/watch")
     async def api_watch(request: Request):

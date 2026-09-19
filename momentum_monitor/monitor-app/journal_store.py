@@ -805,12 +805,24 @@ class JournalStore:
         self._conn.commit()
         return pnl_dollars
 
-    def recent_closed(self, limit: int = 10) -> list[dict]:
-        rows = self._conn.execute(
-            "SELECT * FROM trades WHERE exit_ts IS NOT NULL "
-            "ORDER BY exit_ts DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+    def recent_closed(self, limit: int | None = 10) -> list[dict]:
+        """Most recent first. `limit=None` (specs.md section 26's loss
+        monitoring/evaluation view) returns EVERY closed trade, not just
+        the live page's own most-recent-10 window -- an aggregate stat
+        computed over only the 10 most recently displayed trades would
+        silently ignore the rest of a symbol's real history the moment
+        more than 10 have ever closed."""
+        if limit is None:
+            rows = self._conn.execute(
+                "SELECT * FROM trades WHERE exit_ts IS NOT NULL "
+                "ORDER BY exit_ts DESC",
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM trades WHERE exit_ts IS NOT NULL "
+                "ORDER BY exit_ts DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
         return [_decode_factors(dict(r)) for r in rows]
 
     def delete_closed(self, trade_id: int) -> bool:

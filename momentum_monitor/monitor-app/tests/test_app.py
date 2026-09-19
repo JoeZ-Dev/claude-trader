@@ -2007,3 +2007,143 @@ def test_review_displays_correctly_on_the_real_rendered_page(tmp_path):
         assert "review-label-clean_signal" in page
         assert ">clean_signal<" in page
         assert "textbook" in page
+
+
+# -- loss monitoring & evaluation view, specs.md section 26 ----------------
+# GET /analysis: a separate, retrospective page over the FULL closed-trade
+# history, not the live page's most-recent-10 window. The pure computation
+# is already unit-tested end to end in test_analysis.py -- these tests
+# only prove the HTTP wiring and rendered output on top of it.
+
+def _seed_trade(store, *, symbol="AEHL", entry_price=10.0, exit_price=11.0,
+                exit_reason="trailing_stop", entry_ts=0, exit_ts=100,
+                setup_type=None, review_label=None):
+    from journal_logic import ExitEvent, OpenPosition
+    pos = store.create(OpenPosition(
+        id=None, symbol=symbol, entry_ts=entry_ts, entry_price=entry_price,
+        high_water_mark=entry_price, stop_level=entry_price * 0.95,
+        setup_type=setup_type,
+    ))
+    store.close_position(pos, ExitEvent(exit_ts=exit_ts, exit_price=exit_price,
+                                        exit_reason=exit_reason))
+    if review_label is not None:
+        closed = next(c for c in store.recent_closed() if c["id"] == pos.id)
+        store.review_trade(closed["id"], review_label=review_label)
+    return pos
+
+
+def test_analysis_page_filters_symbol_switched_on_a_real_mixed_dataset(tmp_path):
+    from journal_store import JournalStore
+    store = JournalStore(tmp_path / "journal.db")
+    # 3 real trailing_stop trades (2 wins, 1 loss) + 2 symbol_switched
+    # housekeeping rows with extreme P&L that must NEVER leak into the
+    # real stats (specs.md section 6's standing rule).
+    _seed_trade(store, symbol="AEHL", entry_price=10.0, exit_price=11.0,
+               setup_type="resistance_breakout")
+    _seed_trade(store, symbol="MSFT", entry_price=10.0, exit_price=9.0,
+               setup_type="vwap_reclaim")
+    _seed_trade(store, symbol="NVDA", entry_price=10.0, exit_price=10.5,
+               setup_type="resistance_breakout")
+    _seed_trade(store, symbol="QCLS", entry_price=10.0, exit_price=100.0,
+               exit_reason="symbol_switched")  # +900%, must be excluded
+    _seed_trade(store, symbol="RETO", entry_price=10.0, exit_price=0.1,
+               exit_reason="symbol_switched")  # -99%, must be excluded
+
+    with _client(FakeFetch({}), symbol=None, journal_store=store) as c:
+        r = c.get("/analysis")
+        assert r.status_code == 200
+        page = r.text
+        # Overall table shows exactly 3 real trades, not 5.
+        assert "<tr><th>trades</th><td>3</td></tr>" in page
+        # The housekeeping rows' extreme P&L (+900%, -99%) never appears
+        # anywhere on the page -- it must never leak into any real stat.
+        assert "900" not in page
+        assert "-99" not in page
+
+
+def test_analysis_page_breakdown_by_setup_type(tmp_path):
+    from journal_store import JournalStore
+    store = JournalStore(tmp_path / "journal.db")
+    _seed_trade(store, entry_price=10.0, exit_price=11.0, setup_type="resistance_breakout")
+    _seed_trade(store, entry_price=10.0, exit_price=10.5, setup_type="resistance_breakout")
+    _seed_trade(store, entry_price=10.0, exit_price=9.0, setup_type="vwap_reclaim")
+
+    with _client(FakeFetch({}), symbol=None, journal_store=store) as c:
+        page = c.get("/analysis").text
+        assert "resistance_breakout" in page
+        assert "vwap_reclaim" in page
+        assert "By setup type" in page
+
+
+def test_analysis_page_breakdown_by_review_label(tmp_path):
+    from journal_store import JournalStore
+    store = JournalStore(tmp_path / "journal.db")
+    _seed_trade(store, entry_price=10.0, exit_price=11.0, review_label="clean_signal")
+    _seed_trade(store, entry_price=10.0, exit_price=9.0, review_label="bad_signal")
+    _seed_trade(store, entry_price=10.0, exit_price=10.5)  # not reviewed
+
+    with _client(FakeFetch({}), symbol=None, journal_store=store) as c:
+        page = c.get("/analysis").text
+        assert "By review label" in page
+        assert "clean_signal" in page
+        assert "bad_signal" in page
+        assert "2 of 3 real trades reviewed" in page
+
+
+def test_analysis_page_shows_explicit_insufficient_data_messaging(tmp_path):
+    # Only 2 real trades total -- must say so explicitly, not present a
+    # bare, misleadingly confident win rate (specs.md section 26's
+    # honesty requirement, echoing the EOD swing bot's small-sample
+    # lesson).
+    from journal_store import JournalStore
+    store = JournalStore(tmp_path / "journal.db")
+    _seed_trade(store, entry_price=10.0, exit_price=11.0)
+    _seed_trade(store, entry_price=10.0, exit_price=9.0)
+
+    with _client(FakeFetch({}), symbol=None, journal_store=store) as c:
+        page = c.get("/analysis").text
+        assert "too few to be statistically meaningful" in page
+        assert "2 trade" in page
+
+
+def test_analysis_page_on_zero_real_trades_says_so_cleanly(tmp_path):
+    from journal_store import JournalStore
+    store = JournalStore(tmp_path / "journal.db")
+    with _client(FakeFetch({}), symbol=None, journal_store=store) as c:
+        r = c.get("/analysis")
+        assert r.status_code == 200
+        assert "no real trades yet" in r.text
+
+
+def test_analysis_page_losses_section_shows_average_loss_and_clustering(tmp_path):
+    from journal_store import JournalStore
+    store = JournalStore(tmp_path / "journal.db")
+    _seed_trade(store, symbol="AEHL", entry_price=10.0, exit_price=9.0)   # -10%, a loss
+    _seed_trade(store, symbol="AEHL", entry_price=10.0, exit_price=8.5)   # -15%, a loss
+    _seed_trade(store, symbol="MSFT", entry_price=10.0, exit_price=11.0)  # a win
+
+    with _client(FakeFetch({}), symbol=None, journal_store=store) as c:
+        page = c.get("/analysis").text
+        assert "Losses" in page
+        assert "<tr><th>losing trades</th><td>2 of 3</td></tr>" in page
+        assert "By symbol" in page
+        assert "By entry hour" in page
+
+
+def test_analysis_page_reachable_via_a_nav_link_from_the_live_page(tmp_path):
+    from journal_store import JournalStore
+    store = JournalStore(tmp_path / "journal.db")
+    with _client(FakeFetch({}), symbol=None, journal_store=store) as c:
+        assert "href='/analysis'" in c.get("/").text
+
+
+def test_analysis_page_is_a_separate_view_not_part_of_the_live_symbol_grid():
+    # Design requirement: a separate page, not crammed into the 4-panel
+    # live layout -- the live page's own #symbols grid must not contain
+    # any of this feature's markup.
+    with _client(FakeFetch({"AEHL": [_bars(3)]}), symbol="AEHL") as c:
+        page = c.get("/").text
+        symbols_start = page.find("id=\"symbols\"")
+        symbols_section = page[symbols_start:symbols_start + 2000]
+        assert "Loss monitoring" not in symbols_section
+        assert "overall_loss_rate" not in symbols_section
