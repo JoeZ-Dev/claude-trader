@@ -17,6 +17,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+from indicators import _bar_duration
+
 # Round-number grid, TIERED by price -- retail attention clusters at
 # round numbers, but what counts as "round" scales with price: a nickel
 # matters at $1, but is meaningless noise at $150, while a half-dollar
@@ -83,43 +85,49 @@ def _swing_points(bars: list[dict], window: int, kind: str) -> list[int]:
     return idxs
 
 
-def swing_points_time_aware(bars: list[dict], window_seconds: float, kind: str) -> list[int]:
-    """Time-aware analog of `_swing_points` (specs.md section 15, phase 3.6
-    stage 1): a candidate is compared against every bar within
-    `window_seconds` on EACH side (real elapsed time), rather than a fixed
-    bar count. `window=3` bars at the live 10s cadence is
-    `window_seconds=30.0` (3 * 10s) -- on uniform cadence this selects the
-    identical bracket as `_swing_points(bars, 3, kind)`: bar j is in
-    candidate i's bracket exactly when `abs(bars[j]["ts"] - bars[i]["ts"])
-    <= window_seconds`, which for uniform 10s bars (ts = i*10) reduces to
-    `j in [i-3, i+3]` -- the same inclusive 7-bar segment
-    `bars[i-window:i+window+1]` uses.
+def swing_points_time_aware(bars: list[dict], kind: str, multiple: float = 3.0,
+                            reference_interval_seconds: float = 10.0) -> list[int]:
+    """Time-aware analog of `_swing_points` (specs.md sections 15/16/17,
+    phase 3.6): a candidate is compared against every bar within a
+    CADENCE-ADAPTIVE window on EACH side (real elapsed time), rather than
+    a fixed bar count OR a single fixed real-time span.
 
-    A candidate is only eligible once `window_seconds` of real history
-    exists on BOTH sides (the time-based analog of `_swing_points`'
-    `range(window, len(bars)-window)` bound). The zero-volume forward-fill
-    exclusion (see `_swing_points`'s docstring) is preserved unchanged --
-    that rule is about real vs. synthetic bars, orthogonal to bar-count vs.
-    real-time windowing.
+    A candidate's window is `multiple * ` its own real observed width --
+    `_bar_duration` (the SAME helper `relative_volume_time_aware` uses,
+    not a second width-detection primitive), the gap to whatever bar
+    comes right after it, or `reference_interval_seconds` for the newest
+    bar in the list. Default `multiple=3.0` matches `window=3` bars at
+    the live 10s cadence (own width 10s * 3 = 30s, exactly section 15's
+    original fixed `window_seconds=30.0`), but now scales automatically
+    with whatever cadence a candidate actually sits in: a 60s-cadence
+    backfilled candidate gets a 180s window, wide enough to genuinely
+    bracket its own real neighbors (section 15's fixed 30s window,
+    narrower than backfill's own 60s spacing, could never do this --
+    see section 17). This is still a REAL elapsed-time bound throughout,
+    never a bar count -- reverting to bar-counting anywhere in here would
+    bring back the gap-ballooning bug section 16 already fixed, in a new
+    form.
+
+    A candidate is only eligible once its OWN computed window's worth of
+    real history exists on BOTH sides of it overall (the time-based
+    analog of `_swing_points`' `range(window, len(bars)-window)` bound),
+    and -- unchanged since section 16 -- only if the window genuinely
+    brackets it with a REAL bar on both sides, not just enough calendar
+    room. The zero-volume forward-fill exclusion (see `_swing_points`'s
+    docstring) is preserved unchanged -- that rule is about real vs.
+    synthetic bars, orthogonal to windowing strategy entirely.
     """
     idxs = []
     if not bars:
         return idxs
     first_ts, last_ts = bars[0]["ts"], bars[-1]["ts"]
     for i, cand in enumerate(bars):
+        window_seconds = multiple * _bar_duration(bars, i, reference_interval_seconds)
         if cand["ts"] - first_ts < window_seconds or last_ts - cand["ts"] < window_seconds:
             continue
         if cand["volume"] == 0:
             continue
         seg = [b for b in bars if abs(b["ts"] - cand["ts"]) <= window_seconds]
-        # A real bug on real mixed-cadence data (specs.md section 16):
-        # when bars are spaced wider than window_seconds (backfill, 60s
-        # apart, against a 30s live-calibrated window), `seg` can
-        # degenerate to just `cand` itself -- which then trivially
-        # "wins" as both the max AND the min of a one-element set. A
-        # candidate can only be judged a swing point if the window
-        # genuinely brackets it with a REAL bar on both sides -- a bar
-        # count can never confirm anything from calendar room alone.
         has_before = any(b["ts"] < cand["ts"] for b in seg)
         has_after = any(b["ts"] > cand["ts"] for b in seg)
         if not (has_before and has_after):

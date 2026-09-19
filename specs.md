@@ -2577,7 +2577,113 @@ this stage plus 2 new); `core` suite overall: 46 tests passing; full
 project suite: 276 tests passing, unchanged elsewhere. Stage 3 remains
 separate, later, explicitly-gated work — not started.
 
-### 17. Roadmap / phases
+### 17. Cadence-adaptive window for level detection — phase 3.6 completion
+
+Section 16 fixed a real bug (degenerate single-bar brackets) but left an
+explicit design gap: a single fixed `window_seconds=30`, calibrated to
+live 10s cadence, is narrower than real 60s backfilled bar spacing, so
+the fixed-window version — correctly, but uselessly — excludes the
+entire backfilled portion of a day from ever confirming a swing point.
+This closes that gap, same standard as the rest of phase 3.6, reusing
+AIFF's real mixed-cadence session and AEMD's real uniform session from
+sections 14–16, no existing call site touched.
+
+**The design.** `swing_points_time_aware`'s `window_seconds` parameter
+is replaced with `multiple` (default `3.0`, matching today's convention
+of `window=3` bars). A candidate's window is now `multiple *` its own
+real observed width, via `_bar_duration` — the SAME helper built for
+`relative_volume_time_aware`'s rate fix (section 15), not a second
+width-detection primitive. This stays a real elapsed-time bound
+throughout (a genuine bar strictly before and after, within the computed
+span — section 16's fix, unchanged); only the span itself is now
+per-candidate instead of a single constant.
+
+**Equivalence, reconfirmed on real uniform data.** AEMD's real
+2026-09-18 regular session (2,340 bars, strictly 10s cadence, reused
+from section 14): every candidate's own width is 10s, so `multiple=3.0`
+produces exactly `30.0` for every candidate — identical to section 15's
+fixed value. Result: `swing_points_time_aware` (adaptive) vs. the
+bar-count `_swing_points(window=3)`: 210/210 lows identical, 192/192
+highs identical.
+
+**Genuine improvement, on the same real AIFF mixed-cadence day (236
+bars) reused from sections 15/16.** The fixed-window version (section
+16) found exactly 1 low and 1 high, both in the 8-bar live tail, zero in
+the 228-bar backfilled portion. The cadence-adaptive version finds 45
+lows and 40 highs total — **44 lows and 39 highs genuinely inside the
+backfilled portion**, real numbers, comparable in magnitude to the
+bar-count version's 47/39 (which found plenty, just not reliably — see
+section 16's asymmetry findings). Example real finds: index 13 (08:03:00,
+low=0.9251, own width 60s → window 180s), index 6 (07:56:00, high=1.03,
+own width 60s). These are real swing points now confirmable at genuine
+60s-cadence resolution, which a 30s live-calibrated window could never
+bracket.
+
+**The transition-boundary edge case, demonstrated on real data, not
+assumed away.** AIFF's real last backfilled bar (index 228, 14:39:00,
+close 1.3091) sits 60s after its own predecessor (index 227, 14:38:00)
+but only 10s before the first live bar (index 229, 14:39:10) arrives.
+Since `_bar_duration` measures "gap to the NEXT bar," index 228's own
+computed width is `10.0`, not `60.0` — giving it a 30s window, narrower
+than the 60s gap back to its own real predecessor. Concretely: index 228
+can never be bracketed on its "before" side (no real bar within 30s
+before it; the nearest is 60s away) and is excluded from consideration
+entirely — confirmed directly (`228 not in` either the real high or low
+results). This is honest, explained, and narrow: index 228's OWN
+close/high/low values (1.3091) sit between index 227 (1.3051) and index
+229 (1.32) anyway, so on this real data the exclusion changes nothing —
+index 228 was never going to be a genuine extreme regardless. It is
+still a real, worth-documenting consequence of scaling strictly off
+"time to the next bar": a bar exactly at a cadence speed-up gets treated
+as though it were as narrow as what comes after it, not as wide as what
+it actually represents. No alternative width definition was built to
+avoid this — the instruction was explicit not to add a second
+width-detection primitive, and this stage's job was to demonstrate the
+consequence honestly, not eliminate it.
+
+**Internal-gap reconfirmation — mostly holds, one honest, non-outcome-
+changing exception found.** A candidate with ORDINARY local width (60s,
+not itself inflated) correctly cannot reach across a gap: window=180s is
+well short of a 360s gap, confirmed both algebraically (a constructed
+case mirroring AIFF's real gap magnitude) and on the real AIFF data
+itself (index 25, 26, 27, 29 — none bridge the gap). But index 28
+(08:29:00, immediately after the real 360s gap) has its OWN next-gap
+also unusually wide (120s, since the following bar arrives at 08:31:00),
+giving it `window = 3*120 = 360s` — exactly wide enough to reach back
+across the 360s gap to index 27 (08:23:00). Verified directly: index 27
+IS included in index 28's bracket. This did NOT change index 28's
+verdict here (index 28's low, 0.927, is still lower than index 27's low,
+0.9445, with or without index 27 in the comparison), but it means the
+"never crosses a real gap" property is a strong PRACTICAL consequence of
+scaling the window to LOCAL cadence, not an absolute guarantee — in a
+region unusually sparse on BOTH sides of a candidate, that candidate's
+own inflated width can, in principle, still reach across a neighboring
+gap. Reported honestly per this stage's standing instruction, not
+glossed over.
+
+**Deliberate break-then-fix**
+(`test_swing_points_time_aware_still_finds_real_swing_points_when_
+window_actually_brackets`,
+`test_swing_points_time_aware_uses_bar_duration_helper_not_a_second_
+primitive`): replaced `multiple * _bar_duration(bars, i, reference_
+interval_seconds)` with `multiple * reference_interval_seconds`
+(reverting to a single fixed span, section 16's version). Result: both
+tests failed immediately (`[] == [5]` — the real swing low no longer
+found once the window stopped scaling with actual bar width). Reverted;
+full suite green again.
+
+**Status:** phase 3.6's design/proof work is now complete for all four
+functions. `core/tests/test_core.py`: 36 tests passing (33 from before
+this stage plus 3 new — one new synthetic gap-reconfirmation test, one
+new transition-boundary test, one new bar-duration-helper-usage test;
+the two pre-existing degenerate-bracket tests were updated in place to
+the new `multiple` parameter, not replaced); `core` suite overall: 49
+tests passing; full project suite: 276 tests passing, unchanged
+elsewhere. Stage 3 (migrating call sites, including retiring
+`live_cadence_tail`) remains separate, later, explicitly-gated work —
+not started.
+
+### 18. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,
@@ -2646,10 +2752,31 @@ separate, later, explicitly-gated work — not started.
    backfilled+live series — a straight parameter swap would not be a
    drop-in improvement there without a larger or cadence-adaptive
    window. Stage 3 (migrating call sites) remains future work, not
-   started. Touches `core/`'s public function signatures and its
-   authoritative test suite — a real redesign, not a quick patch, which
-   is why it's a separate phase rather than bundled into the backfill
-   work that motivated it.
+   started. **Cadence-adaptive window (built, 2026-09-18) — see section
+   17:** closed that complication. Replaced the single fixed
+   `window_seconds` with `multiple` (default 3.0) times each candidate's
+   own observed width (`_bar_duration`, reused, not a second width-
+   detection primitive) — a real elapsed-time bound throughout, still
+   never a bar count. Reconfirmed exact equivalence on real uniform data
+   (AEMD, 210/210 lows and 192/192 highs identical to the bar-count
+   version) and proved genuine improvement on the same real AIFF mixed-
+   cadence day: 44 real lows and 39 real highs now confirmed WITHIN the
+   backfilled portion (vs. zero for the fixed-window version), comparable
+   to the bar-count version's 47/39 but without its asymmetries. Found
+   and honestly documented, not hidden, two narrow real edge cases on the
+   same data: a bar exactly at a cadence speed-up (60s predecessor gap,
+   10s successor gap) gets scaled by its narrower successor gap and can
+   become unbracketable — confirmed on the real transition bar, which
+   didn't change any actual verdict there; and in a doubly-sparse
+   stretch, a candidate's own inflated width can, rarely, still bridge a
+   neighboring real gap — confirmed on the real AIFF gap, also without
+   changing any actual verdict. Phase 3.6's design/proof work is complete
+   for all four functions. Stage 3 (actually migrating call sites,
+   including retiring `live_cadence_tail`) remains a separate, later,
+   explicitly-gated prompt. Touches `core/`'s public function signatures
+   and its authoritative test suite — a real redesign, not a quick
+   patch, which is why it's a separate phase rather than bundled into
+   the backfill work that motivated it.
 4. **(built)** Virtual trade journal — logs what the system would have
    done (entry, trailing stop) without placing anything, for end-of-day
    review against the user's own judgment. See section 6 for the full

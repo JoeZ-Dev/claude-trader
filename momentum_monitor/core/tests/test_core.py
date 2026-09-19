@@ -5,7 +5,7 @@ import pytest
 
 from indicators import (
     continuation_days, session_vwap, ema, macd, relative_volume,
-    ema_time_aware, relative_volume_time_aware,
+    ema_time_aware, relative_volume_time_aware, _bar_duration,
 )
 from levels import (
     confirmed_swing_lows, detect_levels, evaluate_hold,
@@ -291,9 +291,11 @@ def test_relative_volume_time_aware_exactly_equals_bar_count_version_on_uniform_
 
 def test_swing_points_time_aware_exactly_equals_bar_count_version_on_uniform_cadence():
     lows = [10, 9, 8, 7, 6, 4, 6, 7, 8, 9, 10, 9, 8, 6, 3, 6, 8, 9, 10]
-    bars = _uniform_bars(lows)
+    bars = _uniform_bars(lows)  # uniform 10s cadence
     old = _swing_points(bars, window=3, kind="low")
-    new = swing_points_time_aware(bars, window_seconds=30.0, kind="low")
+    # default multiple=3.0 * each candidate's own 10s width = 30.0 --
+    # exactly section 15's original fixed window_seconds=30.0.
+    new = swing_points_time_aware(bars, kind="low")
     assert new == old
     assert old  # sanity: the fixture actually contains swing lows to compare
 
@@ -449,30 +451,104 @@ def test_evaluate_hold_time_aware_uses_actual_bar_width_not_fixed_reference_inte
 
 def test_swing_points_time_aware_requires_a_real_bracket_not_just_calendar_room():
     # Real bug found against real AIFF backfilled data (specs.md section
-    # 17): window_seconds=30 is calibrated to LIVE 10s cadence, but
-    # backfilled bars are 60s apart -- narrower than their own spacing.
-    # A candidate's real-time "segment" then degenerates to just the
-    # candidate itself (no bar within 30s on EITHER side), which
-    # trivially "wins" as both the max AND the min of a one-element set --
-    # flagging nearly every backfilled bar as a swing point. A candidate
-    # must never be flagged unless the window genuinely brackets it with
-    # a real bar on both sides.
+    # 16): a fixed window narrower than local bar spacing (30s vs 60s
+    # backfill cadence) makes a candidate's real-time "segment" degenerate
+    # to just the candidate itself, which trivially "wins" as both the
+    # max AND the min of a one-element set. multiple=0.5 against 60s
+    # cadence reproduces exactly that: window = 0.5*60 = 30s, narrower
+    # than the bars' own 60s spacing. A candidate must never be flagged
+    # unless the window genuinely brackets it with a real bar on both
+    # sides.
     lows = [10, 9, 8, 7, 6, 5, 6, 7, 8, 9, 10]
     bars = _uniform_bars(lows, start_ts=0, step=60)  # 60s cadence, like real backfill
-    assert swing_points_time_aware(bars, window_seconds=30.0, kind="low") == []
-    assert swing_points_time_aware(bars, window_seconds=30.0, kind="high") == []
+    assert swing_points_time_aware(bars, kind="low", multiple=0.5) == []
+    assert swing_points_time_aware(bars, kind="high", multiple=0.5) == []
 
 
 def test_swing_points_time_aware_still_finds_real_swing_points_when_window_actually_brackets():
     # Sanity companion to the above: the fix must not make the function
-    # vacuously empty in general -- widen the window to genuinely bracket
-    # the 60s-cadence bars (matches the real AIFF live-cadence case,
-    # window=3 bars * 10s = 30s, scaled up here to 3 * 60s = 180s) and
-    # confirm the real V-shaped low is still found.
+    # vacuously empty in general. With the DEFAULT multiple=3.0, a
+    # candidate's own 60s width already produces a 180s window --
+    # cadence-adaptive by construction, no override needed -- wide enough
+    # to genuinely bracket 60s-cadence neighbors, and the real V-shaped
+    # low is still found.
     lows = [10, 9, 8, 7, 6, 5, 6, 7, 8, 9, 10]
     bars = _uniform_bars(lows, start_ts=0, step=60)
-    result = swing_points_time_aware(bars, window_seconds=180.0, kind="low")
+    result = swing_points_time_aware(bars, kind="low")
     assert result == [5]  # the single low point, index 5 (value 5)
+
+
+# -- Phase 3.6, cadence-adaptive swing_points_time_aware window (specs.md -
+# section 17). Replaces the single fixed window_seconds with
+# multiple * each candidate's own observed width (_bar_duration, reused
+# from the relative_volume fix, not a second width-detection primitive).
+
+def test_swing_points_time_aware_still_excludes_a_real_internal_gap_with_ordinary_local_width():
+    # Reconfirmation (specs.md section 16/17): a candidate whose own
+    # width is ORDINARY for its neighborhood (not itself inflated by
+    # sitting next to the gap) must still be unable to reach across a
+    # real internal gap. own width=60s -> window=180s, well short of the
+    # 360s gap (matches the real AIFF gap's magnitude).
+    bars = _uniform_bars([10, 9, 8, 7], start_ts=0, step=60)      # 0,60,120,180
+    bars.append(bar(540, 1, 1, 1, 6, 100))                          # 360s gap: 180 -> 540
+    bars += _uniform_bars([5, 4, 3, 2, 1], start_ts=600, step=60)   # 600,660,...,840
+    # candidate at ts=600 (index 4): own width=60 (ordinary), window=180.
+    # The nearest real bar on the "before" side is 540 (60s away, within
+    # 180s) -- NOT the far side of the gap (any bar <=180, which is
+    # >=420s away, outside 180s) -- so the gap is correctly never bridged.
+    i = 5
+    assert bars[i]["ts"] == 600
+    assert _bar_duration(bars, i, reference_interval_seconds=10.0) == 60
+    window = 3.0 * 60
+    seg = [b for b in bars if abs(b["ts"] - bars[i]["ts"]) <= window]
+    assert min(b["ts"] for b in seg) == 540  # never reaches back to 180 or earlier
+    assert 180 not in [b["ts"] for b in seg]
+
+
+def test_swing_points_time_aware_transition_boundary_own_width_can_exclude_a_real_neighbor():
+    # Real, explained edge case found against real AIFF data (specs.md
+    # section 17): the LAST backfilled bar sits 60s after its own
+    # predecessor but only 10s before the first live bar arrives. Its
+    # OWN computed width (_bar_duration's "gap to next bar" definition)
+    # is therefore 10s, not 60s, even though it represents a genuine
+    # 60-second backfilled candle -- multiple=3 gives it a 30s window,
+    # narrower than the 60s gap back to its own predecessor, so it can
+    # never be bracketed on the "before" side and is excluded from
+    # consideration entirely. Not a crash or a wrong verdict (real AIFF
+    # data: this bar wasn't a genuine extreme anyway -- see the report),
+    # but a real, narrow, honestly-documented consequence of scaling the
+    # window off "time until the NEXT bar" specifically.
+    bars = (_uniform_bars([1, 2, 3], start_ts=0, step=60)            # 0,60,120 (backfill lead-in)
+            + [bar(180, 1, 1, 1, 4, 100)]                              # 180: the transition bar
+            + _uniform_bars([5, 6, 7, 8], start_ts=190, step=10))      # 190,200,210,220 (live)
+    transition_idx = 3
+    assert bars[transition_idx]["ts"] == 180
+    own_width = _bar_duration(bars, transition_idx, reference_interval_seconds=10.0)
+    assert own_width == 10.0  # next bar (live) arrives only 10s later
+    gap_to_predecessor = bars[transition_idx]["ts"] - bars[transition_idx - 1]["ts"]
+    assert gap_to_predecessor == 60.0  # wider than the resulting 30s window
+    result_high = swing_points_time_aware(bars, kind="high", multiple=3.0,
+                                          reference_interval_seconds=10.0)
+    assert transition_idx not in result_high  # excluded: no real bar within 30s before it
+
+
+def test_swing_points_time_aware_uses_bar_duration_helper_not_a_second_primitive():
+    # multiple * an ARTIFICIALLY inflated per-candidate width must widen
+    # the effective window accordingly -- deliberately broken/restored
+    # standard, verifying the function genuinely calls _bar_duration per
+    # candidate rather than hardcoding reference_interval_seconds. 4
+    # bars, 25s apart (own width 25s for interior candidates); with
+    # multiple=3 the window is 75s, which brackets these deliberately
+    # WIDER-than-live-cadence bars -- a fixed reference_interval_seconds
+    # of 10s (multiple=3 -> 30s) would NOT bracket them (25s spacing
+    # needs at least one full step >= 25s within the window on each side,
+    # which a 30s window only barely allows while a mis-scaled one would
+    # miss for wider spacings).
+    lows = [10, 9, 8, 7, 6, 5, 6, 7, 8, 9, 10]
+    bars = _uniform_bars(lows, start_ts=0, step=40)  # 40s apart -- wider than 3*10s=30s
+    result = swing_points_time_aware(bars, kind="low", multiple=3.0,
+                                     reference_interval_seconds=10.0)
+    assert result == [5]  # correctly bracketed via the bars' OWN 40s width (window=120s)
 
 
 if __name__ == "__main__":
