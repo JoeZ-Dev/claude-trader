@@ -17,6 +17,7 @@ from app import (
     _closest_setup_html,
     _journal_closed_rows_html,
     _journal_open_html,
+    _market_backdrop_html,
     create_app,
 )
 
@@ -113,7 +114,8 @@ def _client(fetch, *, symbol="AEHL", announce=None, unwatch=None,
             announce_retry_attempts=5, announce_retry_base_delay=0.02,
             announce_retry_max_delay=0.02, journal_store=None,
             trail_pct=0.05, max_symbols=4, stream_events=None,
-            fetch_daily_bars=None):
+            fetch_daily_bars=None, fetch_market_backdrop=None,
+            market_backdrop_symbol="SPY", market_backdrop_refresh_seconds=180.0):
     app = create_app(fetch_bars=fetch, watch_symbol=symbol,
                      announce_watch=announce,
                      announce_unwatch=unwatch,
@@ -122,7 +124,10 @@ def _client(fetch, *, symbol="AEHL", announce=None, unwatch=None,
                      announce_retry_max_delay=announce_retry_max_delay,
                      journal_store=journal_store, trail_pct=trail_pct,
                      max_symbols=max_symbols, stream_events=stream_events,
-                     fetch_daily_bars=fetch_daily_bars)
+                     fetch_daily_bars=fetch_daily_bars,
+                     fetch_market_backdrop=fetch_market_backdrop,
+                     market_backdrop_symbol=market_backdrop_symbol,
+                     market_backdrop_refresh_seconds=market_backdrop_refresh_seconds)
     return TestClient(app)
 
 
@@ -136,7 +141,8 @@ def test_api_state_shape_has_symbols_recent_closed_poll_enabled_max_symbols():
     with _client(FakeFetch({"AEHL": [_bars(3)]})) as c:
         body = c.get("/api/state").json()
         assert set(body) == {"symbols", "recent_closed", "poll_enabled",
-                             "max_symbols", "strategy_params", "current_equity"}
+                             "max_symbols", "strategy_params", "current_equity",
+                             "market_backdrop"}
         assert isinstance(body["symbols"], dict)
         assert isinstance(body["recent_closed"], list)
         assert body["max_symbols"] == 4
@@ -1683,3 +1689,149 @@ def test_root_page_has_a_bulk_clear_symbol_switched_button():
         # silently failing. This status span is what the click handler
         # reports "cleared N rows" / "nothing to clear" into.
         assert "id=\"clear-status\"" in page
+
+
+# -- market backdrop, display only, specs.md section 23 --------------------
+# Global context (SPY's own day change), never wired into should_enter/
+# advance_journal/sizing. Reuses the daily-bars fetch mechanism (built for
+# the session volume gate / continuation flag) pointed at SPY, refreshed
+# on its own independent periodic cycle -- deliberately NOT a 5th
+# streaming-subscribed slot.
+
+def _spy_bars(prior_close=415.58, current_price=417.32, prior_ts=RTH - 86400, today_ts=RTH):
+    return [
+        {"ts": prior_ts, "open": 410.0, "high": 412.0, "low": 409.0,
+         "close": prior_close, "volume": 50_000_000.0, "is_extended": False},
+        {"ts": today_ts, "open": prior_close, "high": 418.0, "low": 415.0,
+         "close": current_price, "volume": 20_000_000.0, "is_extended": False},
+    ]
+
+
+def test_market_backdrop_html_unknown_before_first_fetch():
+    html_out = _market_backdrop_html({"status": "unknown", "symbol": "SPY"})
+    assert "unknown" in html_out
+    assert "market-backdrop" in html_out
+
+
+def test_market_backdrop_html_shows_pct_change_and_prices_when_ok():
+    backdrop = {"status": "ok", "symbol": "SPY", "current_price": 417.32,
+               "prior_close": 415.58, "pct_change": 0.004187, "as_of_ts": RTH}
+    html_out = _market_backdrop_html(backdrop)
+    assert "SPY" in html_out
+    assert "+0.42%" in html_out
+    assert "417.32" in html_out
+    assert "415.58" in html_out
+    assert "pos" in html_out  # positive-day coloring
+
+
+def test_market_backdrop_html_negative_day_uses_neg_class_and_sign():
+    backdrop = {"status": "ok", "symbol": "SPY", "current_price": 410.0,
+               "prior_close": 415.58, "pct_change": -0.01342, "as_of_ts": RTH}
+    html_out = _market_backdrop_html(backdrop)
+    assert "-1.34%" in html_out
+    assert "neg" in html_out
+    assert "+.34%" not in html_out  # no stray plus sign on a negative day
+
+
+def test_root_page_renders_market_backdrop_once_at_the_page_level_not_per_panel():
+    async def fetch_backdrop(symbol):
+        return _spy_bars()
+
+    fetch = FakeFetch({"AEHL": [_bars(3)], "S2": [_bars(3, base=20.0)]})
+    with _client(fetch, symbol="AEHL", max_symbols=4,
+                fetch_market_backdrop=fetch_backdrop) as c:
+        c.post("/api/watch", data={"symbol": "S2"})
+        assert _wait_until(lambda: all(
+            (_sym_state(c, s) or {}).get("status") == "ok" for s in ("AEHL", "S2")
+        ))
+        assert _wait_until(lambda: c.get("/api/state").json()["market_backdrop"]["status"] == "ok")
+        page = c.get("/").text
+        # exactly one page-level occurrence, not one per symbol card.
+        # Single-quoted id= is the Python-rendered server markup
+        # specifically (_market_backdrop_html) -- the embedded JS
+        # mirror's own source text contains the SAME id as a double-
+        # quoted string literal unconditionally, which would be a false
+        # positive here (same pitfall test_root_page_renders_closest_
+        # setup_and_chips_for_other_candidates already documents).
+        assert page.count("id='market-backdrop'") == 1
+        assert "Market backdrop: SPY" in page
+
+
+def test_market_backdrop_refreshes_on_its_own_periodic_cycle():
+    calls = []
+
+    async def fetch_backdrop(symbol):
+        calls.append(symbol)
+        return _spy_bars()
+
+    with _client(FakeFetch({"AEHL": [_bars(3)]}), fetch_market_backdrop=fetch_backdrop,
+                market_backdrop_symbol="SPY", market_backdrop_refresh_seconds=0.05) as c:
+        assert _wait_until(lambda: len(calls) >= 3, timeout=2.0)
+        assert all(sym == "SPY" for sym in calls)
+
+
+def test_market_backdrop_refresh_is_independent_of_watched_symbol_polling():
+    # No watched symbols at all -- the backdrop poll must still run, since
+    # it's an entirely separate mechanism from the 4-symbol streaming
+    # update path (specs.md section 23).
+    backdrop_calls = []
+
+    async def fetch_backdrop(symbol):
+        backdrop_calls.append(symbol)
+        return _spy_bars()
+
+    with _client(FakeFetch({}), symbol=None, fetch_market_backdrop=fetch_backdrop,
+                market_backdrop_refresh_seconds=0.05) as c:
+        assert _wait_until(lambda: len(backdrop_calls) >= 2, timeout=2.0)
+        assert c.get("/api/state").json()["symbols"] == {}
+
+
+def test_market_backdrop_stays_unknown_when_not_configured():
+    with _client(FakeFetch({"AEHL": [_bars(3)]})) as c:  # fetch_market_backdrop=None
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        assert c.get("/api/state").json()["market_backdrop"]["status"] == "unknown"
+
+
+def test_market_backdrop_stays_unknown_on_fetch_failure_not_a_crash():
+    async def failing_fetch(symbol):
+        raise RuntimeError("connector unreachable")
+
+    with _client(FakeFetch({"AEHL": [_bars(3)]}), fetch_market_backdrop=failing_fetch,
+                market_backdrop_refresh_seconds=0.05) as c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        # gave the (failing) loop a couple cycles -- still up, still unknown
+        time.sleep(0.15)
+        body = c.get("/api/state").json()
+        assert body["market_backdrop"]["status"] == "unknown"
+
+
+def test_market_backdrop_unknown_when_fetch_returns_fewer_than_two_bars():
+    async def one_bar_fetch(symbol):
+        return _spy_bars()[-1:]
+
+    with _client(FakeFetch({"AEHL": [_bars(3)]}), fetch_market_backdrop=one_bar_fetch,
+                market_backdrop_refresh_seconds=0.05) as c:
+        time.sleep(0.15)
+        assert c.get("/api/state").json()["market_backdrop"]["status"] == "unknown"
+
+
+def test_market_backdrop_never_influences_should_enter_or_advance_journal():
+    # Structural, not conventional (same standard this project has proven
+    # for every other display-only feature -- section 21's reference-
+    # target, section 22's breakdown setups): neither function has ANY
+    # market-backdrop-related parameter in its signature at all.
+    import inspect
+    from journal_logic import advance_journal, should_enter
+    assert "market_backdrop" not in inspect.signature(should_enter).parameters
+    assert "market_backdrop" not in inspect.signature(advance_journal).parameters
+
+
+def test_market_backdrop_symbol_is_configurable():
+    async def fetch_backdrop(symbol):
+        assert symbol == "QQQ"
+        return _spy_bars()
+
+    with _client(FakeFetch({"AEHL": [_bars(3)]}), fetch_market_backdrop=fetch_backdrop,
+                market_backdrop_symbol="QQQ", market_backdrop_refresh_seconds=0.05) as c:
+        assert _wait_until(lambda: c.get("/api/state").json()["market_backdrop"]["symbol"] == "QQQ")
+        assert _wait_until(lambda: c.get("/api/state").json()["market_backdrop"]["status"] == "ok")

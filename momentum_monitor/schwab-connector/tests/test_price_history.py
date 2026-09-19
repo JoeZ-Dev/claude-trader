@@ -200,3 +200,56 @@ def test_fetch_daily_history_raises_on_error_status():
 def test_fetch_daily_history_returns_empty_for_empty_candles():
     client = _FakeClient(_FakeResponse(200, {"candles": []}))
     assert asyncio.run(fetch_daily_history(client, "QCLS")) == []
+
+
+# -- include_today (specs.md section 23, market backdrop display) ---------
+# opposite need from every caller above: INCLUDE today's still-forming
+# daily candle instead of excluding it.
+
+def test_fetch_daily_history_include_today_false_still_ends_at_midnight():
+    # Default behavior is byte-for-byte unchanged -- every existing caller
+    # (session volume gate, continuation flag) depends on this.
+    resp = _FakeResponse(200, {"candles": []})
+    client = _FakeClient(resp)
+    now = datetime(2026, 9, 18, 12, 0, 0, tzinfo=_NY)
+
+    asyncio.run(fetch_daily_history(client, "SPY", now_fn=now.timestamp,
+                                    include_today=False))
+
+    _, kwargs = client.calls[0]
+    assert kwargs["end_datetime"] == datetime(2026, 9, 18, 0, 0, 0, tzinfo=_NY)
+
+
+def test_fetch_daily_history_include_today_true_ends_at_now():
+    resp = _FakeResponse(200, {"candles": []})
+    client = _FakeClient(resp)
+    now = datetime(2026, 9, 18, 12, 0, 0, tzinfo=_NY)
+
+    asyncio.run(fetch_daily_history(client, "SPY", now_fn=now.timestamp,
+                                    include_today=True))
+
+    _, kwargs = client.calls[0]
+    assert kwargs["end_datetime"] == now  # NOT midnight -- today's still-forming candle is in range
+
+
+def test_fetch_daily_history_include_today_returns_the_forming_candle():
+    # A still-forming "today" candle (close = current live price) alongside
+    # yesterday's completed close -- exactly what the market-backdrop
+    # display needs: current price vs. prior close, from the SAME fetch.
+    now = datetime(2026, 9, 18, 12, 0, 0, tzinfo=_NY)
+    today_ts = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    yesterday_ts = today_ts - 86400
+    candles = [
+        {"datetime": yesterday_ts * 1000, "open": 410.0, "high": 412.0,
+         "low": 409.0, "close": 415.58, "volume": 50_000_000},
+        {"datetime": today_ts * 1000, "open": 415.6, "high": 418.0,
+         "low": 415.0, "close": 417.32, "volume": 20_000_000},
+    ]
+    client = _FakeClient(_FakeResponse(200, {"candles": candles}))
+
+    bars = asyncio.run(fetch_daily_history(client, "SPY", lookback_days=2,
+                                           now_fn=now.timestamp, include_today=True))
+
+    assert len(bars) == 2
+    assert bars[0]["close"] == 415.58   # prior completed close
+    assert bars[1]["close"] == 417.32   # today's live/forming close

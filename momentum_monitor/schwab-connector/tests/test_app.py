@@ -399,8 +399,8 @@ def test_daily_bars_calls_the_fetcher_and_returns_its_bars(tmp_path):
     daily_bars = [_backfill_bar(RTH_1030 - 86400 * i, 9.0 + i) for i in range(5)]
     calls = []
 
-    async def daily_history_fetcher(symbol, *, lookback_days):
-        calls.append((symbol, lookback_days))
+    async def daily_history_fetcher(symbol, *, lookback_days, include_today):
+        calls.append((symbol, lookback_days, include_today))
         return daily_bars
 
     app, _ = _app(tmp_path, daily_history_fetcher=daily_history_fetcher)
@@ -410,13 +410,13 @@ def test_daily_bars_calls_the_fetcher_and_returns_its_bars(tmp_path):
         body = r.json()
         assert body["symbol"] == "AEHL"
         assert body["bars"] == daily_bars
-        assert calls == [("AEHL", 20)]
+        assert calls == [("AEHL", 20, False)]  # include_today defaults False
 
 
 def test_daily_bars_defaults_lookback_days_when_omitted(tmp_path):
     calls = []
 
-    async def daily_history_fetcher(symbol, *, lookback_days):
+    async def daily_history_fetcher(symbol, *, lookback_days, include_today):
         calls.append(lookback_days)
         return []
 
@@ -435,7 +435,7 @@ def test_daily_bars_returns_503_when_no_fetcher_configured(tmp_path):
 
 
 def test_daily_bars_returns_502_on_fetcher_failure_not_a_crash(tmp_path):
-    async def failing_fetcher(symbol, *, lookback_days):
+    async def failing_fetcher(symbol, *, lookback_days, include_today):
         raise RuntimeError("companion-auth unreachable")
 
     app, _ = _app(tmp_path, daily_history_fetcher=failing_fetcher)
@@ -443,6 +443,36 @@ def test_daily_bars_returns_502_on_fetcher_failure_not_a_crash(tmp_path):
         r = c.get("/daily_bars/AEHL")
         assert r.status_code == 502
         assert r.json()["bars"] == []
+
+
+# -- include_today (specs.md section 23, market backdrop display) ---------
+# forwards straight through to daily_history_fetcher; default False is the
+# byte-for-byte pre-existing behavior every other caller depends on.
+
+def test_daily_bars_forwards_include_today_true_when_requested(tmp_path):
+    calls = []
+
+    async def daily_history_fetcher(symbol, *, lookback_days, include_today):
+        calls.append(include_today)
+        return []
+
+    app, _ = _app(tmp_path, daily_history_fetcher=daily_history_fetcher)
+    with TestClient(app) as c:
+        c.get("/daily_bars/SPY", params={"lookback_days": 2, "include_today": "true"})
+        assert calls == [True]
+
+
+def test_daily_bars_include_today_defaults_false_when_omitted(tmp_path):
+    calls = []
+
+    async def daily_history_fetcher(symbol, *, lookback_days, include_today):
+        calls.append(include_today)
+        return []
+
+    app, _ = _app(tmp_path, daily_history_fetcher=daily_history_fetcher)
+    with TestClient(app) as c:
+        c.get("/daily_bars/AEHL")
+        assert calls == [False]
 
 
 # -- push (leg 1 of the poll -> push replacement, see specs.md) ----------

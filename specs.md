@@ -1214,8 +1214,10 @@ about a trade or what the strategy itself accounts for, not yet closed.
   never built until now — an informational flag, deliberately never a
   gate, reusing the daily-bars data section 12's volume gate already
   fetches rather than a second historical pull.
-- Market backdrop (broad-market direction that day) — no data pipeline
-  exists for this at all yet.
+- ~~Market backdrop (broad-market direction that day).~~ **Built
+  2026-09-19 — see section 23.** SPY's day change, global informational
+  display, deliberately NOT wired into sizing (a real, explicitly
+  deferred decision, not an oversight — see that section).
 - Human review/labeling — no way to mark a trade as "real signal" vs.
   "worked by chance" after the fact.
 
@@ -3373,7 +3375,137 @@ app stack (`create_app` + `TestClient`, real bars, no hand-built state):
 the actual served page, distinct from the "Closest setup" callout showing
 the bullish `round_number_reclaim` candidate.
 
-### 23. Roadmap / phases
+### 23. Market backdrop — informational display only, no sizing tie-in
+
+**The gap, closed 2026-09-19.** Section 7's last remaining data-collection
+gap: "no data pipeline exists for [broad-market direction that day] at
+all yet." Shows SPY's own day change (current price vs. prior close) as
+global context for reading a candidate's move against the broader tape.
+
+**Design: display only, deliberately not wired to sizing — a real
+decision, not an oversight.** The original framing that motivated this
+feature was "sizing down on a red day is rational, but not a reason to
+dismiss a strong signal" — a genuine trading judgment call, not something
+to silently bake into `risk_pct_per_trade` or any entry gate. Built as
+pure context: `should_enter`/`advance_journal`/`apply_bar_to_open_position`
+have NO market-backdrop-related parameter in their signatures at all —
+confirmed directly (`inspect.signature`, not just code-reading), and the
+full pre-existing `test_journal_logic.py`/`test_journal_wiring.py` suites
+pass completely unmodified (zero-diff on `journal_logic.py` and both test
+files, confirmed via `git diff --stat`) — same "prove it's display-only"
+standard as section 21's reference-target feature. **If an automatic
+sizing tie-in is ever wanted later, that is a separate, explicit decision
+this section deliberately leaves open** — same standing-open-question
+treatment as the portfolio-risk-cap question in section 7's own backlog.
+
+**Data: reuses the existing daily-bars mechanism, pointed at SPY, not a
+new pipeline.** Section 12/13's `/daily_bars/{symbol}` route (schwab-
+connector) and `fetch_daily_history` (`price_history.py`) already fetch
+daily candles for the session-volume gate and continuation flag — but
+that existing call deliberately excludes today (`end_datetime` is
+today's own NY midnight) so a still-forming session never drags the
+volume average down, which meant it structurally couldn't answer "what's
+SPY doing right now." Extended `fetch_daily_history` with one new
+parameter, `include_today: bool = False` — default False is byte-for-
+byte the pre-existing behavior every other caller (volume gate,
+continuation flag) already depends on, confirmed by tests asserting
+`end_datetime` is unchanged when omitted. When True, `end_datetime`
+becomes `now`, so the still-forming CURRENT day's daily candle comes back
+too, whose `close` is Schwab's continuously-updating last-traded price
+for the session so far — exactly "current price," from the SAME
+mechanism, not a new one. The route (`GET /daily_bars/{symbol}
+?lookback_days=2&include_today=true`) forwards this straight through.
+monitor-app's `fetch_market_backdrop(symbol)` calls this route with
+`lookback_days=2`, giving exactly two candles: index `-2` (the prior
+COMPLETED day's close) and index `-1` (today's forming close) —
+`pct_change = (current_price - prior_close) / prior_close`.
+
+**Honest caveat, not verified live against real Schwab in this session.**
+Sections 10/12/13's own daily-bars call sites were previously verified
+live against production Schwab data (section 4's real NVDA backfill).
+This session has no real Schwab credentials available (same dev-
+environment limitation sections 12/13 already documented), so the
+assumption that Schwab's daily-candle endpoint returns a live-updating
+"today" candle when the date range is extended to include it — standard
+behavior for daily OHLC data mid-session, but not something this session
+directly confirmed against the real API — is flagged here explicitly
+rather than silently treated as proven. Everything downstream of that
+API response (the `include_today` parameter's own date-range behavior,
+the route's pass-through, the pct_change math, the refresh loop, and the
+display) IS verified, live, in this session (below).
+
+**Global, not per-symbol.** `Poller._market_backdrop` is a single dict on
+the Poller itself, entirely separate from any `_SymbolSlot` — SPY is
+never added to `_slots`, never counted against `MAX_SYMBOLS`, never
+subscribed to schwab-connector's live tick stream. `GET /api/state`
+exposes it as a new top-level `market_backdrop` key, sibling to
+`symbols`/`current_equity`/`strategy_params`, not nested under any
+symbol.
+
+**Refresh: its own independent periodic REST poll, not a 5th streaming
+slot.** `Poller.run_market_backdrop_loop()` is a separate `asyncio` task
+(started in `create_app`'s lifespan alongside, but independent of, the
+per-symbol push/stream tasks): fetches immediately on start, then every
+`market_backdrop_refresh_seconds` (default 180 — a few minutes; this
+context doesn't need sub-second freshness the way a watched candidate
+does). A failed fetch, or a fetch returning fewer than 2 bars, leaves
+`status: "unknown"` rather than crashing the loop, holding a stale value,
+or showing a fabricated 0% — same "unknown, not silently zero" treatment
+`avg_daily_volume`/the continuation flag already use. No-ops forever if
+`fetch_market_backdrop` was never configured (same optional-dependency
+pattern as `fetch_daily_bars`).
+
+**Display.** A single line (`id="market-backdrop"`) rendered once at the
+page level, above the current-equity/strategy-params lines, near the
+watch-form's own "N/4 symbols watched" line — never duplicated inside
+any of the up-to-4 symbol panels. "Market backdrop: SPY +0.42% (417.32,
+prior close 415.58)" when known, colored `pos`/`neg` by sign (reusing
+`_sign_class`, the same helper the MACD histogram and P&L cells already
+use); "Market backdrop (SPY): unknown (not yet fetched)" when not. Both
+the Python renderer (`_market_backdrop_html`) and its JS mirror
+(`marketBackdropHtml`) patched via `outerHTML` (not `innerHTML`, since
+the element's own CSS class changes between the two states) on every
+push, same dual-rendering discipline as every other display feature this
+project has built.
+
+**Tests:** 8 new schwab-connector tests (`include_today`'s date-range
+behavior and default-False preservation in `price_history.py`, the
+route's pass-through and default in `app.py`). 12 new monitor-app tests:
+`_market_backdrop_html`'s unknown/positive/negative-day rendering; the
+page-level-once-not-per-panel proof (guarding against the same "matches
+the JS mirror's own source text" false positive
+`test_root_page_renders_closest_setup_and_chips_for_other_candidates`
+already documented, by asserting on the single-quoted Python-rendered
+attribute specifically); the periodic-refresh-cadence proof (a 0.05s
+test interval, asserting 3+ fetches land); the refresh-runs-with-zero-
+watched-symbols proof (this poll is not driven by, or dependent on, any
+watched symbol); the not-configured and fetch-failure paths staying
+`"unknown"` rather than crashing; the too-few-bars-returned path; the
+configurable-symbol proof; and the `inspect.signature` structural proof
+that `should_enter`/`advance_journal` have no market-backdrop parameter.
+Full project suite: 498 tests passing (`core` 71, `schwab-connector`
+112, `monitor-app` 315).
+
+**Verified live (2026-09-19), against the real FastAPI app (`create_app`
++ `TestClient`), using realistic representative data — real epoch-second
+timestamps converted from real 2026-09-17/2026-09-18 America/New_York
+dates (not a loop index, learned the hard way in section 13), real
+SPY-scale prices ($415.58 prior close, $417.32 current).** `GET
+/api/state`'s `market_backdrop` showed `{"status": "ok", "symbol": "SPY",
+"current_price": 417.32, "prior_close": 415.58, "pct_change": 0.004187,
+"as_of_ts": 1789738200}` — `pct_change` independently hand-computed as
+`(417.32 - 415.58) / 415.58 = 0.0041869...` rounds to the exact same
+`0.004187`, and `as_of_ts` converted back to `2026-09-18 09:30:00
+America/New_York`, the exact date used. The rendered page showed `Market
+backdrop: SPY +0.42% (417.32, prior close 415.58)`, positive-day styled.
+With `market_backdrop_refresh_seconds=0.3` and zero symbols watched at
+all, 4 real fetch calls landed over 1.2 real seconds with measured
+intervals of `0.301s` each — matching the configured cadence to the
+millisecond and confirming the poll runs independently of, and is not
+gated by, any watched symbol. `git diff --stat` on `journal_logic.py` and
+both its test files showed zero changes for this entire feature.
+
+### 24. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,

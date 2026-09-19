@@ -110,7 +110,7 @@ async def fetch_today_bars(client, symbol: str, *, now_fn=time.time) -> list[dic
 
 
 async def fetch_daily_history(client, symbol: str, *, lookback_days: int = 30,
-                              now_fn=time.time) -> list[dict]:
+                              now_fn=time.time, include_today: bool = False) -> list[dict]:
     """Fetch up to `lookback_days` of DAILY candles for the session-level
     volume gate's "typical daily volume" baseline (specs.md section 12) --
     a longer, coarser lookback distinct from fetch_today_bars' same-day
@@ -120,20 +120,30 @@ async def fetch_daily_history(client, symbol: str, *, lookback_days: int = 30,
     Same explicit start_datetime/end_datetime discipline as
     fetch_today_bars, for the same reason (see that function's docstring
     on why period_type=DAY silently returns the wrong range) --
-    end_datetime is today's own NY midnight, EXCLUSIVE of today, so a
-    still-forming partial session never drags the average down.
-    start_datetime requests a calendar window generously larger than
-    `lookback_days` (weekends/holidays mean calendar days always
+    end_datetime is today's own NY midnight, EXCLUSIVE of today by
+    default, so a still-forming partial session never drags the average
+    down. start_datetime requests a calendar window generously larger
+    than `lookback_days` (weekends/holidays mean calendar days always
     outnumber trading days) -- 2x plus a 10-day pad is comfortable
     without over-fetching. Returns at most the `lookback_days` MOST
     RECENT candles actually returned, oldest-first (candles_to_bars'
     own sort order) -- a symbol with less than `lookback_days` of real
     trading history simply returns fewer, never padded or invented.
 
+    `include_today` (specs.md section 23, market backdrop display) --
+    when True, end_datetime is `now` instead of today's midnight, so the
+    still-forming CURRENT day's daily candle is included too, with its
+    `close` being Schwab's continuously-updating last-traded price for
+    the session so far. This is the opposite need from every existing
+    caller above (which deliberately excludes today to keep the average
+    honest) -- built for a caller that wants exactly one thing: today's
+    live price compared against the prior COMPLETED day's close. Default
+    False preserves every existing caller's behavior byte-for-byte.
+
     Raises on any non-2xx response or network failure, same as
     fetch_today_bars -- callers decide whether that's fatal."""
     now = datetime.fromtimestamp(now_fn(), _NY)
-    end = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = now if include_today else now.replace(hour=0, minute=0, second=0, microsecond=0)
     start = end - timedelta(days=lookback_days * 2 + 10)
     resp = await client.get_price_history(
         symbol,

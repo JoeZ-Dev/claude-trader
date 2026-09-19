@@ -324,7 +324,8 @@ def create_app(*, store: BarStore, source_factory, replay: bool,
         return connector.bars(symbol, since_ts)
 
     @app.get("/daily_bars/{symbol}")
-    async def get_daily_bars(symbol: str, lookback_days: int = 30):
+    async def get_daily_bars(symbol: str, lookback_days: int = 30,
+                             include_today: bool = False):
         """On-demand REST pass-through for the session-level volume
         gate's "typical daily volume" baseline (specs.md section 12) --
         deliberately NOT tied to the watch/backfill lifecycle above (no
@@ -332,10 +333,18 @@ def create_app(*, store: BarStore, source_factory, replay: bool,
         once per symbol per watch and caches the result itself, so this
         route stays a thin fetch-and-serve proxy, same division of
         labor as GET /bars/{symbol}. `daily_history_fetcher` is an
-        `async def (symbol, *, lookback_days) -> list[dict]` (see
-        price_history.fetch_daily_history); unconfigured (None) returns
-        503, and a fetch failure returns 502 -- either way, never a
-        silent crash the caller has to guess about."""
+        `async def (symbol, *, lookback_days, include_today) -> list[dict]`
+        (see price_history.fetch_daily_history); unconfigured (None)
+        returns 503, and a fetch failure returns 502 -- either way, never
+        a silent crash the caller has to guess about.
+
+        `include_today` (specs.md section 23, market backdrop display) --
+        forwarded straight through to `daily_history_fetcher`; default
+        False is byte-for-byte the pre-existing behavior every other
+        caller (session volume gate, continuation flag) already depends
+        on. monitor-app's market-backdrop poll is the one caller that
+        passes True, reusing this SAME route/fetcher rather than adding a
+        second daily-bars pipeline."""
         if daily_history_fetcher is None:
             return JSONResponse(
                 {"symbol": symbol, "bars": [],
@@ -343,7 +352,8 @@ def create_app(*, store: BarStore, source_factory, replay: bool,
                 status_code=503,
             )
         try:
-            bars = await daily_history_fetcher(symbol, lookback_days=lookback_days)
+            bars = await daily_history_fetcher(symbol, lookback_days=lookback_days,
+                                               include_today=include_today)
         except Exception as exc:
             return JSONResponse(
                 {"symbol": symbol, "bars": [], "error": str(exc)},

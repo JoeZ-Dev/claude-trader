@@ -93,20 +93,25 @@ else:
         client = _build_client(token_source.as_schwab_token())
         return await fetch_today_bars(client, symbol)
 
-    async def _daily_history_fetcher(symbol: str, *, lookback_days: int):
+    async def _daily_history_fetcher(symbol: str, *, lookback_days: int,
+                                     include_today: bool = False):
         # Same one-shot token+client pattern as _history_fetcher above --
         # a separate closure (not a shared helper) because the two exist
         # for genuinely different callers (automatic backfill-on-watch vs.
         # monitor-app's on-demand GET /daily_bars/{symbol}) at different
         # points in the symbol lifecycle; collapsing them would couple two
         # things that only coincidentally share a few lines of auth setup.
+        # `include_today` (specs.md section 23) just forwards through to
+        # fetch_daily_history -- monitor-app's market-backdrop poll is the
+        # one caller that passes True.
         if not AUTH_HELPER_URL:
             raise RuntimeError(
                 "AUTH_HELPER_URL is not set; cannot reach companion-auth for a token")
         token_source = AccessTokenSource(AUTH_HELPER_URL, shared_secret=INTERNAL_AUTH_SECRET)
         await token_source.refresh_async()
         client = _build_client(token_source.as_schwab_token())
-        return await fetch_daily_history(client, symbol, lookback_days=lookback_days)
+        return await fetch_daily_history(client, symbol, lookback_days=lookback_days,
+                                         include_today=include_today)
 
 app = create_app(store=_store, source_factory=_source_factory, replay=_replay,
                  history_fetcher=_history_fetcher,

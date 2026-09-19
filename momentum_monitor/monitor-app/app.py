@@ -224,6 +224,15 @@ DAILY_VOLUME_LOOKBACK_DAYS = 30
 # DEFAULT_* constant here.
 DEFAULT_CONTINUATION_LOOKBACK_DAYS = 7
 DEFAULT_CONTINUATION_THRESHOLD_PCT = 0.5
+# Market backdrop (specs.md section 23) -- global, informational-only
+# display of broad-market direction (SPY's own day change), never wired
+# into should_enter/advance_journal or any sizing calculation. A separate
+# periodic REST poll, deliberately NOT a 5th streaming-subscribed slot
+# (that would violate MAX_SYMBOLS below and add unneeded complexity for
+# something that only needs a reasonably fresh daily change, not
+# sub-second freshness).
+DEFAULT_MARKET_BACKDROP_SYMBOL = "SPY"
+DEFAULT_MARKET_BACKDROP_REFRESH_SECONDS = 180.0
 MAX_SYMBOLS = 4
 
 # Real ticker symbols are short and plain (letters/digits, occasionally a
@@ -310,9 +319,24 @@ class Poller:
                  confirmation_freshness_seconds=DEFAULT_CONFIRMATION_FRESHNESS_SECONDS,
                  target_reference_pct=DEFAULT_TARGET_REFERENCE_PCT,
                  fetch_daily_bars=None,
+                 fetch_market_backdrop=None,
+                 market_backdrop_symbol=DEFAULT_MARKET_BACKDROP_SYMBOL,
+                 market_backdrop_refresh_seconds=DEFAULT_MARKET_BACKDROP_REFRESH_SECONDS,
                  now_fn=time.time, max_symbols=MAX_SYMBOLS):
         self._fetch_bars = fetch_bars
         self._fetch_daily_bars = fetch_daily_bars
+        self._fetch_market_backdrop = fetch_market_backdrop
+        self._market_backdrop_symbol = market_backdrop_symbol
+        self._market_backdrop_refresh_seconds = market_backdrop_refresh_seconds
+        # Global, not per-symbol (specs.md section 23) -- "unknown" until
+        # the first refresh completes, same "unknown, not silently zero"
+        # meaning avg_daily_volume/continuation already use elsewhere in
+        # this file.
+        self._market_backdrop: dict = {
+            "status": "unknown", "symbol": market_backdrop_symbol,
+            "current_price": None, "prior_close": None,
+            "pct_change": None, "as_of_ts": None,
+        }
         self._initial_symbol = watch_symbol.upper() if watch_symbol else None
         self._announce_watch = announce_watch
         self._announce_unwatch = announce_unwatch
@@ -426,6 +450,73 @@ class Poller:
             "lookback_days_used": int(lookback_days),
             "threshold_pct_used": threshold_pct,
         }
+
+    def market_backdrop(self) -> dict:
+        """Broad-market direction for the day (specs.md section 23) --
+        global context, not scoped to any watched symbol. {"status":
+        "unknown"|"ok", "symbol", "current_price", "prior_close",
+        "pct_change", "as_of_ts"}. "unknown" (never a fake 0% or stale
+        cached value) until the first successful refresh, same "unknown,
+        not silently zero" treatment as avg_daily_volume/continuation
+        elsewhere in this file. Purely informational: never read by
+        should_enter/advance_journal/apply_bar_to_open_position anywhere
+        -- those functions have no market-backdrop-related parameter at
+        all, the same structural (not conventional) guarantee this
+        project has proven for every other display-only feature."""
+        return dict(self._market_backdrop)
+
+    async def refresh_market_backdrop(self) -> None:
+        """Fetches and recomputes the market backdrop, then broadcasts
+        the new state immediately (specs.md section 23) -- called on its
+        own periodic cycle by run_market_backdrop_loop, entirely
+        independent of the 4 watched symbols' push-driven updates. A
+        failed or short (<2 bars) fetch leaves status "unknown" rather
+        than crashing the loop or showing a stale/fabricated value --
+        same non-fatal-fetch precedent as add_symbol's own daily-bars
+        fetch."""
+        if self._fetch_market_backdrop is None:
+            return
+        try:
+            bars = await self._fetch_market_backdrop(self._market_backdrop_symbol)
+        except Exception as exc:
+            logger.warning(
+                "market-backdrop fetch failed for %s; leaving it unknown: %s",
+                self._market_backdrop_symbol, exc,
+            )
+            bars = []
+        if len(bars) < 2:
+            self._market_backdrop = {
+                "status": "unknown", "symbol": self._market_backdrop_symbol,
+                "current_price": None, "prior_close": None,
+                "pct_change": None, "as_of_ts": None,
+            }
+        else:
+            prior_close = bars[-2]["close"]
+            current_price = bars[-1]["close"]
+            pct_change = (current_price - prior_close) / prior_close
+            self._market_backdrop = {
+                "status": "ok", "symbol": self._market_backdrop_symbol,
+                "current_price": round(current_price, 4),
+                "prior_close": round(prior_close, 4),
+                "pct_change": round(pct_change, 6),
+                "as_of_ts": bars[-1]["ts"],
+            }
+        self._broadcast_state()
+
+    async def run_market_backdrop_loop(self) -> None:
+        """Independent periodic REST poll (specs.md section 23) -- NOT
+        tied to the 4 watched symbols' streaming push updates, and not a
+        5th streaming-subscribed slot (would violate max_symbols and add
+        unneeded complexity for something that only needs a reasonably
+        fresh daily change). Refreshes immediately on start (so data is
+        available as soon as possible after startup, not stale/empty for
+        a full interval), then every market_backdrop_refresh_seconds.
+        No-ops forever if fetch_market_backdrop was never configured."""
+        if self._fetch_market_backdrop is None:
+            return
+        while True:
+            await self.refresh_market_backdrop()
+            await asyncio.sleep(self._market_backdrop_refresh_seconds)
 
     def reverse_splits_for(self, symbol: str) -> list[dict]:
         """Every recorded reverse split for `symbol`, most recent first --
@@ -905,6 +996,7 @@ class Poller:
             "max_symbols": self.max_symbols,
             "strategy_params": self.strategy_params(),
             "current_equity": self.current_equity(),
+            "market_backdrop": self.market_backdrop(),
         }
 
     def _broadcast_state(self) -> None:
@@ -1564,15 +1656,44 @@ def _current_equity_html(value: float) -> str:
     return f"<p id='current-equity'><strong>Current equity: {_fmt_dollars(value)}</strong></p>"
 
 
+def _market_backdrop_html(backdrop: dict) -> str:
+    """Broad-market direction for the day (specs.md section 23) -- GLOBAL
+    context, rendered once at the page level (alongside the slot-count
+    line), never duplicated per-panel. id="market-backdrop" so render()
+    can refresh it in place on every push/periodic refresh, same pattern
+    as current-equity/strategy-params. "unknown" (not yet fetched, or the
+    last fetch failed) is shown plainly rather than a fake 0% or a blank
+    line, same "unknown must never look like a real answer" precedent as
+    the continuation flag."""
+    symbol = html.escape(backdrop.get("symbol") or "")
+    if backdrop.get("status") != "ok":
+        return (f"<p id='market-backdrop' class='muted'>"
+                f"Market backdrop ({symbol}): unknown (not yet fetched)</p>")
+    pct = backdrop["pct_change"] * 100.0
+    cls = _sign_class(backdrop["pct_change"])
+    sign = "+" if pct >= 0 else ""
+    return (
+        f"<p id='market-backdrop'>Market backdrop: {symbol} "
+        f"<span class='{cls}'>{sign}{pct:.2f}%</span> "
+        f"({_fmt(backdrop['current_price'], 2)}, prior close "
+        f"{_fmt(backdrop['prior_close'], 2)})</p>"
+    )
+
+
 def _page(full_states: dict[str, dict], recent_closed: list[dict], poll_enabled: bool,
-          max_symbols: int, strategy_params: dict, current_equity: float) -> str:
+          max_symbols: int, strategy_params: dict, current_equity: float,
+          market_backdrop: dict | None = None) -> str:
     if full_states:
         cards_html = "".join(_symbol_card_html(sym, st) for sym, st in full_states.items())
     else:
         cards_html = ("<p class='muted'>No symbols watched yet — add one below "
                       f"(up to {max_symbols}).</p>")
 
+    backdrop_html = _market_backdrop_html(
+        market_backdrop or {"status": "unknown", "symbol": DEFAULT_MARKET_BACKDROP_SYMBOL})
+
     body = f"""
+{backdrop_html}
 {_current_equity_html(current_equity)}
 <p id="strategy-params" class="muted">{_strategy_params_html(strategy_params)}</p>
 {_watch_form_html(len(full_states), max_symbols)}
@@ -1960,6 +2081,10 @@ function render(data) {
   if (equityEl && data.current_equity !== undefined) {
     equityEl.innerHTML = '<strong>Current equity: ' + fmtDollars(data.current_equity) + '</strong>';
   }
+  const backdropEl = document.getElementById('market-backdrop');
+  if (backdropEl && data.market_backdrop) {
+    backdropEl.outerHTML = marketBackdropHtml(data.market_backdrop);
+  }
 }
 
 // Mirrors _strategy_params_html (Python side) -- read-only display, kept
@@ -1970,6 +2095,22 @@ function strategyParamsText(params) {
     const when = p.updated_at ? fmtTs(p.updated_at) : 'seed default';
     return key + '=' + fmt(p.value, 4) + ' (since ' + when + ')';
   }).join(' \\u00b7 ');
+}
+
+// Mirrors _market_backdrop_html (Python side) -- GLOBAL context (specs.md
+// section 23), rendered once at the page level, never per-panel.
+function marketBackdropHtml(backdrop) {
+  const symbol = esc(backdrop.symbol || '');
+  if (backdrop.status !== 'ok') {
+    return '<p id="market-backdrop" class="muted">Market backdrop (' + symbol +
+      '): unknown (not yet fetched)</p>';
+  }
+  const pct = backdrop.pct_change * 100;
+  const cls = signClass(backdrop.pct_change);
+  const sign = pct >= 0 ? '+' : '';
+  return '<p id="market-backdrop">Market backdrop: ' + symbol + ' <span class="' + cls + '">' +
+    sign + pct.toFixed(2) + '%</span> (' + fmt(backdrop.current_price, 2) +
+    ', prior close ' + fmt(backdrop.prior_close, 2) + ')</p>';
 }
 
 // Thin wrapper kept for the explicit post-action call sites below
@@ -2243,6 +2384,7 @@ table.detail th{color:var(--muted);font-weight:500;width:45%}
 .zero-size-flag{color:var(--pending);font-weight:600;font-size:.72rem}
 .continuation-flag{font-size:.82rem;margin:.15rem 0}
 .continuation-flag-active{color:var(--pending);font-weight:600}
+#market-backdrop{font-size:1rem;margin:0 0 .4rem}
 #current-equity{font-size:1.1rem;margin:0 0 .5rem}
 .badge{display:inline-block;padding:.1rem .5rem;border-radius:1rem;
   font-size:.72rem;font-weight:600}
@@ -2296,6 +2438,9 @@ def create_app(*, fetch_bars, watch_symbol=None,
                confirmation_freshness_seconds=DEFAULT_CONFIRMATION_FRESHNESS_SECONDS,
                target_reference_pct=DEFAULT_TARGET_REFERENCE_PCT,
                fetch_daily_bars=None,
+               fetch_market_backdrop=None,
+               market_backdrop_symbol=DEFAULT_MARKET_BACKDROP_SYMBOL,
+               market_backdrop_refresh_seconds=DEFAULT_MARKET_BACKDROP_REFRESH_SECONDS,
                now_fn=time.time, max_symbols=MAX_SYMBOLS) -> FastAPI:
     poller = Poller(fetch_bars=fetch_bars, watch_symbol=watch_symbol,
                     announce_watch=announce_watch,
@@ -2314,6 +2459,9 @@ def create_app(*, fetch_bars, watch_symbol=None,
                     confirmation_freshness_seconds=confirmation_freshness_seconds,
                     target_reference_pct=target_reference_pct,
                     fetch_daily_bars=fetch_daily_bars,
+                    fetch_market_backdrop=fetch_market_backdrop,
+                    market_backdrop_symbol=market_backdrop_symbol,
+                    market_backdrop_refresh_seconds=market_backdrop_refresh_seconds,
                     now_fn=now_fn, max_symbols=max_symbols)
 
     @asynccontextmanager
@@ -2328,10 +2476,16 @@ def create_app(*, fetch_bars, watch_symbol=None,
         if stream_events is not None:
             stream_task = asyncio.create_task(
                 stream_events(poller.apply_bar_push, poller.resync_all))
+        # Market backdrop (specs.md section 23) -- its own independent
+        # periodic task, entirely separate from the push-driven per-symbol
+        # updates above; no-ops forever if fetch_market_backdrop was never
+        # configured, so this task is harmless to always start.
+        backdrop_task = asyncio.create_task(poller.run_market_backdrop_loop())
         yield
         run_task.cancel()
         if stream_task is not None:
             stream_task.cancel()
+        backdrop_task.cancel()
 
     app = FastAPI(title="monitor-app", lifespan=lifespan)
     app.state.poller = poller
@@ -2364,7 +2518,7 @@ def create_app(*, fetch_bars, watch_symbol=None,
     async def root():
         return _page(poller.all_full_states(), poller.recent_closed(limit=10),
                     poller.poll_enabled, poller.max_symbols, poller.strategy_params(),
-                    poller.current_equity())
+                    poller.current_equity(), poller.market_backdrop())
 
     @app.post("/api/watch")
     async def api_watch(request: Request):

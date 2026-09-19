@@ -68,6 +68,17 @@ Environment:
                         trailing stop -- never an exit trigger (specs.md
                         section 21) -- same seed-only treatment
                                                               (default 0.10)
+  MARKET_BACKDROP_SYMBOL  broad-market symbol whose day change is shown as
+                        global, informational-only context (specs.md
+                        section 23) -- never wired into should_enter/
+                        advance_journal/sizing, and NOT a seed-only value
+                        (no strategy_params row; it's a plain runtime
+                        setting, not a live-tunable strategy threshold)
+                                                              (default SPY)
+  MARKET_BACKDROP_REFRESH_SECONDS  how often the market-backdrop poll
+                        re-fetches -- its own independent periodic REST
+                        poll, not tied to the 4 watched symbols' push
+                        updates                              (default 180)
 
 Run:  uvicorn main:app --host 0.0.0.0 --port 8012
 """
@@ -100,6 +111,8 @@ CONTINUATION_LOOKBACK_DAYS = float(os.environ.get("CONTINUATION_LOOKBACK_DAYS", 
 CONTINUATION_THRESHOLD_PCT = float(os.environ.get("CONTINUATION_THRESHOLD_PCT", "0.5"))
 CONFIRMATION_FRESHNESS_SECONDS = float(os.environ.get("CONFIRMATION_FRESHNESS_SECONDS", "30"))
 TARGET_REFERENCE_PCT = float(os.environ.get("TARGET_REFERENCE_PCT", "0.10"))
+MARKET_BACKDROP_SYMBOL = os.environ.get("MARKET_BACKDROP_SYMBOL", "SPY")
+MARKET_BACKDROP_REFRESH_SECONDS = float(os.environ.get("MARKET_BACKDROP_REFRESH_SECONDS", "180"))
 
 _client = httpx.AsyncClient(timeout=10.0)
 _journal_store = JournalStore(JOURNAL_DB_PATH, default_params={
@@ -141,6 +154,22 @@ async def fetch_daily_bars(symbol: str):
     # propagates (add_symbol catches it, logs, and leaves avg_daily_
     # volume None -- skip the gate for that symbol, never a crash).
     r = await _client.get(f"{CONNECTOR_URL}/daily_bars/{symbol}")
+    r.raise_for_status()
+    return r.json().get("bars", [])
+
+
+async def fetch_market_backdrop(symbol: str):
+    # Market backdrop display (specs.md section 23) -- reuses this SAME
+    # /daily_bars route (built for the volume gate above), just with
+    # include_today=true so the still-forming current day's candle (whose
+    # close is Schwab's live-updating current price) comes back alongside
+    # the prior COMPLETED day's close. Called on its own periodic cycle
+    # (Poller.run_market_backdrop_loop), never per-bar. A non-2xx or
+    # network failure propagates -- refresh_market_backdrop catches it,
+    # logs, and leaves the backdrop "unknown" rather than crashing the
+    # loop or showing a stale value.
+    r = await _client.get(f"{CONNECTOR_URL}/daily_bars/{symbol}",
+                          params={"lookback_days": 2, "include_today": "true"})
     r.raise_for_status()
     return r.json().get("bars", [])
 
@@ -195,4 +224,7 @@ app = create_app(fetch_bars=fetch_bars, watch_symbol=WATCH_SYMBOL,
                  continuation_threshold_pct=CONTINUATION_THRESHOLD_PCT,
                  confirmation_freshness_seconds=CONFIRMATION_FRESHNESS_SECONDS,
                  target_reference_pct=TARGET_REFERENCE_PCT,
-                 fetch_daily_bars=fetch_daily_bars)
+                 fetch_daily_bars=fetch_daily_bars,
+                 fetch_market_backdrop=fetch_market_backdrop,
+                 market_backdrop_symbol=MARKET_BACKDROP_SYMBOL,
+                 market_backdrop_refresh_seconds=MARKET_BACKDROP_REFRESH_SECONDS)
