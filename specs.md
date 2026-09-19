@@ -2134,7 +2134,183 @@ live, direct proof that continuation status never affects entry
 behavior, not merely that `should_enter`'s signature has no parameter
 for it.
 
-### 14. Roadmap / phases
+### 14. Time-aware core functions — phase 3.6, stage 1 (equivalence only)
+
+Motivated by section 3's "Backfill vs. live bar width" and roadmap item
+3.6 below: `ema`/`relative_volume`/`evaluate_hold`/`detect_levels`'s
+swing-point window all currently decay/compare/require by BAR COUNT, an
+assumption that only holds while every bar is the same width. Live bars
+are exactly 10s apart (`schwab-connector`'s aggregator, `BUCKET_SECONDS
+= 10`); backfilled/daily bars are coarser and irregular, and even the
+backfilled portion has its own internal gaps (Schwab skips zero-volume
+minutes). `state.py`'s `live_cadence_tail` stopgap works around this
+today by excluding backfilled bars from these functions entirely, rather
+than weighting them correctly.
+
+**Stage 1's entire job, and nothing more:** build new, distinctly-named,
+purely additive time-aware functions in `core/` and prove they behave
+EXACTLY like the existing bar-count functions on real uniform-cadence
+data. No existing call site (`journal_logic.py`, `setup_types.py`,
+`state.py`) is touched — the old functions keep running unchanged, the
+new ones exist alongside them, untouched by anything currently live.
+Stage 2 (proving the new functions are actually BETTER on genuinely
+mixed-cadence data) and stage 3 (migrating call sites) are separate,
+later, explicitly-gated work — not started.
+
+**New functions**, all in `momentum_monitor/core/`:
+- `indicators.ema_time_aware(values, timestamps, period,
+  reference_interval_seconds=10.0)`
+- `indicators.relative_volume_time_aware(bars, lookback_seconds=200.0)`
+- `levels.evaluate_hold_time_aware(bars, level_price, direction="above",
+  required_seconds=30.0, reference_interval_seconds=10.0)` →
+  `HoldStateTimeAware` (parallel to `HoldState`, `elapsed_seconds` in
+  place of `consecutive_bars`)
+- `levels.swing_points_time_aware(bars, window_seconds, kind)` (time-aware
+  analog of the private `_swing_points`, the primitive `detect_levels`
+  and `confirmed_swing_lows` both build on)
+
+**`ema_time_aware` — derivation, shown in full (not just the code).**
+The bar-count EMA's recursion is `out[i] = k*v[i] + (1-k)*out[i-1]`,
+`k = 2/(period+1)`. `(1-k)` is the fraction of the OLD value retained
+after one bar-width step. Generalizing "one step" to an arbitrary real
+elapsed time `dt`: if retention compounds continuously at the same rate,
+the fraction retained after `dt` seconds is `(1-k)**(dt /
+reference_interval_seconds)` (`reference_interval_seconds` being the bar
+width the original `k` was calibrated against — 10.0, the live cadence).
+The effective per-step weight on the new value is therefore
+
+```
+k_eff(dt) = 1 - (1 - k) ** (dt / reference_interval_seconds)
+out[i] = k_eff(dt) * v[i] + (1 - k_eff(dt)) * out[i-1]
+```
+
+At `dt == reference_interval_seconds` (every live bar under uniform
+cadence): `k_eff = 1 - (1-k)**1 = 1 - (1-k) = k` — the ORIGINAL formula,
+exactly, by direct substitution. By induction (the base case `out[0]`
+seeds identically in both functions, and the inductive step above shows
+each subsequent step's formula is identical when `dt == reference_interval
+_seconds`), the two sequences are equal at every index, not just in
+aggregate.
+
+One real subtlety this exposed: floating-point `**` does not always
+round-trip losslessly at exponent `1.0`. E.g. `period=5`: `k = 2/6 =
+0.3333333333333333`, but `1 - (1 - k) ** 1.0` evaluates to
+`0.33333333333333326` — off in the last bit. Left as-is, this would make
+`ema_time_aware` merely APPROXIMATELY equal to `ema` on uniform data,
+not exactly equal as required. The implementation special-cases `dt ==
+reference_interval_seconds` to use `k` directly, skipping `**`
+entirely — this is what makes the equivalence test's `==` (not
+`pytest.approx`) pass bit-for-bit, and is also just the correct
+optimization for the overwhelmingly common case (every live bar).
+
+**`evaluate_hold_time_aware` — the bar-start-vs-bar-end boundary, made
+explicit.** `required_bars=3` at the live 10s cadence is
+`required_seconds=30.0` — three FULL bar-widths of confirmed time, not
+merely the 20-second gap between the first and third bar's own start
+timestamps. Concretely: `elapsed_seconds = (current_bar_ts -
+streak_start_ts) + reference_interval_seconds` — the current bar's own
+assumed width is added on top of the gap since the streak began, because
+confirmation is evaluated as of the END of the current bar's interval,
+not its start. Proof of exact equivalence on uniform cadence: for the
+k-th consecutive on-side bar in a streak (1-indexed) under uniform 10s
+spacing, `current_bar_ts - streak_start_ts = (k-1)*10`, so
+`elapsed_seconds = (k-1)*10 + 10 = k*10`. The bar-count version confirms
+when `k >= 3`; the time-aware version confirms when `k*10 >= 30`, i.e.
+`k >= 3` — the identical threshold, by direct algebra, not merely
+observed to match in practice.
+
+**`relative_volume_time_aware` and `swing_points_time_aware` — explicit
+bar-count-to-seconds conversions**, both at the live 10s cadence:
+- `relative_volume`'s `lookback=20` bars → `lookback_seconds=200.0`
+  (20 × 10s). Window selection: every prior bar with `b["ts"] -
+  lookback_seconds <= w["ts"] < b["ts"]`, which for uniform 10s bars
+  (`ts = j*10`) reduces to `j in [i-20, i-1]` — the identical 20 bars
+  `bars[i-lookback:i]` selects. "Not enough history" is judged the same
+  way: `b["ts"] - bars[0]["ts"] < lookback_seconds` reduces to `i < 20`
+  on uniform data, matching the bar-count version's `i < lookback` check
+  exactly.
+- `detect_levels`'/`confirmed_swing_lows`'s `swing_window=3` bars (each
+  side) → `window_seconds=30.0` (3 × 10s, each side). A candidate's
+  bracket is every bar with `abs(b["ts"] - cand["ts"]) <= window_seconds`,
+  which for uniform 10s bars reduces to `j in [i-3, i+3]` — the identical
+  7-bar segment `bars[i-window:i+window+1]` selects. The zero-volume
+  forward-fill exclusion (section 3) is preserved unchanged in
+  `swing_points_time_aware` — that rule is about real vs. synthetic
+  bars, orthogonal to bar-count vs. real-time windowing.
+
+**Live evidence** (real, already-captured bars — not a hand-built
+fixture — pulled from `schwab-connector`'s actual `data/bars/AEMD.jsonl`
+store, tonight's regular-hours session, 2026-09-18 09:30:00–15:59:50
+America/New_York, 2,340 bars, gap-set `{10}` confirmed strictly uniform):
+
+- `ema_time_aware` vs `ema`, periods 9/12/26 (macd's fast/slow legs and
+  its own signal period): `new == old` (Python list equality, exact)
+  over all 2,340 points, for all three periods. Spot-checked values
+  (period=9): i=0 both `6.36`; i=100 both `6.259372499466311`; i=1000
+  both `6.072960438384809`; i=2339 (last bar, 15:59:50) both
+  `6.41329308830684`.
+- `relative_volume_time_aware` vs `relative_volume`, `lookback=20` ↔
+  `lookback_seconds=200.0`: `new == old` over all 2,340 points. i=19
+  (last warm-up bar) both `1.0`; i=20 (first real comparison, volume
+  jumped to 3,586 against a quiet opening average) both `4.834187...`;
+  i=1000 both `1.500586...`.
+- `swing_points_time_aware` vs `_swing_points`, `window=3` ↔
+  `window_seconds=30.0`, kind="low": identical index lists, 210 swing
+  lows found by both, in the same order (first five: indices 4, 12, 18,
+  20, 24 — e.g. index 4 is the 09:30:40 bar, low=6.00).
+- `evaluate_hold_time_aware` vs `evaluate_hold`, `required_bars=3` ↔
+  `required_seconds=30.0`, level_price=6.20 (the session's median
+  close): three real bar sequences walked step by step —
+  1. 09:30:40–09:31:40 (7 bars, all closes below level): both stay at
+     `consecutive_bars=0` / `elapsed_seconds=0`, `confirmed=False`
+     throughout — trivial agreement, included for contrast.
+  2. 09:33:40–09:34:30: bar1 close=6.2199 (on side) → OLD
+     `consecutive_bars=1`, NEW `elapsed_seconds=10`; bar2 close=6.2150
+     (on side) → OLD `consecutive_bars=2`, NEW `elapsed_seconds=20`;
+     bar3 close=6.1810 (off side) → both reset, neither ever confirmed.
+     Both count this as one failed attempt.
+  3. 09:35:00–09:35:50, the confirming case: bar1 close=6.3199 → OLD
+     `consecutive_bars=1` NEW `elapsed_seconds=10`, both
+     `confirmed=False`; bar2 close=6.3086 → OLD `2` / NEW `20`, both
+     still `False`; bar3 close=6.2650 → OLD `3` / NEW `30` — **both flip
+     to `confirmed=True` on this exact same bar**; bar4–6 stay
+     confirmed on both sides (`4`/`40`, `5`/`50`, `6`/`60`). This is the
+     concrete proof the 30-second boundary derived above fires at
+     precisely the same real bar as the bar-count version, not
+     approximately the same one.
+
+**Deliberate break-then-fix, both required equivalence tests**
+(`test_ema_time_aware_exactly_equals_bar_count_ema_on_uniform_cadence`,
+`test_evaluate_hold_time_aware_exactly_equals_bar_count_version_on_
+uniform_cadence`), to prove the tests actually catch a real regression
+rather than merely passing today:
+- `ema_time_aware`: changed the uniform-cadence special case from
+  `k_eff = k` to `k_eff = k * 1.01`. Result: both the hand-computed test
+  and the equivalence test failed immediately (`15.05 == 15.0` and full
+  divergence from index 1 onward across all three periods, e.g.
+  period=3: `[5.0, 5.101..., ...] != [5.0, 5.1, ...]`). Reverted; full
+  suite green again.
+- `evaluate_hold_time_aware`: changed `elapsed_seconds = (b["ts"] -
+  streak_start_ts) + reference_interval_seconds` to drop the `+
+  reference_interval_seconds` term (reintroducing exactly the bar-start-
+  vs-bar-end ambiguity this stage was built to resolve). Result: both
+  the hand-computed test (`elapsed_seconds=20` instead of `30`,
+  `confirmed` stuck `False`) and the equivalence test
+  (`failed_attempts` mismatched: `1` vs. the bar-count version's `0`,
+  because the streak that should confirm at bar 3 never did) failed
+  immediately. Reverted; full suite green again.
+
+**Status:** stage 1 complete — additive functions built, exact
+equivalence proven both algebraically and against real uniform-cadence
+data, tests proven to catch a real regression. `core/tests/test_core.py`:
+27 tests passing (19 pre-existing plus 8 new for this stage);
+`core` suite overall (including the untouched `test_setup_types.py`): 40
+tests passing; full project suite: 276 tests passing, unchanged in every
+other module, confirming zero impact on any existing call site. Stage 2
+(mixed-cadence improvement) and stage 3 (call-site migration) are
+separate future work, not started.
+
+### 15. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,
@@ -2164,7 +2340,15 @@ for it.
    live bar width") that currently just excludes backfilled bars from the
    window-based functions instead of correctly weighting them. Also fixes
    the irregular gaps *within* the backfilled portion itself (Schwab
-   skips zero-volume minutes), which the stopgap doesn't address. Touches
+   skips zero-volume minutes), which the stopgap doesn't address.
+   **Stage 1 (built, 2026-09-18) — see section 14:** purely additive
+   time-aware `ema`/`relative_volume`/`evaluate_hold`/swing-point-window
+   functions, proven EXACTLY equivalent to the bar-count versions on real
+   uniform-cadence data; no existing call site touched. `macd`'s own
+   time-aware version deferred to a later stage (composable directly from
+   `ema_time_aware` once needed, not required by stage 1's explicit
+   scope). Stage 2 (proving genuine improvement on mixed-cadence data)
+   and stage 3 (migrating call sites) remain future work. Touches
    `core/`'s public function signatures and its authoritative test suite
    — a real redesign, not a quick patch, which is why it's a separate
    phase rather than bundled into the backfill work that motivated it.

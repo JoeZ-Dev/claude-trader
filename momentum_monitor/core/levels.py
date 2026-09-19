@@ -83,6 +83,44 @@ def _swing_points(bars: list[dict], window: int, kind: str) -> list[int]:
     return idxs
 
 
+def swing_points_time_aware(bars: list[dict], window_seconds: float, kind: str) -> list[int]:
+    """Time-aware analog of `_swing_points` (specs.md section 15, phase 3.6
+    stage 1): a candidate is compared against every bar within
+    `window_seconds` on EACH side (real elapsed time), rather than a fixed
+    bar count. `window=3` bars at the live 10s cadence is
+    `window_seconds=30.0` (3 * 10s) -- on uniform cadence this selects the
+    identical bracket as `_swing_points(bars, 3, kind)`: bar j is in
+    candidate i's bracket exactly when `abs(bars[j]["ts"] - bars[i]["ts"])
+    <= window_seconds`, which for uniform 10s bars (ts = i*10) reduces to
+    `j in [i-3, i+3]` -- the same inclusive 7-bar segment
+    `bars[i-window:i+window+1]` uses.
+
+    A candidate is only eligible once `window_seconds` of real history
+    exists on BOTH sides (the time-based analog of `_swing_points`'
+    `range(window, len(bars)-window)` bound). The zero-volume forward-fill
+    exclusion (see `_swing_points`'s docstring) is preserved unchanged --
+    that rule is about real vs. synthetic bars, orthogonal to bar-count vs.
+    real-time windowing.
+    """
+    idxs = []
+    if not bars:
+        return idxs
+    first_ts, last_ts = bars[0]["ts"], bars[-1]["ts"]
+    for i, cand in enumerate(bars):
+        if cand["ts"] - first_ts < window_seconds or last_ts - cand["ts"] < window_seconds:
+            continue
+        if cand["volume"] == 0:
+            continue
+        seg = [b for b in bars if abs(b["ts"] - cand["ts"]) <= window_seconds]
+        val = cand["high"] if kind == "high" else cand["low"]
+        seg_vals = [b["high"] if kind == "high" else b["low"] for b in seg]
+        if kind == "high" and val == max(seg_vals):
+            idxs.append(i)
+        elif kind == "low" and val == min(seg_vals):
+            idxs.append(i)
+    return idxs
+
+
 def confirmed_swing_lows(bars: list[dict], window: int = 3) -> list[dict]:
     """Every CONFIRMED swing low in `bars` (a local minimum with `window`
     bars fully bracketing it on both sides, per `_swing_points` -- reused
@@ -237,5 +275,70 @@ def evaluate_hold(
     return HoldState(
         level_price=level_price, direction=direction,
         consecutive_bars=consecutive, confirmed=confirmed,
+        failed_attempts=failed_attempts,
+    )
+
+
+@dataclass
+class HoldStateTimeAware:
+    level_price: float
+    direction: str  # "above" or "below"
+    elapsed_seconds: float
+    confirmed: bool
+    failed_attempts: int = 0
+
+
+def evaluate_hold_time_aware(
+    bars: list[dict],
+    level_price: float,
+    direction: str = "above",
+    required_seconds: float = 30.0,
+    reference_interval_seconds: float = 10.0,
+) -> HoldStateTimeAware:
+    """Time-aware `evaluate_hold` (specs.md section 15, phase 3.6 stage 1):
+    tracks real ELAPSED SECONDS on the required side of the level, rather
+    than a bar count. `required_bars=3` at the live 10s cadence is
+    `required_seconds=30.0` (3 * 10s) -- confirmation still fires on
+    exactly the 3rd bar on uniform cadence (proved in specs.md section 15
+    by direct substitution, and covered by
+    test_evaluate_hold_time_aware_exactly_equals_bar_count_version_on_uniform_cadence).
+
+    Boundary, made explicit (this was left implicit in the bar-count
+    version): elapsed time is measured as of the END of the current bar's
+    own interval, not its start timestamp -- a bar's own
+    `reference_interval_seconds` of width counts in full toward the
+    streak once that bar closes on the right side. Concretely,
+    `elapsed_seconds = (current_bar_ts - streak_start_ts) +
+    reference_interval_seconds`: the gap between the streak's first bar's
+    start and the current bar's start, PLUS the current bar's own
+    assumed width. This is why `required_seconds=30.0`, not `20.0` --
+    "3 consecutive bars" means 3 FULL bar-widths of confirmed time, not
+    the gap between the 1st and 3rd bar starts.
+    """
+    streak_start_ts = None
+    failed_attempts = 0
+    confirmed = False
+    elapsed_seconds = 0.0
+    was_attempting = False
+
+    for b in bars:
+        on_side = b["close"] > level_price if direction == "above" else b["close"] < level_price
+        if on_side:
+            if streak_start_ts is None:
+                streak_start_ts = b["ts"]
+            was_attempting = True
+            elapsed_seconds = (b["ts"] - streak_start_ts) + reference_interval_seconds
+            if elapsed_seconds >= required_seconds:
+                confirmed = True
+        else:
+            if was_attempting and streak_start_ts is not None and not confirmed:
+                failed_attempts += 1
+            streak_start_ts = None
+            elapsed_seconds = 0.0
+            was_attempting = False
+
+    return HoldStateTimeAware(
+        level_price=level_price, direction=direction,
+        elapsed_seconds=elapsed_seconds, confirmed=confirmed,
         failed_attempts=failed_attempts,
     )

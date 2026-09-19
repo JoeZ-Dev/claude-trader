@@ -42,6 +42,47 @@ def ema(values: list[float], period: int) -> list[float]:
     return out
 
 
+def ema_time_aware(values: list[float], timestamps: list[float], period: int,
+                   reference_interval_seconds: float = 10.0) -> list[float]:
+    """Time-aware EMA (specs.md section 15, phase 3.6 stage 1): decays by
+    REAL elapsed seconds between bars rather than by bar count, so it
+    weights a value correctly even when bars aren't evenly spaced (a
+    backfilled gap, a quiet stretch Schwab skips). `timestamps[i]` is
+    bar i's own ts, parallel to `values[i]` -- kept as a separate list
+    (not read off a bar dict) so this can run on a derived series (e.g. a
+    macd line) that shares the underlying bars' timestamps without being
+    its own list of bars.
+
+    Derivation, shown in full in specs.md section 15: the bar-count EMA's
+    recursion is out[i] = k*v[i] + (1-k)*out[i-1], k = 2/(period+1). The
+    (1-k) factor is the fraction of the old value retained after ONE
+    reference-length step. Generalizing to an arbitrary elapsed time dt,
+    the retained fraction after dt seconds is (1-k)**(dt/reference_interval_
+    seconds) (compounding the per-reference-step retention continuously),
+    so the effective per-step weight on the new value is
+    k_eff(dt) = 1 - (1-k)**(dt/reference_interval_seconds).
+    At dt == reference_interval_seconds (every live bar), this reduces
+    mathematically to EXACTLY k. The dt == reference_interval_seconds case
+    is special-cased below to use k directly rather than going through
+    `**`, because floating-point pow does not always round-trip losslessly
+    at exponent 1.0 (e.g. period=5: 1-(1-2/6)**1.0 == 0.33333333333333326,
+    not 0.3333333333333333) -- this guarantees BIT-EXACT equivalence with
+    `ema()` on uniform-cadence data, not merely equal in real-number terms.
+    """
+    if not values:
+        return []
+    k = 2.0 / (period + 1)
+    out = [values[0]]
+    for i in range(1, len(values)):
+        dt = timestamps[i] - timestamps[i - 1]
+        if dt == reference_interval_seconds:
+            k_eff = k
+        else:
+            k_eff = 1 - (1 - k) ** (dt / reference_interval_seconds)
+        out.append(values[i] * k_eff + out[-1] * (1 - k_eff))
+    return out
+
+
 def macd(closes: list[float], fast: int = 12, slow: int = 26, signal: int = 9) -> dict:
     """Returns {'macd': [...], 'signal': [...], 'histogram': [...]}, one value
     per input close, using EMA seeded on the first value (matches common
@@ -71,6 +112,36 @@ def relative_volume(bars: list[dict], lookback: int = 20) -> list[float]:
             continue
         window = bars[i - lookback:i]
         avg = sum(w["volume"] for w in window) / lookback
+        out.append(b["volume"] / avg if avg > 0 else 1.0)
+    return out
+
+
+def relative_volume_time_aware(bars: list[dict], lookback_seconds: float = 200.0) -> list[float]:
+    """Time-aware relative_volume (specs.md section 15, phase 3.6 stage 1):
+    the rolling comparison window is a real elapsed-time span
+    (`lookback_seconds`) rather than a fixed bar count, so it selects the
+    same real history regardless of gaps in cadence. `lookback=20` bars at
+    the live 10s cadence is `lookback_seconds=200.0` (20 * 10s) -- the
+    default here.
+
+    Window is every prior bar with `b["ts"] - lookback_seconds <= w["ts"]
+    < b["ts"]` (matches the bar-count version's `bars[i-lookback:i]`
+    slice exactly on uniform cadence: both are the `lookback`-bars/
+    `lookback_seconds`-seconds strictly preceding the current bar).
+    "Not enough history yet" is judged by real elapsed time since the
+    first bar (`b["ts"] - bars[0]["ts"] < lookback_seconds`), the direct
+    time-based analog of the bar-count version's `i < lookback` check.
+    """
+    out = []
+    for i, b in enumerate(bars):
+        if b["ts"] - bars[0]["ts"] < lookback_seconds:
+            out.append(1.0)
+            continue
+        window = [w for w in bars[:i] if b["ts"] - lookback_seconds <= w["ts"] < b["ts"]]
+        if not window:
+            out.append(1.0)
+            continue
+        avg = sum(w["volume"] for w in window) / len(window)
         out.append(b["volume"] / avg if avg > 0 else 1.0)
     return out
 

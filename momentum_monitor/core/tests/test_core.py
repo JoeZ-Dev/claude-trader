@@ -3,8 +3,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 
-from indicators import continuation_days, session_vwap, ema, macd, relative_volume
-from levels import confirmed_swing_lows, detect_levels, evaluate_hold
+from indicators import (
+    continuation_days, session_vwap, ema, macd, relative_volume,
+    ema_time_aware, relative_volume_time_aware,
+)
+from levels import (
+    confirmed_swing_lows, detect_levels, evaluate_hold,
+    evaluate_hold_time_aware, swing_points_time_aware, _swing_points,
+)
 
 
 def bar(ts, o, h, l, c, v):
@@ -225,6 +231,111 @@ def test_evaluate_hold_confirms_after_required_consecutive_closes():
     assert state.confirmed is True
     assert state.consecutive_bars == 3
     assert state.failed_attempts == 0
+
+
+# -- Phase 3.6 stage 1: time-aware core functions (specs.md section 15) ----
+# Purely additive -- these prove the new time-aware functions are EXACTLY
+# equivalent to the existing bar-count functions on uniform-cadence data
+# (real live bars are always exactly 10s apart). Stage 2 will separately
+# prove genuine improvement on mixed-cadence data; that is NOT this suite's
+# job.
+
+def _uniform_bars(closes, volumes=None, start_ts=1_700_000_000, step=10):
+    volumes = volumes or [1000.0] * len(closes)
+    return [bar(start_ts + i * step, c, c, c, c, v)
+            for i, (c, v) in enumerate(zip(closes, volumes))]
+
+
+def test_ema_time_aware_hand_computed_first_two_steps():
+    # period=3 -> k=2/4=0.5. Uniform 10s cadence, reference=10s.
+    # out[0]=10 (seed). out[1] = 20*0.5 + 10*0.5 = 15.0.
+    values = [10.0, 20.0, 20.0]
+    timestamps = [0, 10, 20]
+    result = ema_time_aware(values, timestamps, period=3, reference_interval_seconds=10.0)
+    assert result[0] == 10.0
+    assert result[1] == 15.0
+
+
+def test_ema_time_aware_exactly_equals_bar_count_ema_on_uniform_cadence():
+    # Exact (==, not approx) equivalence on real 10s-uniform cadence, for
+    # every EMA period this project actually uses (macd's fast/slow/signal
+    # plus a couple of others), per the requirement that this reduce to
+    # EXACTLY the bar-count formula, not merely close to it.
+    values = [5.0, 5.2, 5.1, 5.4, 5.6, 5.3, 5.8, 6.0, 5.9, 6.2,
+              6.5, 6.3, 6.6, 6.8, 6.7, 7.0, 7.2, 7.1, 7.4, 7.6]
+    timestamps = [1_700_000_000 + i * 10 for i in range(len(values))]
+    for period in (3, 9, 12, 26):
+        old = ema(values, period)
+        new = ema_time_aware(values, timestamps, period, reference_interval_seconds=10.0)
+        assert new == old, f"period={period} diverged: {new} != {old}"
+
+
+def test_relative_volume_time_aware_hand_computed():
+    # Same case as test_relative_volume_hand_computed, in time-window form:
+    # lookback=20 bars * 10s/bar = 200s.
+    bars = [bar(1_700_000_000 + i * 10, 1, 1, 1, 1, 100) for i in range(20)]
+    bars.append(bar(1_700_000_000 + 20 * 10, 1, 1, 1, 1, 500))
+    result = relative_volume_time_aware(bars, lookback_seconds=200.0)
+    assert result[:20] == [1.0] * 20
+    assert abs(result[20] - 5.0) < 1e-9
+
+
+def test_relative_volume_time_aware_exactly_equals_bar_count_version_on_uniform_cadence():
+    closes = [5.0] * 60
+    volumes = [1000 + (i * 37) % 500 for i in range(60)]  # varied, deterministic
+    bars = _uniform_bars(closes, volumes)
+    old = relative_volume(bars, lookback=20)
+    new = relative_volume_time_aware(bars, lookback_seconds=200.0)
+    assert new == old
+
+
+def test_swing_points_time_aware_exactly_equals_bar_count_version_on_uniform_cadence():
+    lows = [10, 9, 8, 7, 6, 4, 6, 7, 8, 9, 10, 9, 8, 6, 3, 6, 8, 9, 10]
+    bars = _uniform_bars(lows)
+    old = _swing_points(bars, window=3, kind="low")
+    new = swing_points_time_aware(bars, window_seconds=30.0, kind="low")
+    assert new == old
+    assert old  # sanity: the fixture actually contains swing lows to compare
+
+
+def test_evaluate_hold_time_aware_hand_computed_confirms_at_30s():
+    # Mirrors test_evaluate_hold_confirms_after_required_consecutive_closes:
+    # 3 consecutive 10s bars on the correct side = 30s elapsed (bar-END
+    # semantics: each bar contributes its own reference_interval_seconds of
+    # confirmed time, measured as of that bar's close).
+    bars = [
+        bar(1_700_000_000 + 0, 8.5, 8.75, 8.5, 8.72, 100_000),
+        bar(1_700_000_000 + 10, 8.72, 8.9, 8.65, 8.85, 120_000),
+        bar(1_700_000_000 + 20, 8.85, 9.0, 8.8, 8.95, 110_000),
+    ]
+    state = evaluate_hold_time_aware(bars, level_price=8.69, direction="above",
+                                     required_seconds=30.0, reference_interval_seconds=10.0)
+    assert state.confirmed is True
+    assert state.elapsed_seconds == 30.0
+    assert state.failed_attempts == 0
+
+
+def test_evaluate_hold_time_aware_single_bar_break_is_not_confirmed():
+    bars = [
+        bar(1_700_000_000 + 0, 8.5, 8.75, 8.5, 8.72, 100_000),
+        bar(1_700_000_000 + 10, 8.7, 8.75, 7.2, 7.25, 200_000),
+    ]
+    state = evaluate_hold_time_aware(bars, level_price=8.69, direction="above",
+                                     required_seconds=30.0, reference_interval_seconds=10.0)
+    assert state.confirmed is False
+    assert state.failed_attempts == 1
+
+
+def test_evaluate_hold_time_aware_exactly_equals_bar_count_version_on_uniform_cadence():
+    # required_bars=3 <-> required_seconds=30 (3 * 10s reference interval).
+    closes = [8.72, 8.85, 8.95, 7.2, 8.71, 8.9, 9.1, 9.3, 6.5, 8.72, 8.8]
+    bars = _uniform_bars(closes)
+    old = evaluate_hold(bars, level_price=8.69, direction="above", required_bars=3)
+    new = evaluate_hold_time_aware(bars, level_price=8.69, direction="above",
+                                   required_seconds=30.0, reference_interval_seconds=10.0)
+    assert new.confirmed == old.confirmed
+    assert new.failed_attempts == old.failed_attempts
+    assert new.elapsed_seconds == old.consecutive_bars * 10.0
 
 
 if __name__ == "__main__":
