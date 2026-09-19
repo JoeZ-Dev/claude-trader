@@ -1835,3 +1835,175 @@ def test_market_backdrop_symbol_is_configurable():
                 market_backdrop_symbol="QQQ", market_backdrop_refresh_seconds=0.05) as c:
         assert _wait_until(lambda: c.get("/api/state").json()["market_backdrop"]["symbol"] == "QQQ")
         assert _wait_until(lambda: c.get("/api/state").json()["market_backdrop"]["status"] == "ok")
+
+
+# -- human review/labeling for closed trades, specs.md section 24 ---------
+# The first place a human judgment gets attached to a trade after the
+# fact, rather than something the system computed about its own
+# mechanical decisions. Closed trades only -- an open position's outcome
+# isn't known yet.
+
+def test_closed_row_shows_not_reviewed_when_never_reviewed():
+    rows = _journal_closed_rows_html([_closed_row("AEHL", "trailing_stop")])
+    assert "not reviewed" in rows
+    assert "journal-review-btn" in rows
+    assert "data-trade-id='1'" in rows  # scoped to its own trade, like delete
+
+
+def test_closed_row_shows_the_review_label_badge_when_reviewed():
+    row = _closed_row("AEHL", "trailing_stop")
+    row["review_label"] = "clean_signal"
+    rows = _journal_closed_rows_html([row])
+    assert "review-label-clean_signal" in rows
+    assert ">clean_signal<" in rows
+
+
+def test_closed_row_review_form_prefills_existing_note_and_ideal_entry():
+    row = _closed_row("AEHL", "trailing_stop")
+    row["review_label"] = "lucky"
+    row["review_note"] = "gap up saved a marginal entry"
+    row["ideal_entry_price"] = 9.85
+    rows = _journal_closed_rows_html([row])
+    assert "review-form-row" in rows
+    assert "hidden" in rows  # the form row starts collapsed
+    assert "gap up saved a marginal entry" in rows
+    assert "9.85" in rows
+    assert "selected" in rows  # the current label is pre-selected in the <select>
+
+
+def test_closed_row_review_form_survives_a_trade_with_no_review_fields_at_all():
+    # Backward compatibility: _closed_row (and any pre-migration-shaped
+    # dict) has no review_label/review_note/ideal_entry_price keys at
+    # all -- .get(), not direct indexing, must not KeyError.
+    rows = _journal_closed_rows_html([_closed_row("AEHL", "trailing_stop")])
+    assert "review-form-row" in rows
+
+
+def test_post_review_stores_label_note_and_ideal_entry_on_a_real_closed_trade(tmp_path):
+    from journal_store import JournalStore
+    store = JournalStore(tmp_path / "journal.db")
+    closed = _seed_closed_trades(store)
+    target_id = next(c["id"] for c in closed if c["symbol"] == "AEHL")
+
+    with _client(FakeFetch({}), symbol=None, journal_store=store) as c:
+        r = c.post(f"/api/trades/{target_id}/review", json={
+            "review_label": "clean_signal",
+            "review_note": "held exactly per plan",
+            "ideal_entry_price": 10.05,
+        })
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+
+    reviewed = next(c for c in store.recent_closed() if c["id"] == target_id)
+    assert reviewed["review_label"] == "clean_signal"
+    assert reviewed["review_note"] == "held exactly per plan"
+    assert reviewed["ideal_entry_price"] == 10.05
+
+
+def test_post_review_on_an_open_trade_is_rejected(tmp_path):
+    from journal_store import JournalStore
+    store = JournalStore(tmp_path / "journal.db")
+    open_pos = store.create(_position(symbol="AEHL"))  # never closed
+
+    with _client(FakeFetch({}), symbol=None, journal_store=store) as c:
+        r = c.post(f"/api/trades/{open_pos.id}/review", json={"review_label": "clean_signal"})
+        assert r.status_code == 409
+        assert r.json()["ok"] is False
+        assert "open" in r.json()["reason"].lower()
+
+    # nothing was written
+    assert store.open_position_for("AEHL").id == open_pos.id
+
+
+def test_post_review_on_an_unknown_trade_id_returns_409(tmp_path):
+    from journal_store import JournalStore
+    store = JournalStore(tmp_path / "journal.db")
+    with _client(FakeFetch({}), symbol=None, journal_store=store) as c:
+        r = c.post("/api/trades/999999/review", json={"review_label": "clean_signal"})
+        assert r.status_code == 409
+        assert r.json()["ok"] is False
+
+
+def test_post_review_twice_updates_in_place_not_a_duplicate(tmp_path):
+    from journal_store import JournalStore
+    store = JournalStore(tmp_path / "journal.db")
+    closed = _seed_closed_trades(store)
+    target_id = next(c["id"] for c in closed if c["symbol"] == "AEHL")
+
+    with _client(FakeFetch({}), symbol=None, journal_store=store) as c:
+        c.post(f"/api/trades/{target_id}/review", json={"review_label": "bad_signal",
+                                                        "review_note": "chased it"})
+        r = c.post(f"/api/trades/{target_id}/review", json={"review_label": "clean_signal",
+                                                            "review_note": "actually fine"})
+        assert r.status_code == 200
+
+    all_closed = store.recent_closed()
+    assert len(all_closed) == 3  # still exactly the 3 seeded trades, no duplicate
+    reviewed = next(c for c in all_closed if c["id"] == target_id)
+    assert reviewed["review_label"] == "clean_signal"
+    assert reviewed["review_note"] == "actually fine"
+
+
+def test_post_review_rejects_an_unrecognized_label(tmp_path):
+    from journal_store import JournalStore
+    store = JournalStore(tmp_path / "journal.db")
+    closed = _seed_closed_trades(store)
+    target_id = next(c["id"] for c in closed if c["symbol"] == "AEHL")
+
+    with _client(FakeFetch({}), symbol=None, journal_store=store) as c:
+        r = c.post(f"/api/trades/{target_id}/review", json={"review_label": "definitely_not_real"})
+        assert r.status_code == 409
+        assert r.json()["ok"] is False
+
+    assert next(c for c in store.recent_closed() if c["id"] == target_id)["review_label"] is None
+
+
+def test_post_review_rejects_an_over_length_note(tmp_path):
+    from journal_store import JournalStore
+    from journal_store import MAX_REVIEW_NOTE_LENGTH
+    store = JournalStore(tmp_path / "journal.db")
+    closed = _seed_closed_trades(store)
+    target_id = next(c["id"] for c in closed if c["symbol"] == "AEHL")
+
+    with _client(FakeFetch({}), symbol=None, journal_store=store) as c:
+        r = c.post(f"/api/trades/{target_id}/review",
+                   json={"review_note": "x" * (MAX_REVIEW_NOTE_LENGTH + 1)})
+        assert r.status_code == 409
+        assert r.json()["ok"] is False
+
+
+def test_post_review_rejects_a_non_numeric_ideal_entry_price(tmp_path):
+    from journal_store import JournalStore
+    store = JournalStore(tmp_path / "journal.db")
+    closed = _seed_closed_trades(store)
+    target_id = next(c["id"] for c in closed if c["symbol"] == "AEHL")
+
+    with _client(FakeFetch({}), symbol=None, journal_store=store) as c:
+        r = c.post(f"/api/trades/{target_id}/review",
+                   json={"ideal_entry_price": "not-a-number"})
+        assert r.status_code == 409
+        assert r.json()["ok"] is False
+
+
+def test_post_review_when_journaling_disabled_returns_409():
+    with _client(FakeFetch({}), symbol=None) as c:  # no journal_store
+        r = c.post("/api/trades/1/review", json={"review_label": "clean_signal"})
+        assert r.status_code == 409
+        assert r.json()["ok"] is False
+
+
+def test_review_displays_correctly_on_the_real_rendered_page(tmp_path):
+    from journal_store import JournalStore
+    store = JournalStore(tmp_path / "journal.db")
+    closed = _seed_closed_trades(store)
+    target_id = next(c["id"] for c in closed if c["symbol"] == "AEHL")
+
+    with _client(FakeFetch({}), symbol=None, journal_store=store) as c:
+        c.post(f"/api/trades/{target_id}/review", json={
+            "review_label": "clean_signal", "review_note": "textbook",
+            "ideal_entry_price": 10.05,
+        })
+        page = c.get("/").text
+        assert "review-label-clean_signal" in page
+        assert ">clean_signal<" in page
+        assert "textbook" in page

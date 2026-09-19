@@ -1218,8 +1218,10 @@ about a trade or what the strategy itself accounts for, not yet closed.
   2026-09-19 — see section 23.** SPY's day change, global informational
   display, deliberately NOT wired into sizing (a real, explicitly
   deferred decision, not an oversight — see that section).
-- Human review/labeling — no way to mark a trade as "real signal" vs.
-  "worked by chance" after the fact.
+- ~~Human review/labeling.~~ **Built 2026-09-19 — see section 24.** The
+  last of this list's data-collection gaps — closed trades only,
+  `clean_signal`/`lucky`/`bad_signal`, plain mutable fields (no history
+  table needed), extending the existing closed-trades table.
 
 **Strategy gaps:**
 - ~~Position sizing does not exist.~~ **Built 2026-09-18 — see section
@@ -3505,7 +3507,146 @@ millisecond and confirming the poll runs independently of, and is not
 gated by, any watched symbol. `git diff --stat` on `journal_logic.py` and
 both its test files showed zero changes for this entire feature.
 
-### 24. Roadmap / phases
+### 24. Human review/labeling for closed trades
+
+**The gap, closed 2026-09-19 — the last of section 7's data-collection
+gaps.** Every prior feature this journal has built logs the system's OWN
+mechanical decisions (what setup confirmed, what the stop did, what
+volume gate passed). This is the first place a HUMAN judgment gets
+attached to a trade after the fact — "was this a genuine, trustworthy
+signal, or did it just happen to work out (or not) by chance?"
+
+**Scope: closed trades only.** A trade can only be reviewed once it has
+an `exit_ts` — an open position's outcome isn't known yet, so labeling
+it doesn't mean anything yet. `JournalStore.review_trade` checks this
+FIRST, before any other validation, and raises `InvalidReviewError`
+(nothing written) for a still-open trade, with a message that says so
+plainly, not a generic "invalid" — proven by test and live (below), not
+just documented.
+
+**review_label's three categories, chosen deliberately along the SIGNAL
+QUALITY axis, not the outcome axis** (outcome is already fully captured
+by `realized_pnl_pct`/`exit_reason` — a label duplicating that would add
+nothing):
+- **`clean_signal`** — the setup was genuine and well-formed; entry
+  criteria were legitimately met and it reads correctly in hindsight. A
+  clean signal can still LOSE (normal variance) without becoming
+  `bad_signal` — this is about whether the signal itself was
+  trustworthy, not whether it happened to win.
+- **`lucky`** — won, but not because the signal was actually sound;
+  credits the outcome to chance rather than the setup.
+- **`bad_signal`** — the setup itself was flawed or questionable (chop,
+  a marginal/false confirmation, thin volume), regardless of outcome — a
+  loss here is a deserved one, not variance.
+
+`review_note` (free text) gets the SAME length-cap treatment as
+`watch_note`/reverse-split notes (500 chars, rejected outright rather
+than truncated) — its own independently-validated constant
+(`MAX_REVIEW_NOTE_LENGTH`), per this project's "each note field
+validated on its own" precedent (specs.md section 8), even though the
+number happens to match. `ideal_entry_price` (optional, nullable,
+must be positive if given) is the feature's original motivating
+intent — "where would you actually have entered" — for later comparison
+against what the system's mechanical logic actually did; not read or
+used by anything else in this codebase yet.
+
+**Storage: plain mutable columns on `trades`, no history table —
+deliberately different from watch_notes/reverse_splits.** Those two
+needed an append-only history table because a symbol's reason for being
+watched, or its reverse-split history, can genuinely accumulate distinct
+real events over time. A review is different in kind: a single, current,
+replaceable judgment about ONE already-finished, immutable-outcome
+trade. Re-reviewing just overwrites the existing `review_label`/
+`review_note`/`ideal_entry_price` in place — proven by test AND live
+(below) to update the same row, not create a duplicate. Migrated onto an
+existing `trades` table the same way every prior column addition was
+(`_ADDED_COLUMNS`, `_migrate_added_columns` on connect) — a pre-existing
+row simply reads back with all three as NULL, never confused with any of
+the three real label categories.
+
+**Endpoint:** `POST /api/trades/{trade_id}/review`, JSON body
+(`review_label`/`review_note`/`ideal_entry_price`, each independently
+optional — e.g. jotting a note without committing to a category is
+valid). Full-replace semantics, matching the storage design above: the
+three stored values become exactly what's in the request, not merged
+with whatever was there before. Validates `review_label` against the
+defined set, `review_note`'s length, and `ideal_entry_price`'s
+positivity, and rejects an unknown or still-open trade id — all as a
+clean `409` with a specific reason, same convention as every other
+validated endpoint in this app (reverse-splits, watch-note,
+strategy-params).
+
+**Display: extends the existing closed-trades table, no separate
+review page** (per the user's explicit instruction). A new "review"
+column shows the current label as a colored badge (`pos`/`neg`/
+`pending`-toned, matching the badge-confirmed/badge-pending styling this
+page already uses) or "not reviewed" when none, plus a "review" button.
+Clicking it reveals a hidden sibling `<tr>` (a form row, since this
+lives inside a `<table>` and can't nest an arbitrary block inside a
+`<td>` the way a card can) with a label `<select>`, a note `<input>`,
+and an ideal-entry-price `<input>`, pre-filled with whatever's currently
+stored — same click-to-expand pattern as this page's setup-chip/
+setup-detail, reusing its CSS classes and event-delegation style so no
+new interaction pattern was invented. A "Save review" button POSTs the
+full form and refreshes the row from server truth on success; a failed
+save shows the real rejection reason in place and does NOT refresh away
+the error. Expanded/collapsed state for these form rows survives a
+push-driven table rebuild the same way setup-chip's own expanded state
+already did (specs.md section 5's 2026-09-17 fix) — a push landing
+mid-edit no longer silently collapses the open form. Both the Python
+renderer and its JS mirror stay in sync, per this project's established
+dual-rendering discipline.
+
+**Forward-looking note, explicitly NOT built now:** a future win-rate/
+expectancy analysis could reasonably want to segment by `review_label`
+— e.g. performance among trades marked `clean_signal` specifically vs.
+overall. That's a later capability, contingent on enough real reviewed
+trades accumulating over time; nothing here implements it, and nothing
+in this feature's design blocks building it later (the label is a plain
+queryable column on `trades`).
+
+**Tests:** 10 new `journal_store.py` tests (store/retrieve all three
+fields, the open-trade rejection, the unknown-id rejection, re-review
+updating in place with a row-count assertion proving no duplicate, the
+unrecognized-label/over-length-note/non-positive-price rejections, a
+partial-fields-note-only case, and the pre-migration-table proof). 13
+new `app.py`/route tests (the badge/not-reviewed/prefilled-form display,
+`.get()`-tolerance for a trade dict with none of the three keys, the
+full HTTP round trip storing correctly, the open-trade 409 with an
+"open" substring check on the actual message, the unknown-id 409, the
+re-review-updates-not-duplicates proof through the HTTP layer, the
+invalid-label/over-length-note/non-numeric-price 409s, the journaling-
+disabled 409, and a real end-to-end page-render proof). Full project
+suite: 521 tests passing (`core` 71, `schwab-connector` 112,
+`monitor-app` 338).
+
+**Verified live (2026-09-19), against the real FastAPI app (`create_app`
++ `TestClient`) with a real SQLite `JournalStore`, real `OpenPosition`/
+`ExitEvent` primitives (not hand-built dicts) creating a genuinely closed
+trade (AEHL, entry 10.00, exit 11.00, `trailing_stop`) and a genuinely
+still-open one (MSFT).** `POST /api/trades/{id}/review` on the closed
+trade returned `200 {"ok": true, "reason": ""}`; the rendered page then
+showed the `clean_signal` badge and the exact submitted note text.
+`POST .../review` on the OPEN trade returned `409 {"ok": false, "reason":
+"trade 2 is still open; only closed trades can be reviewed"}` — the
+exact clear rejection message required, not a generic failure. A second
+review call on the SAME closed trade (`lucky`, a different note/ideal
+price) returned `200`, `store.recent_closed()` still showed exactly ONE
+row (not two), and the rendered page's badge `class` attribute was
+independently confirmed to have changed from
+`review-label-clean_signal` to `review-label-lucky` — the old class
+string gone, the new one present, checked precisely against the
+specific `class='review-label review-label-X'` attribute rather than
+loose substring matching, after an initial loose check falsely flagged
+a mismatch (the old label's name legitimately still appears as plain
+text inside the review form's own always-fully-listed `<select>`
+options — traced and ruled out, not a real bug, before this section was
+marked done; same "loose substring match on rendered HTML can produce a
+false positive from unrelated markup" pitfall this session's own prior
+features already documented for `id="market-backdrop"` and `Closest
+setup:`).
+
+### 25. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,

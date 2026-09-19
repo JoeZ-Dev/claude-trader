@@ -139,7 +139,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from journal_logic import ExitEvent, OpenPosition, advance_journal
 from journal_store import (MAX_WATCH_NOTE_LENGTH, InvalidEquityOverrideError,
                            InvalidParamError, InvalidReverseSplitError,
-                           InvalidWatchNoteError)
+                           InvalidReviewError, InvalidWatchNoteError)
 from state import build_state
 
 # Same sys.path setup as state.py's own CORE_PATH -- app.py reaches into
@@ -575,6 +575,26 @@ class Poller:
         if deleted:
             self._broadcast_state()
         return deleted
+
+    def review_trade(self, trade_id: int, review_label: str | None,
+                     review_note: str | None, ideal_entry_price: float | None
+                     ) -> tuple[bool, str]:
+        """Sets or updates review_label/review_note/ideal_entry_price on a
+        closed trade (specs.md section 24) -- (False, reason) if
+        journaling is disabled or (propagated) InvalidReviewError's
+        message for an unknown/still-open trade, an unrecognized label,
+        an over-length note, or a non-positive ideal_entry_price; (True,
+        "") on success."""
+        if self._journal_store is None:
+            return False, "journaling is disabled"
+        try:
+            self._journal_store.review_trade(
+                trade_id, review_label=review_label, review_note=review_note,
+                ideal_entry_price=ideal_entry_price)
+        except InvalidReviewError as exc:
+            return False, str(exc)
+        self._broadcast_state()
+        return True, ""
 
     def clear_symbol_switched(self) -> int:
         """Permanently deletes every symbol_switched closed row (the bulk
@@ -1455,9 +1475,60 @@ def _journal_open_html(open_block: dict | None) -> str:
     )
 
 
+# Human review/labeling (specs.md section 24) -- display order for the
+# <select>, matching journal_store.REVIEW_LABELS exactly (a test asserts
+# this). Not imported from journal_store directly to keep app.py's display
+# layer decoupled from journal_store's own internals, same separation
+# this file already keeps for every other validated-elsewhere constant.
+_REVIEW_LABEL_CHOICES = ["clean_signal", "lucky", "bad_signal"]
+
+
+def _review_label_badge_html(label: str | None) -> str:
+    if not label:
+        return "<span class='muted'>not reviewed</span>"
+    return f"<span class='review-label review-label-{html.escape(label)}'>{html.escape(label)}</span>"
+
+
+def _review_label_options_html(selected: str | None) -> str:
+    opts = [f"<option value=''{' selected' if not selected else ''}>not reviewed</option>"]
+    for label in _REVIEW_LABEL_CHOICES:
+        sel = " selected" if selected == label else ""
+        opts.append(f"<option value='{label}'{sel}>{html.escape(label)}</option>")
+    return "".join(opts)
+
+
+def _review_form_row_html(t: dict) -> str:
+    """Hidden by default, toggled by the matching row's 'review' button
+    (same click-to-expand pattern as setup-chip/setup-detail elsewhere on
+    this page) -- a sibling <tr> rather than a nested element, since this
+    lives inside a <table>. `data-trade-id` (not a synthetic data-key) is
+    enough to restore expanded state across a push-driven rebuild, same
+    reasoning as setup-chip's own data-key: it's already unique per row,
+    a trade id is never reused."""
+    note = html.escape(t.get("review_note") or "")
+    ideal = t.get("ideal_entry_price")
+    ideal_value = "" if ideal is None else _fmt(ideal, 4)
+    return (
+        f"<tr class='review-form-row' hidden data-trade-id='{t['id']}'>"
+        "<td colspan='11'>"
+        "<table class='detail'>"
+        "<tr><th>review label</th><td>"
+        f"<select class='review-label-select'>{_review_label_options_html(t.get('review_label'))}</select>"
+        "</td></tr>"
+        "<tr><th>review note</th><td>"
+        f"<input type='text' class='review-note-input' maxlength='500' value=\"{note}\"></td></tr>"
+        "<tr><th>ideal entry price</th><td>"
+        f"<input type='number' step='0.0001' class='review-ideal-entry-input' value='{ideal_value}'></td></tr>"
+        "</table>"
+        f"<button type='button' class='journal-review-save-btn' data-trade-id='{t['id']}'>Save review</button>"
+        " <span class='review-status muted'></span>"
+        "</td></tr>"
+    )
+
+
 def _journal_closed_rows_html(closed: list[dict]) -> str:
     if not closed:
-        return "<tr><td colspan='10' class='muted'>No closed trades yet.</td></tr>"
+        return "<tr><td colspan='11' class='muted'>No closed trades yet.</td></tr>"
     rows = []
     for t in closed:
         # symbol_switched isn't a trading outcome -- it's watchlist
@@ -1487,10 +1558,14 @@ def _journal_closed_rows_html(closed: list[dict]) -> str:
             f"<td>{shares_html}</td>"
             f"<td class='{cls}'>{pnl_pct}</td>"
             f"<td class='{cls}'>{pnl_dollars}</td>"
+            f"<td>{_review_label_badge_html(t.get('review_label'))} "
+            f"<button type='button' class='setup-chip journal-review-btn' "
+            f"data-trade-id='{t['id']}'>review</button></td>"
             "<td><button type='button' class='remove-btn journal-delete-btn' "
             f"data-trade-id='{t['id']}'>delete</button></td>"
             "</tr>"
         )
+        rows.append(_review_form_row_html(t))
     return "".join(rows)
 
 
@@ -1707,7 +1782,7 @@ def _page(full_states: dict[str, dict], recent_closed: list[dict], poll_enabled:
   <table class="detail">
     <tr><th>symbol</th><th>entry time</th><th>entry</th><th>exit time</th>
         <th>exit</th><th>reason</th><th>shares</th><th>P&amp;L %</th>
-        <th>P&amp;L $</th><th></th></tr>
+        <th>P&amp;L $</th><th>review</th><th></th></tr>
     <tbody id="journal-closed-tbody">{_journal_closed_rows_html(recent_closed)}</tbody>
   </table>
 </section>
@@ -1846,9 +1921,41 @@ function journalOpenHtml(open) {
     '<tr><th>unrealized P&amp;L $</th><td class="' + cls + '">' + fmtDollars(open.unrealized_pnl_dollars) + '</td></tr>' +
     '</table>';
 }
+// Human review/labeling (specs.md section 24) -- mirrors journal_store.
+// REVIEW_LABELS/app.py's _REVIEW_LABEL_CHOICES exactly.
+var REVIEW_LABEL_CHOICES = ['clean_signal', 'lucky', 'bad_signal'];
+function reviewLabelBadgeHtml(label) {
+  if (!label) return '<span class="muted">not reviewed</span>';
+  return '<span class="review-label review-label-' + esc(label) + '">' + esc(label) + '</span>';
+}
+function reviewLabelOptionsHtml(selected) {
+  let out = '<option value=""' + (!selected ? ' selected' : '') + '>not reviewed</option>';
+  REVIEW_LABEL_CHOICES.forEach(function (label) {
+    out += '<option value="' + label + '"' + (selected === label ? ' selected' : '') + '>' + label + '</option>';
+  });
+  return out;
+}
+function reviewFormRowHtml(t) {
+  // Mirrors _review_form_row_html (Python side) -- hidden by default,
+  // toggled by the matching row's "review" button, same click-to-expand
+  // pattern as setup-chip/setup-detail.
+  const note = esc(t.review_note || '');
+  const idealValue = (t.ideal_entry_price === null || t.ideal_entry_price === undefined)
+    ? '' : fmt(t.ideal_entry_price, 4);
+  return '<tr class="review-form-row" hidden data-trade-id="' + esc(t.id) + '">' +
+    '<td colspan="11"><table class="detail">' +
+    '<tr><th>review label</th><td><select class="review-label-select">' +
+    reviewLabelOptionsHtml(t.review_label) + '</select></td></tr>' +
+    '<tr><th>review note</th><td><input type="text" class="review-note-input" ' +
+    'maxlength="500" value="' + note + '"></td></tr>' +
+    '<tr><th>ideal entry price</th><td><input type="number" step="0.0001" ' +
+    'class="review-ideal-entry-input" value="' + idealValue + '"></td></tr>' +
+    '</table><button type="button" class="journal-review-save-btn" data-trade-id="' +
+    esc(t.id) + '">Save review</button> <span class="review-status muted"></span></td></tr>';
+}
 function journalClosedRows(closed) {
   if (!closed || !closed.length) {
-    return '<tr><td colspan="10" class="muted">No closed trades yet.</td></tr>';
+    return '<tr><td colspan="11" class="muted">No closed trades yet.</td></tr>';
   }
   return closed.map(function(t) {
     // symbol_switched = watchlist housekeeping, not a trading outcome --
@@ -1868,8 +1975,11 @@ function journalClosedRows(closed) {
       '<td>' + sharesHtml + '</td>' +
       '<td class="' + cls + '">' + pnlPct + '</td>' +
       '<td class="' + cls + '">' + pnlDollars + '</td>' +
+      '<td>' + reviewLabelBadgeHtml(t.review_label) +
+      ' <button type="button" class="setup-chip journal-review-btn" data-trade-id="' +
+      esc(t.id) + '">review</button></td>' +
       '<td><button type="button" class="remove-btn journal-delete-btn" data-trade-id="' +
-      esc(t.id) + '">delete</button></td></tr>';
+      esc(t.id) + '">delete</button></td></tr>' + reviewFormRowHtml(t);
   }).join('');
 }
 function removeButtonHtml(symbol) {
@@ -2073,7 +2183,18 @@ function render(data) {
     if (detail) detail.hidden = false;
   });
 
-  document.getElementById('journal-closed-tbody').innerHTML = journalClosedRows(data.recent_closed);
+  // Same expanded-state preservation as setup-chip/level-chip above,
+  // applied to the review-form rows (specs.md section 24) -- a push
+  // landing while a review edit is open must not silently collapse it.
+  const closedTbody = document.getElementById('journal-closed-tbody');
+  const expandedReviewIds = new Set();
+  closedTbody.querySelectorAll('.review-form-row').forEach(function (row) {
+    if (!row.hidden) expandedReviewIds.add(row.getAttribute('data-trade-id'));
+  });
+  closedTbody.innerHTML = journalClosedRows(data.recent_closed);
+  closedTbody.querySelectorAll('.review-form-row').forEach(function (row) {
+    if (expandedReviewIds.has(row.getAttribute('data-trade-id'))) row.hidden = false;
+  });
   document.getElementById('slot-count').textContent = syms.length + ' / ' + maxSymbols + ' symbols watched';
   const paramsEl = document.getElementById('strategy-params');
   if (paramsEl && data.strategy_params) paramsEl.textContent = strategyParamsText(data.strategy_params);
@@ -2226,6 +2347,60 @@ document.getElementById('journal-closed-tbody').addEventListener('click', async 
     });
   } catch (err) {
     // leave the row as-is; the next poll reflects actual state either way
+  }
+  refresh();
+});
+
+// Per-row review toggle: reveals/hides the matching review-form-row,
+// which is always the immediately-following sibling <tr> (specs.md
+// section 24) -- same click-to-expand pattern as setup-chip/setup-
+// detail, just a sibling <tr> instead of a nested element (this lives
+// inside a <table>, which can't nest an arbitrary block inside a <td>
+// the way a card can).
+document.getElementById('journal-closed-tbody').addEventListener('click', function (e) {
+  const btn = e.target.closest('.journal-review-btn');
+  if (!btn) return;
+  const row = btn.closest('tr').nextElementSibling;
+  if (row && row.classList.contains('review-form-row')) row.hidden = !row.hidden;
+});
+
+// Per-row review save: full-replace semantics (specs.md section 24) --
+// whatever's currently in the three fields is what gets sent and stored,
+// no merge with the prior review. An empty ideal-entry-price input sends
+// null, not an empty string or 0.
+document.getElementById('journal-closed-tbody').addEventListener('click', async function (e) {
+  const btn = e.target.closest('.journal-review-save-btn');
+  if (!btn) return;
+  const tradeId = btn.getAttribute('data-trade-id');
+  const formRow = btn.closest('tr');
+  const label = formRow.querySelector('.review-label-select').value || null;
+  const note = formRow.querySelector('.review-note-input').value || null;
+  const idealRaw = formRow.querySelector('.review-ideal-entry-input').value;
+  const statusEl = formRow.querySelector('.review-status');
+  btn.disabled = true;
+  statusEl.textContent = '';
+  statusEl.className = 'review-status muted';
+  try {
+    const r = await fetch('/api/trades/' + encodeURIComponent(tradeId) + '/review', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        review_label: label, review_note: note,
+        ideal_entry_price: idealRaw === '' ? null : idealRaw,
+      }),
+    });
+    const body = await r.json();
+    if (!body.ok) {
+      statusEl.textContent = body.reason || 'save failed';
+      statusEl.className = 'review-status neg';
+      btn.disabled = false;
+      return;  // don't refresh() away the error message on a failed save
+    }
+  } catch (err) {
+    statusEl.textContent = 'request failed';
+    statusEl.className = 'review-status neg';
+    btn.disabled = false;
+    return;
   }
   refresh();
 });
@@ -2403,6 +2578,13 @@ table.detail th{color:var(--muted);font-weight:500;width:45%}
 .breakdown-chip{border-color:var(--neg)}
 .row-housekeeping td{color:var(--muted)}
 .journal-delete-btn{padding:.15rem .45rem;font-size:.68rem}
+.journal-review-btn{padding:.15rem .45rem;font-size:.68rem}
+.review-label{display:inline-block;padding:.1rem .5rem;border-radius:1rem;
+  font-size:.68rem;font-weight:600}
+.review-label-clean_signal{background:rgba(62,207,126,.18);color:var(--pos)}
+.review-label-bad_signal{background:rgba(224,90,90,.18);color:var(--neg)}
+.review-label-lucky{background:rgba(201,162,39,.18);color:var(--pending)}
+.review-form-row td{background:var(--bg)}
 .footer{color:var(--muted);font-size:.8rem;margin-top:1rem}
 """
 
@@ -2609,6 +2791,34 @@ def create_app(*, fetch_bars, watch_symbol=None,
             )
         deleted = poller.delete_closed_trade(trade_id)
         return JSONResponse({"ok": deleted}, status_code=200 if deleted else 404)
+
+    @app.post("/api/trades/{trade_id}/review")
+    async def api_review_trade(trade_id: int, request: Request):
+        # Human review/labeling for a CLOSED trade (specs.md section 24)
+        # -- JSON body, like /api/watch_note and /api/reverse_splits, not
+        # tied to a plain HTML form. Full-replace semantics: whatever's in
+        # the body becomes the new stored values, no merge with whatever
+        # was there before (see JournalStore.review_trade's docstring for
+        # why no history table is needed here). ideal_entry_price is
+        # cast to float defensively (a JS <input type="number"> already
+        # sends a number, but a raw JSON/curl caller might send a string)
+        # -- a bad value is a clean 409, never a 500.
+        body = await request.json()
+        review_label = body.get("review_label") or None
+        review_note = body.get("review_note") or None
+        raw_ideal = body.get("ideal_entry_price")
+        ideal_entry_price = None
+        if raw_ideal is not None and raw_ideal != "":
+            try:
+                ideal_entry_price = float(raw_ideal)
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"ok": False, "reason": f"{raw_ideal!r} is not a valid price"},
+                    status_code=409,
+                )
+        ok, reason = poller.review_trade(trade_id, review_label, review_note,
+                                         ideal_entry_price)
+        return JSONResponse({"ok": ok, "reason": reason}, status_code=200 if ok else 409)
 
     @app.post("/api/journal/clear_symbol_switched")
     async def api_journal_clear_symbol_switched():

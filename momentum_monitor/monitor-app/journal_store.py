@@ -119,6 +119,28 @@ snapshotted onto `trades` at all (unlike every entry-time-locked value
 above), since it never gates or influences an entry decision and is
 meant to reflect whatever the CURRENT live threshold says whenever a
 symbol's panel is viewed, not a value frozen at some past moment.
+
+Also (added 2026-09-19, specs.md section 24, "human review/labeling" --
+section 7's last remaining data-collection gap): `trades` gains
+`review_label`/`review_note`/`ideal_entry_price` -- a human's OWN
+after-the-fact judgment about an already-CLOSED trade, the first place
+in this whole journal a human opinion gets attached to a mechanically-
+logged decision rather than something the system computed about itself.
+Unlike watch_notes/reverse_splits/strategy_params_history, these are
+PLAIN mutable columns with no separate append-only history table:
+reviewing a trade again just overwrites the existing values in place --
+a symbol's reason for being watched can genuinely differ across
+separate occasions (which is why watch_notes needed history), but a
+review is a single, current, replaceable judgment about one already-
+finished, immutable-outcome trade, not a sequence of distinct past
+events worth preserving individually. `review_label` is constrained to
+`REVIEW_LABELS` below; `review_note` gets the same length-cap treatment
+as `watch_note`/reverse-split notes (validated independently, per this
+project's "each note field validated on its own" precedent, even though
+the limit happens to be the same number). `review_trade` refuses to set
+any of these on a trade that's still open (`exit_ts IS NULL`) -- an open
+position's outcome isn't known yet, so labeling it doesn't mean
+anything yet.
 """
 from __future__ import annotations
 
@@ -208,6 +230,9 @@ _ADDED_COLUMNS = [
     ("swing_low_buffer_pct_used", "REAL"),
     ("pattern_progress_threshold_pct_used", "REAL"),
     ("phase_transitioned_ts", "INTEGER"),
+    ("review_label", "TEXT"),
+    ("review_note", "TEXT"),
+    ("ideal_entry_price", "REAL"),
 ]
 
 # A note longer than this is rejected outright (409), never silently
@@ -337,6 +362,42 @@ _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 class InvalidReverseSplitError(ValueError):
     """Raised by add_reverse_split for a blank split_date/ratio, a
     non-ISO split_date, or a note over MAX_REVERSE_SPLIT_NOTE_LENGTH."""
+
+
+# Human review/labeling (specs.md section 24) -- the categorization axis
+# is SIGNAL QUALITY, deliberately independent of outcome (win/loss is
+# already fully captured by realized_pnl_pct/exit_reason, so a label
+# duplicating that would add nothing). Three categories, chosen to
+# directly answer the original framing: "was this a genuine, trustworthy
+# signal, or did it just happen to work out (or not) by chance?"
+#   - "clean_signal": the setup was genuine and well-formed -- entry
+#     criteria were legitimately met, and it reads correctly in
+#     hindsight. A clean signal can still LOSE (normal variance) without
+#     becoming "bad_signal" -- this label is about whether the signal
+#     itself was trustworthy, not whether it happened to win.
+#   - "lucky": won, but not because the signal was actually sound --
+#     credits the outcome to chance rather than the setup.
+#   - "bad_signal": the setup itself was flawed or questionable (chop, a
+#     marginal/false confirmation, thin volume) regardless of how it
+#     turned out -- a loss here is a well-deserved one, not variance.
+# A trade with no review yet has review_label = NULL, distinct from any
+# of the three real categories -- "not yet reviewed" must never be
+# confused with a real judgment call.
+REVIEW_LABELS = frozenset({"clean_signal", "lucky", "bad_signal"})
+
+# Same length-cap treatment as MAX_WATCH_NOTE_LENGTH/MAX_REVERSE_SPLIT_
+# NOTE_LENGTH -- its own constant, not reused, per this project's "each
+# note field validated independently" precedent (specs.md section 8),
+# even though the number happens to match.
+MAX_REVIEW_NOTE_LENGTH = 500
+
+
+class InvalidReviewError(ValueError):
+    """Raised by review_trade for: no trade with the given id, a trade
+    that's still open (exit_ts IS NULL -- its outcome isn't known yet,
+    so labeling it doesn't mean anything), a review_label outside
+    REVIEW_LABELS, a review_note over MAX_REVIEW_NOTE_LENGTH, or a
+    non-positive ideal_entry_price."""
 
 
 class JournalStore:
@@ -626,6 +687,51 @@ class JournalStore:
             (symbol.strip().upper(),),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # -- human review/labeling for closed trades (specs.md section 24) ----
+
+    def review_trade(self, trade_id: int, *, review_label: str | None = None,
+                     review_note: str | None = None,
+                     ideal_entry_price: float | None = None) -> None:
+        """Sets or updates review_label/review_note/ideal_entry_price on
+        an already-CLOSED trade -- a full replace, not a merge (there's
+        no history table here, unlike watch_notes: see this module's own
+        docstring for why). Re-reviewing a trade just calls this again;
+        whatever the three fields were on the previous call is simply
+        overwritten, never accumulated.
+
+        Raises InvalidReviewError (changing nothing) for: no trade with
+        this id, a trade that's still open (its outcome isn't known yet),
+        an unrecognized review_label, an over-length review_note, or a
+        non-positive ideal_entry_price. `review_label`/`review_note`/
+        `ideal_entry_price` are each independently optional (None) --
+        e.g. jotting a note without committing to a category yet is
+        valid; None for all three is also valid (clears a prior review)."""
+        row = self._conn.execute(
+            "SELECT exit_ts FROM trades WHERE id = ?", (trade_id,),
+        ).fetchone()
+        if row is None:
+            raise InvalidReviewError(f"no trade with id {trade_id}")
+        if row["exit_ts"] is None:
+            raise InvalidReviewError(
+                f"trade {trade_id} is still open; only closed trades can be reviewed")
+        if review_label is not None and review_label not in REVIEW_LABELS:
+            raise InvalidReviewError(
+                f"{review_label!r} is not a recognized review label "
+                f"(expected one of: {', '.join(sorted(REVIEW_LABELS))})")
+        if review_note is not None and len(review_note) > MAX_REVIEW_NOTE_LENGTH:
+            raise InvalidReviewError(
+                f"review_note is {len(review_note)} characters, over the "
+                f"{MAX_REVIEW_NOTE_LENGTH}-character limit")
+        if ideal_entry_price is not None and ideal_entry_price <= 0:
+            raise InvalidReviewError(
+                f"ideal_entry_price must be positive, got {ideal_entry_price}")
+        self._conn.execute(
+            "UPDATE trades SET review_label = ?, review_note = ?, "
+            "ideal_entry_price = ? WHERE id = ?",
+            (review_label, review_note, ideal_entry_price, trade_id),
+        )
+        self._conn.commit()
 
     def open_position_for(self, symbol: str) -> OpenPosition | None:
         """The currently-open (exit_ts IS NULL) position for `symbol`, if

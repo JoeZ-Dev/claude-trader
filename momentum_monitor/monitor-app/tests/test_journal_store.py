@@ -664,6 +664,152 @@ def test_add_reverse_split_rejects_an_over_length_note(tmp_path):
     assert store.reverse_splits_for("BIAF") == []
 
 
+# -- human review/labeling for closed trades (specs.md section 24) ------
+
+def test_review_trade_stores_label_note_and_ideal_entry_price(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    created = store.create(_position(entry_price=10.0))
+    store.close_position(created, ExitEvent(exit_ts=200, exit_price=11.0,
+                                            exit_reason="trailing_stop"))
+    (closed,) = store.recent_closed()
+
+    store.review_trade(closed["id"], review_label="clean_signal",
+                       review_note="textbook breakout, held perfectly",
+                       ideal_entry_price=10.05)
+
+    (reviewed,) = store.recent_closed()
+    assert reviewed["review_label"] == "clean_signal"
+    assert reviewed["review_note"] == "textbook breakout, held perfectly"
+    assert reviewed["ideal_entry_price"] == 10.05
+
+
+def test_a_new_closed_trade_has_no_review_yet():
+    # NULL, not some fake default category -- "not yet reviewed" must
+    # never be confused with a real judgment call.
+    store = JournalStore(":memory:")
+    created = store.create(_position())
+    store.close_position(created, ExitEvent(exit_ts=200, exit_price=10.9,
+                                            exit_reason="trailing_stop"))
+    (closed,) = store.recent_closed()
+    assert closed["review_label"] is None
+    assert closed["review_note"] is None
+    assert closed["ideal_entry_price"] is None
+
+
+def test_reviewing_an_open_trade_is_rejected():
+    from journal_store import InvalidReviewError
+    store = JournalStore(":memory:")
+    created = store.create(_position())  # never closed
+    with pytest.raises(InvalidReviewError):
+        store.review_trade(created.id, review_label="clean_signal")
+    # nothing was written
+    assert store.open_position_for("AEHL").id == created.id
+
+
+def test_reviewing_an_unknown_trade_id_is_rejected():
+    from journal_store import InvalidReviewError
+    store = JournalStore(":memory:")
+    with pytest.raises(InvalidReviewError):
+        store.review_trade(999999, review_label="clean_signal")
+
+
+def test_re_reviewing_a_trade_updates_in_place_not_a_duplicate():
+    store = JournalStore(":memory:")
+    created = store.create(_position())
+    store.close_position(created, ExitEvent(exit_ts=200, exit_price=10.9,
+                                            exit_reason="trailing_stop"))
+    (closed,) = store.recent_closed()
+
+    store.review_trade(closed["id"], review_label="bad_signal", review_note="chased it")
+    store.review_trade(closed["id"], review_label="clean_signal",
+                       review_note="actually fine on review", ideal_entry_price=9.9)
+
+    all_closed = store.recent_closed()
+    assert len(all_closed) == 1  # still exactly one trade row, no duplicate
+    (reviewed,) = all_closed
+    assert reviewed["review_label"] == "clean_signal"       # overwritten, not appended
+    assert reviewed["review_note"] == "actually fine on review"
+    assert reviewed["ideal_entry_price"] == 9.9
+
+
+def test_review_trade_rejects_an_unrecognized_label():
+    from journal_store import InvalidReviewError
+    store = JournalStore(":memory:")
+    created = store.create(_position())
+    store.close_position(created, ExitEvent(exit_ts=200, exit_price=10.9,
+                                            exit_reason="trailing_stop"))
+    (closed,) = store.recent_closed()
+    with pytest.raises(InvalidReviewError):
+        store.review_trade(closed["id"], review_label="not_a_real_category")
+    # nothing was written
+    assert store.recent_closed()[0]["review_label"] is None
+
+
+def test_review_trade_rejects_an_over_length_note():
+    from journal_store import InvalidReviewError, MAX_REVIEW_NOTE_LENGTH
+    store = JournalStore(":memory:")
+    created = store.create(_position())
+    store.close_position(created, ExitEvent(exit_ts=200, exit_price=10.9,
+                                            exit_reason="trailing_stop"))
+    (closed,) = store.recent_closed()
+    with pytest.raises(InvalidReviewError):
+        store.review_trade(closed["id"], review_note="x" * (MAX_REVIEW_NOTE_LENGTH + 1))
+    assert store.recent_closed()[0]["review_note"] is None
+
+
+def test_review_trade_rejects_a_non_positive_ideal_entry_price():
+    from journal_store import InvalidReviewError
+    store = JournalStore(":memory:")
+    created = store.create(_position())
+    store.close_position(created, ExitEvent(exit_ts=200, exit_price=10.9,
+                                            exit_reason="trailing_stop"))
+    (closed,) = store.recent_closed()
+    with pytest.raises(InvalidReviewError):
+        store.review_trade(closed["id"], ideal_entry_price=0.0)
+    with pytest.raises(InvalidReviewError):
+        store.review_trade(closed["id"], ideal_entry_price=-5.0)
+    assert store.recent_closed()[0]["ideal_entry_price"] is None
+
+
+def test_review_trade_allows_partial_fields_note_only():
+    # Jotting a note without committing to a category yet is valid.
+    store = JournalStore(":memory:")
+    created = store.create(_position())
+    store.close_position(created, ExitEvent(exit_ts=200, exit_price=10.9,
+                                            exit_reason="trailing_stop"))
+    (closed,) = store.recent_closed()
+    store.review_trade(closed["id"], review_note="need to think about this one")
+    (reviewed,) = store.recent_closed()
+    assert reviewed["review_label"] is None
+    assert reviewed["review_note"] == "need to think about this one"
+
+
+def test_review_trade_migrates_onto_an_existing_trades_table(tmp_path):
+    # Same migration discipline as every prior trades-table addition
+    # (setup_type/factors, watch_note, ...): an existing journal.db
+    # without these three columns must not crash on open, and must
+    # accept a real review call afterward.
+    db_path = tmp_path / "journal.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(_PRE_MIGRATION_SCHEMA)
+    conn.execute(
+        "INSERT INTO trades (symbol, entry_ts, entry_price, high_water_mark, "
+        "stop_level, exit_ts, exit_price, exit_reason, realized_pnl_pct) "
+        "VALUES ('AEHL', 100, 10.0, 10.0, 9.5, 200, 10.9, 'trailing_stop', 9.0)",
+    )
+    conn.commit()
+    conn.close()
+
+    store = JournalStore(db_path)  # must not raise
+    (closed,) = store.recent_closed()
+    assert closed["review_label"] is None  # pre-migration row has none of the three
+
+    store.review_trade(closed["id"], review_label="lucky", review_note="got saved by a bounce")
+    (reviewed,) = store.recent_closed()
+    assert reviewed["review_label"] == "lucky"
+    assert reviewed["review_note"] == "got saved by a bounce"
+
+
 def test_watch_note_migrates_onto_an_existing_trades_table(tmp_path):
     db_path = tmp_path / "journal.db"
     conn = sqlite3.connect(str(db_path))
