@@ -284,6 +284,14 @@ _PARAM_BOUNDS = {
     "session_volume_multiple": (0.0, 50.0),
     "continuation_lookback_days": (0.0, 30.0),
     "continuation_threshold_pct": (0.0, 5.0),
+    # How long a persisted confirmed=True stays actionable for a NEW
+    # entry after it was last genuinely reaffirmed (phase 3.6 follow-up,
+    # specs.md section 20) -- 0 would make it impossible to ever enter
+    # (nothing is fresh at ts==confirmed_at_ts plus any real gap), 3600
+    # (1 hour) is a generous upper bound comfortably above any
+    # legitimate use, same "wide but not unbounded" pattern as the other
+    # thresholds here.
+    "confirmation_freshness_seconds": (0.0, 3600.0),
 }
 
 # current_equity's own seed/reset fallback (specs.md section 7) -- "2000

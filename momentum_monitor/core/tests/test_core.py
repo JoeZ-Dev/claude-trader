@@ -657,6 +657,53 @@ def test_evaluate_hold_time_aware_watch_added_ts_none_is_unrestricted_default():
     assert with_none == without
 
 
+# -- confirmed_at_ts (phase 3.6 follow-up, specs.md section 20): exposes --
+# WHEN a persisted confirmed=True was last genuinely reaffirmed, so a
+# CONSUMER can gate staleness without evaluate_hold_time_aware's own
+# monotonic confirmed logic changing at all.
+
+def test_confirmed_at_ts_is_none_before_ever_confirming():
+    bars = [bar(0, 8.5, 8.6, 8.4, 8.72, 100_000)]  # on-side, but only 10s -- not confirmed yet
+    state = evaluate_hold_time_aware(bars, level_price=8.69, direction="above", required_seconds=30.0)
+    assert state.confirmed is False
+    assert state.confirmed_at_ts is None
+
+
+def test_confirmed_at_ts_refreshes_on_every_reaffirming_bar():
+    # A hold that confirms and then CONTINUES (no reversal) must keep
+    # confirmed_at_ts current -- this is the "recently confirmed, still
+    # actionable" property: as long as the hold is genuinely ongoing,
+    # it's never stale.
+    bars = [
+        bar(0, 8.5, 8.6, 8.4, 8.72, 100_000),
+        bar(10, 8.72, 8.9, 8.6, 8.85, 100_000),
+        bar(20, 8.72, 8.9, 8.6, 8.90, 100_000),  # confirms here (elapsed=30)
+        bar(30, 8.72, 8.9, 8.6, 8.92, 100_000),  # still on-side -- refreshes
+        bar(40, 8.72, 8.9, 8.6, 8.95, 100_000),  # still on-side -- refreshes again
+    ]
+    state = evaluate_hold_time_aware(bars, level_price=8.69, direction="above", required_seconds=30.0)
+    assert state.confirmed is True
+    assert state.confirmed_at_ts == 40  # the LAST on-side bar, not the first confirming one
+
+
+def test_confirmed_at_ts_freezes_at_the_last_reaffirming_bar_after_a_reversal():
+    # Mirrors the real sharp-breach scenario (specs.md section 19/20):
+    # confirmed stays True (monotonic, unchanged) through a later
+    # reversal, but confirmed_at_ts freezes at the last bar where it was
+    # GENUINELY on-side and past threshold, exposing exactly how stale
+    # that persisted True actually is.
+    bars = [
+        bar(0, 8.5, 8.6, 8.4, 8.72, 100_000),
+        bar(10, 8.72, 8.9, 8.6, 8.85, 100_000),
+        bar(20, 8.72, 8.9, 8.6, 8.90, 100_000),  # confirms here (elapsed=30)
+        bar(30, 8.72, 8.9, 8.6, 8.92, 100_000),  # still on-side -- confirmed_at_ts=30
+        bar(40, 8.72, 8.9, 8.0, 8.10, 100_000),  # reversal -- confirmed stays True, confirmed_at_ts freezes
+    ]
+    state = evaluate_hold_time_aware(bars, level_price=8.69, direction="above", required_seconds=30.0)
+    assert state.confirmed is True   # unchanged, still monotonic
+    assert state.confirmed_at_ts == 30  # frozen at the last genuinely-on-side bar
+
+
 def test_macd_time_aware_exactly_equals_bar_count_macd_on_uniform_cadence():
     # Composed directly from ema_time_aware (specs.md section 19) --
     # bit-exact equal to macd() on uniform 10s cadence, by ema_time_

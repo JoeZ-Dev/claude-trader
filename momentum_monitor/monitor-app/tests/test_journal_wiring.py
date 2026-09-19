@@ -314,26 +314,18 @@ def test_two_symbols_journal_positions_are_fully_independent(tmp_path):
             store.open_position_for(s) is not None for s in ("AEHL", "MSFT")
         ))
         msft_before = store.open_position_for("MSFT")
-        aehl_before_breach = store.open_position_for("AEHL")
 
         # drive AEHL to its stop-out (its 3rd batch; MSFT's queue is
-        # already exhausted, so this resync is a harmless no-op for it)
+        # already exhausted, so this resync is a harmless no-op for it).
+        # This sharp drop also recomputes round_number_reclaim's trigger
+        # to a much lower price, which bars from hours (here, tens of
+        # seconds) earlier in the SAME session already satisfy -- without
+        # the confirmation-freshness gate (specs.md section 20), this
+        # would spuriously reopen a NEW position in the same tick (a real
+        # bug found and fixed this session, see section 19/20); the gate
+        # correctly blocks it, so AEHL simply closes clean.
         _resync(c)
-        # AEHL's ORIGINAL position must have stopped out -- checked by id,
-        # not by "no position at all" (see below: a KNOWN, documented,
-        # open risk in evaluate_hold_time_aware -- specs.md section 19 --
-        # means round_number_reclaim's dynamically-recomputed trigger can
-        # spuriously re-confirm from stale same-session bars right after a
-        # sharp drop, immediately reopening a NEW position in the same
-        # tick. That reopening is a real, flagged, NOT-yet-fixed
-        # limitation of this migration, not something this test should
-        # silently pretend doesn't happen -- it's asserted on explicitly
-        # here instead of hidden, and this test's own actual purpose
-        # (cross-symbol independence, below) is unaffected either way.)
-        aehl_after_breach = store.open_position_for("AEHL")
-        assert aehl_before_breach.id != (aehl_after_breach.id if aehl_after_breach else None)
-        if aehl_after_breach is not None:
-            assert aehl_after_breach.entry_ts > aehl_before_breach.entry_ts
+        assert store.open_position_for("AEHL") is None
 
         # MSFT must be completely unaffected: still open, identical values
         msft_after = store.open_position_for("MSFT")
@@ -350,12 +342,7 @@ def test_two_symbols_journal_positions_are_fully_independent(tmp_path):
 
     # MSFT's row is still open in the DB, not just in the in-memory slot
     assert store.open_position_for("MSFT") is not None
-    # AEHL's ORIGINAL position stays closed (checked by id, same known,
-    # documented spurious-reopen risk noted above -- a DIFFERENT position
-    # may legitimately be open here, that is not what this assertion is
-    # about).
-    aehl_final = store.open_position_for("AEHL")
-    assert aehl_before_breach.id != (aehl_final.id if aehl_final else None)
+    assert store.open_position_for("AEHL") is None
 
 
 def test_removing_one_symbol_does_not_close_another_symbols_position(tmp_path):

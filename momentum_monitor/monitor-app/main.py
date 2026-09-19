@@ -59,6 +59,10 @@ Environment:
   CONTINUATION_THRESHOLD_PCT  how large a single day's move (either
                         direction) must be to flag that day -- same
                         seed-only treatment                  (default 0.5)
+  CONFIRMATION_FRESHNESS_SECONDS  how long a persisted confirmed=True
+                        stays actionable for a NEW entry after it was
+                        last genuinely reaffirmed (specs.md section 20)
+                        -- same seed-only treatment            (default 30)
 
 Run:  uvicorn main:app --host 0.0.0.0 --port 8012
 """
@@ -89,6 +93,7 @@ PATTERN_PROGRESS_THRESHOLD_PCT = float(
 SESSION_VOLUME_MULTIPLE = float(os.environ.get("SESSION_VOLUME_MULTIPLE", "3.0"))
 CONTINUATION_LOOKBACK_DAYS = float(os.environ.get("CONTINUATION_LOOKBACK_DAYS", "7"))
 CONTINUATION_THRESHOLD_PCT = float(os.environ.get("CONTINUATION_THRESHOLD_PCT", "0.5"))
+CONFIRMATION_FRESHNESS_SECONDS = float(os.environ.get("CONFIRMATION_FRESHNESS_SECONDS", "30"))
 
 _client = httpx.AsyncClient(timeout=10.0)
 _journal_store = JournalStore(JOURNAL_DB_PATH, default_params={
@@ -101,6 +106,7 @@ _journal_store = JournalStore(JOURNAL_DB_PATH, default_params={
     "session_volume_multiple": SESSION_VOLUME_MULTIPLE,
     "continuation_lookback_days": CONTINUATION_LOOKBACK_DAYS,
     "continuation_threshold_pct": CONTINUATION_THRESHOLD_PCT,
+    "confirmation_freshness_seconds": CONFIRMATION_FRESHNESS_SECONDS,
 })
 
 
@@ -180,4 +186,5 @@ app = create_app(fetch_bars=fetch_bars, watch_symbol=WATCH_SYMBOL,
                  session_volume_multiple=SESSION_VOLUME_MULTIPLE,
                  continuation_lookback_days=CONTINUATION_LOOKBACK_DAYS,
                  continuation_threshold_pct=CONTINUATION_THRESHOLD_PCT,
+                 confirmation_freshness_seconds=CONFIRMATION_FRESHNESS_SECONDS,
                  fetch_daily_bars=fetch_daily_bars)

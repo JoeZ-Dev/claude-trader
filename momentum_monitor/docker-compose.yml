@@ -104,6 +104,11 @@ services:
       # treatment as the params above.
       CONTINUATION_LOOKBACK_DAYS: "${CONTINUATION_LOOKBACK_DAYS:-7}"
       CONTINUATION_THRESHOLD_PCT: "${CONTINUATION_THRESHOLD_PCT:-0.5}"
+      # Confirmation-freshness gate (specs.md section 20) -- how long a
+      # persisted confirmed=True stays actionable for a NEW entry after
+      # it was last genuinely reaffirmed; same seed-only treatment as
+      # the params above.
+      CONFIRMATION_FRESHNESS_SECONDS: "${CONFIRMATION_FRESHNESS_SECONDS:-30}"
     volumes:
       - ./monitor-app/data:/data
     depends_on:

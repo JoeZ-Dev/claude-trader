@@ -384,6 +384,17 @@ class HoldStateTimeAware:
     elapsed_seconds: float
     confirmed: bool
     failed_attempts: int = 0
+    # The ts of the most recent bar where `confirmed` was reaffirmed --
+    # still-on-side and still past `required_seconds` (phase 3.6 stage 3
+    # part 2 follow-up, specs.md section 19/20). Refreshes on EVERY such
+    # bar while a hold continues (staying current, not just "when it
+    # first happened"), and freezes at the last such bar once the streak
+    # breaks -- `confirmed` itself stays exactly as it was (unchanged,
+    # still monotonic), but this timestamp lets a CONSUMER measure how
+    # stale that persisted `confirmed=True` actually is, without this
+    # function needing any notion of "now" itself. `None` only when
+    # `confirmed` has never been true.
+    confirmed_at_ts: float | None = None
 
 
 def evaluate_hold_time_aware(
@@ -440,37 +451,26 @@ def evaluate_hold_time_aware(
     `None` (the default) disables this check entirely, for every
     existing caller/test that doesn't track a watch time.
 
-    KNOWN OPEN RISK, found but deliberately NOT fixed here (phase 3.6
-    stage 3 part 2, specs.md section 19 -- flagged for an explicit
-    decision, not silently patched): `confirmed` is still monotonic,
+    RESOLVED (phase 3.6, specs.md section 20 -- see section 19 for the
+    original finding): `confirmed` is STILL monotonic here, unchanged,
     same as `evaluate_hold` ("once confirmed, a single close back through
-    doesn't retroactively un-confirm history"). That was only ever safe
-    because every caller fed `evaluate_hold` a short, freshly-scoped bars
-    window (`live_cadence_tail`'s tail) -- "stays confirmed" meant
-    "stays confirmed for the rest of THIS short window," not "forever, no
-    matter how much later or how different the market looks." Now that
-    this function sees the FULL session directly, a DYNAMICALLY-derived
-    level_price (round_number_reclaim's nearest-round-number-above-
-    current-price, recomputed fresh every call) can, after a sharp price
-    drop, find itself ALREADY "satisfied" by bars from hours earlier in
-    the same session, when price was much higher -- found real via a
-    downstream integration test (a stop-out on a sharp drop immediately
-    followed by a spurious fresh entry, using stale pre-drop bars against
-    the newly-lower trigger). A first attempted fix (reset `confirmed` on
-    every reversal) was reverted: it also broke the genuine, load-bearing
-    "recently confirmed, still actionable" property that real entries
-    depend on (the live entry bar itself is often one tick back through
-    the level even while a real, current hold is still very much in
-    play) -- 20+ existing tests, and the real entry-firing design,
-    assume a brief pullback right after confirming doesn't erase it. The
-    real distinguishing factor is TIME-BASED staleness (a one-tick,
-    seconds-old pullback vs. an hours-old, since-reversed regime), not a
-    simple has-it-ever-reversed check, and needs its own careful design
-    pass rather than a quick patch under this prompt.
+    doesn't retroactively un-confirm history") -- deliberately left
+    untouched, since a "reset confirmed on any reversal" attempt was
+    tried and reverted (it broke the genuine, load-bearing "recently
+    confirmed, still actionable" property 20+ existing tests and the real
+    entry-firing design depend on: the live entry bar itself is often one
+    tick back through the level even while a real, current hold is still
+    very much in play). Instead, `confirmed_at_ts` (above) exposes WHEN
+    the persisted `confirmed=True` was last genuinely reaffirmed, so a
+    CONSUMER (monitor-app/journal_logic.py's `_first_newly_confirmed`)
+    can apply a staleness gate at the point confirmation is actually
+    acted on, without this function's own state machine needing any
+    notion of "now" -- see that function's docstring for the fix itself.
     """
     streak_start_ts = None
     failed_attempts = 0
     confirmed = False
+    confirmed_at_ts = None
     elapsed_seconds = 0.0
     was_attempting = False
 
@@ -485,6 +485,7 @@ def evaluate_hold_time_aware(
             if elapsed_seconds >= required_seconds and (
                     watch_added_ts is None or b["ts"] >= watch_added_ts):
                 confirmed = True
+                confirmed_at_ts = b["ts"]  # refreshed every reaffirming bar, not just the first
         else:
             if was_attempting and streak_start_ts is not None and not confirmed:
                 failed_attempts += 1
@@ -495,5 +496,5 @@ def evaluate_hold_time_aware(
     return HoldStateTimeAware(
         level_price=level_price, direction=direction,
         elapsed_seconds=elapsed_seconds, confirmed=confirmed,
-        failed_attempts=failed_attempts,
+        failed_attempts=failed_attempts, confirmed_at_ts=confirmed_at_ts,
     )

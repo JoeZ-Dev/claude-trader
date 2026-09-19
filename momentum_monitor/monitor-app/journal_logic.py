@@ -234,15 +234,47 @@ def _phase1_anchor(candidate_anchor: float, entry_price: float) -> float:
     return min(candidate_anchor, entry_price)
 
 
-def _first_newly_confirmed(setups: list[dict],
-                           was_confirmed_types: frozenset[str]) -> dict | None:
+def _first_newly_confirmed(setups: list[dict], was_confirmed_types: frozenset[str],
+                           now_ts: float, confirmation_freshness_seconds: float) -> dict | None:
     """The first (closest -- setups is pre-sorted ascending by distance,
     per setup_types.evaluate_setups' own contract) setup whose type just
-    transitioned hold.confirmed False->True. None if none did. A type
-    that's confirmed but was ALSO confirmed last tick doesn't count --
-    that's not a fresh transition, it's the same one continuing."""
+    transitioned hold.confirmed False->True AND whose confirmation is
+    still FRESH. None if none qualify. A type that's confirmed but was
+    ALSO confirmed last tick doesn't count -- that's not a fresh
+    transition, it's the same one continuing.
+
+    Staleness gate (phase 3.6 follow-up, specs.md section 20): a real bug
+    found via downstream regression during the ema/relative_volume/
+    evaluate_hold migration (section 19) -- once evaluate_hold_time_aware
+    sees the FULL session, a DYNAMICALLY-derived trigger (round_number_
+    reclaim's nearest-round-number-above-current-price, recomputed every
+    call) can, after a sharp price drop, find itself satisfied by bars
+    from hours (or even just tens of seconds) earlier in the SAME
+    session, when price was very different -- `confirmed` is monotonic
+    by design (core/levels.py's `evaluate_hold_time_aware`, deliberately
+    left untouched: a "reset confirmed on any reversal" attempt broke
+    the load-bearing "recently confirmed, still actionable" property 20+
+    other tests depend on) and `was_confirmed_types` can legitimately
+    have "forgotten" a type between ticks (e.g. its trigger recomputed
+    to a DIFFERENT price and was momentarily unconfirmed), making a
+    stale, long-since-irrelevant confirmation look like a brand new one.
+
+    Fixed HERE, at the point confirmation is actually consumed to decide
+    on a NEW entry -- not inside evaluate_hold_time_aware's own state,
+    which stays exactly as it always has. `now_ts` is the caller's own
+    "now" (the latest bar in this poll's batch -- see advance_journal);
+    `s["hold"]["confirmed_at_ts"]` is when that specific hold was last
+    genuinely reaffirmed (core/levels.py's `HoldStateTimeAware.
+    confirmed_at_ts`, refreshed on every bar the hold actually continues,
+    frozen at the last such bar once it breaks). A candidate whose
+    confirmation is older than `confirmation_freshness_seconds` is
+    skipped for a NEW entry -- `confirmed` itself, and `was_confirmed_
+    types` bookkeeping below (unaffected by this function), are
+    untouched either way."""
     for s in setups:
-        if s["hold"]["confirmed"] and s["setup_type"] not in was_confirmed_types:
+        if (s["hold"]["confirmed"] and s["setup_type"] not in was_confirmed_types
+                and s["hold"]["confirmed_at_ts"] is not None
+                and now_ts - s["hold"]["confirmed_at_ts"] <= confirmation_freshness_seconds):
             return s
     return None
 
@@ -376,7 +408,8 @@ def advance_journal(
     trail_pct: float, symbol: str, current_equity: float,
     risk_pct_per_trade: float, swing_low_buffer_pct: float,
     pattern_progress_threshold_pct: float, session_cumulative_volume: float,
-    session_volume_multiple: float, watch_note: str | None = None,
+    session_volume_multiple: float, confirmation_freshness_seconds: float,
+    watch_note: str | None = None,
     swing_low_anchor: float | None = None, avg_daily_volume: float | None = None,
 ) -> JournalTick:
     """Run one poll cycle's newly-arrived bars (in order) through the
@@ -428,6 +461,13 @@ def advance_journal(
     should_enter's extra entry condition, stacking with (not replacing)
     the existing bar-level relative_volume gate -- see should_enter's own
     docstring for the avg_daily_volume=None skip-the-gate behavior.
+
+    `confirmation_freshness_seconds` (phase 3.6 follow-up, specs.md
+    section 20) is the CURRENT live strategy_params value, passed
+    straight through to `_first_newly_confirmed`'s staleness gate --
+    required, not optional, same treatment as trail_pct/swing_low_
+    buffer_pct above (this is now load-bearing entry-gating logic, not a
+    cosmetic default).
     """
     current = position
     updated = None
@@ -458,7 +498,9 @@ def advance_journal(
 
     opened = None
     if current is None and new_bars:
-        candidate = _first_newly_confirmed(setups, was_confirmed_types)
+        candidate = _first_newly_confirmed(setups, was_confirmed_types,
+                                           now_ts=new_bars[-1]["ts"],
+                                           confirmation_freshness_seconds=confirmation_freshness_seconds)
         newly_type = candidate["setup_type"] if candidate is not None else None
         if should_enter(
             newly_confirmed_type=newly_type, relative_volume=relative_volume,

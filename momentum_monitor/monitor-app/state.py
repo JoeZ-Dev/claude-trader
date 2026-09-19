@@ -101,6 +101,7 @@ def _level_block(bars, level, direction: str, watch_added_ts: float | None) -> d
             "elapsed_seconds": hold.elapsed_seconds,
             "confirmed": hold.confirmed,
             "failed_attempts": hold.failed_attempts,
+            "confirmed_at_ts": hold.confirmed_at_ts,
         },
     }
 

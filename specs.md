@@ -2970,16 +2970,9 @@ through the level even while a real, current hold is very much still in
 play, and resetting on any reversal made confirmation intolerably
 fragile. The real distinguishing factor is TIME-BASED staleness (a
 one-tick, seconds-old pullback vs. an hours-old, since-reversed regime),
-not a simple has-it-ever-reversed check. This needs a real design pass
-of its own, not a rushed patch under this prompt, so it is left
-EXPLICITLY OPEN: documented in full in `evaluate_hold_time_aware`'s own
-docstring (flagged "KNOWN OPEN RISK... found but deliberately NOT fixed
-here"), and `test_two_symbols_journal_positions_are_fully_independent`
-was updated to assert what it can honestly assert (AEHL's ORIGINAL
-position, tracked by id, is closed; MSFT is unaffected — the test's own
-actual purpose) rather than "nothing at all reopens," with an explicit
-comment naming the known limitation rather than silently loosening the
-assertion.
+not a simple has-it-ever-reversed check — fixed properly in section 20,
+below, without touching `evaluate_hold_time_aware`'s state machine at
+all.
 
 **Real before/after, on the same real AIFF mixed-cadence day (236 bars)
 used throughout sections 14-18.** OLD reconstructed via `live_cadence_
@@ -3034,13 +3027,11 @@ history. Ran cleanly, no errors, sensible output.
 section 18** given this migration's larger behavioral surface (it now
 touches live entry-gating directly, not just display). If anything
 looks wrong once this deploys — a level that doesn't make sense, a
-setup type behaving unexpectedly, ANY sign of the known-open stale-
-reconfirmation risk actually firing a bad entry — the correct response
-is reverting this commit immediately and re-diagnosing from a clean
-state, not attempting a live fix under pressure. Nothing wrong was
-observed in the evidence above beyond the one explicitly-flagged, still-
-open risk; the deploy itself is deliberately deferred until AEMD's
-position clears.
+setup type behaving unexpectedly, an entry that doesn't hold up — the
+correct response is reverting the relevant commit immediately and
+re-diagnosing from a clean state, not attempting a live fix under
+pressure. Nothing wrong was observed in the evidence above; the deploy
+itself is deliberately deferred until AEMD's position clears.
 
 **Status:** `core` suite 55 tests, `monitor-app` suite 272 tests, full
 project suite 434 tests, all green. `live_cadence_tail` fully retired
@@ -3048,12 +3039,137 @@ project suite 434 tests, all green. `live_cadence_tail` fully retired
 historical prose references). Two real risks investigated: the one
 explicitly asked about (backfill-only confirmation) is FIXED and proven;
 a second, related one found by mandatory downstream regression (stale
-same-session reconfirmation for dynamically-recomputed triggers) is
-investigated, reasoned about, and left explicitly OPEN pending a
-dedicated design pass — not silently accepted, not rushed. Deploy held
-pending AEMD's open position clearing.
+same-session reconfirmation for dynamically-recomputed triggers) was
+investigated, reasoned about, and is FIXED in section 20 (a follow-up
+prompt, same day) — see there for the staleness gate, the freshness
+window value and reasoning, and the real-data scope decision. Deploy
+held pending AEMD's open position clearing.
 
-### 20. Roadmap / phases
+### 20. Phase 3.6 follow-up — confirmation-freshness gate (closes section 19's stale-reconfirmation risk)
+
+Section 19 found a real bug (a stop-out on a sharp price drop could be
+immediately followed, in the same tick, by a spurious fresh entry using
+bars from well before the drop) and reverted a first fix attempt
+("reset `confirmed` on any reversal") because it broke the genuine,
+load-bearing "recently confirmed, still actionable" property 20+
+existing tests and the real entry-firing design depend on. This closes
+that gap properly: a staleness gate at the point confirmation is
+CONSUMED to decide on a new entry, not inside `evaluate_hold_time_
+aware`'s own monotonic state, which is completely untouched.
+
+**The fix.** `HoldStateTimeAware` gains `confirmed_at_ts: float | None`
+— the timestamp of the most recent bar where `confirmed` was genuinely
+REAFFIRMED (still on-side, still past `required_seconds`). It refreshes
+on every such bar while a hold continues (staying current for as long
+as the hold is real and ongoing) and freezes at the last such bar once
+the streak breaks — exposing exactly how stale a persisted
+`confirmed=True` actually is, without `evaluate_hold_time_aware` needing
+any notion of "now" itself. Propagated through `setup_types.py`'s
+`_hold_dict` and `state.py`'s `_level_block` into every setup/level
+dict's `hold.confirmed_at_ts` field (alongside the existing `confirmed`,
+unchanged).
+
+The actual gate lives in `monitor-app/journal_logic.py`'s
+`_first_newly_confirmed` — the exact point a setup's `confirmed=True` is
+consumed to decide on a NEW entry. It now also requires
+`now_ts - confirmed_at_ts <= confirmation_freshness_seconds`, where
+`now_ts` is the caller's own "now": the latest bar in the CURRENT poll's
+batch (`new_bars[-1]["ts"]`, already available in `advance_journal`,
+requiring no wall-clock dependency and staying fully deterministic in
+tests). `confirmed` itself, `was_confirmed_types` bookkeeping, and every
+other consumer of the hold dict (display, `_level_block`) are completely
+unaffected — this is purely an additional condition on whether a
+candidate is ACTIONABLE for a brand-new entry.
+
+**New live-tunable strategy_param: `CONFIRMATION_FRESHNESS_SECONDS`,
+default 30.0.** Same seed-only / live-tunable-via-`POST /api/strategy_
+params` treatment as every other threshold in this project (`journal_
+store.py`'s `_PARAM_BOUNDS`: `(0.0, 3600.0)` — the upper bound is a
+generous ceiling, same "wide but not unbounded" pattern as the other
+params, not a real expected operating value). Reasoning for the
+default: 30.0 matches `REQUIRED_HOLD_SECONDS` itself (`evaluate_hold_
+time_aware`'s own `required_seconds` default) — a confirmation remains
+actionable for as long as it took to establish it in the first place.
+Checked against both real numbers this section needed to reconcile: a
+one-tick pullback at live 10s cadence ages 10-20 seconds (comfortably
+under 30 — stays actionable, preserving the property the reverted fix
+broke); the real bug found in section 19 (round_number_reclaim, real
+AIFF data, 07:54:00) aged 240 seconds, and the real `test_two_symbols_
+journal_positions_are_fully_independent` scenario aged 40 seconds — both
+comfortably OVER 30 (correctly blocked).
+
+**Scope investigated with real data: does this apply to all four setup
+types, or just round_number_reclaim?** Simulated polling through the
+real AIFF session (step-by-step, tracking every False→True transition
+and its age for all four types) rather than assuming either way. Real
+findings: `round_number_reclaim` reproduces it (age 240s at 07:54:00,
+and again 50s at 14:40:00); `micro_breakout` ALSO reproduces it
+independently (ages 420s, 120s, 300s, 180s, and 50s across five separate
+transitions that real day) — proving the mechanism is NOT unique to
+round_number_reclaim's dynamically-recomputed trigger, contrary to
+section 19's initial hypothesis: `micro_breakout`'s trigger comes from
+`detect_levels` (a real structural level), and it exhibits the exact
+same staleness pattern whenever the "nearest" qualifying level's
+identity changes and `was_confirmed_types` "forgets" the type in
+between. `resistance_breakout` and `vwap_reclaim` never confirmed often
+enough on this particular real day to independently exhibit a
+transition either way (0 confirmed occurrences for `vwap_reclaim`, 0 for
+`resistance_breakout` across the whole day) — genuinely inconclusive on
+this data, not evidence of immunity. Since all four setup types run
+through the IDENTICAL `evaluate_hold_time_aware` + `was_confirmed_types`
+mechanism with no structural difference between them, and two of the
+four independently reproduce the exact same bug on real data, the gate
+is applied UNIFORMLY to all four in `_first_newly_confirmed` (no
+per-setup_type special-casing) — not narrowed to round_number_reclaim
+alone, based on what the real data actually showed, not assumed.
+
+**Real before/after, using the actual real AIFF data and the real
+`advance_journal` production path (not a synthetic reconstruction):**
+- `round_number_reclaim` at the real 07:54:00 transition
+  (`confirmed_at_ts=1789645800`, evaluated at `ts=1789646040`, age
+  240s): OLD (`confirmation_freshness_seconds=inf`, i.e. no gate) opens
+  a real position, `entry_price=0.96`. NEW (default 30.0) — `opened is
+  None`, correctly blocked.
+- `micro_breakout` at the real 08:04:00 transition
+  (`confirmed_at_ts=1789646220`, evaluated at `ts=1789646640`, age
+  420s): OLD opens a real position, `entry_price=0.9366`. NEW —
+  correctly blocked.
+- `test_two_symbols_journal_positions_are_fully_independent`, run
+  through the REAL production wiring end to end (`create_app`/`Poller`/
+  real HTTP, not a unit-level shortcut): AEHL's position now closes
+  clean with NO reopening at all — the test's original, simple
+  assertion (`store.open_position_for("AEHL") is None`) is restored
+  verbatim, no longer needing the workaround language section 19 added.
+
+**The load-bearing "recently confirmed, still actionable" property,
+proven intact, not assumed:** the full pre-existing `monitor-app`/`core`
+suite — every test that existed before this fix, including all 20+ that
+the reverted "reset on reversal" attempt broke — passes unchanged (272
+`monitor-app` tests, 58 `core` tests). `test_advance_journal_allows_
+entry_on_a_fresh_confirmation` explicitly re-proves the specific
+property using the real micro_breakout numbers (age 10s, one live bar's
+worth of "the entry bar itself ticked back through the level") fires
+correctly.
+
+**Deliberate break-then-fix:** removed the freshness condition from
+`_first_newly_confirmed` entirely. Result: `test_advance_journal_blocks_
+entry_on_a_stale_confirmation`, `test_advance_journal_applies_the_
+freshness_gate_uniformly_across_setup_types`, `test_advance_journal_the_
+real_sharp_breach_scenario_reproduced_then_blocked`, and
+`test_confirmation_freshness_gate_break_then_fix` all failed immediately
+(the real bug reproduced exactly). Reverted; full suite green again, no
+leftover markers.
+
+**Status:** `core` suite 58 tests, `monitor-app` suite 277 tests, full
+project suite 442 tests, all green. Both real risks from phase 3.6's
+migration work are now FIXED and proven: backfill-only confirmation
+(section 19, `watch_added_ts`) and stale same-session reconfirmation
+(this section, the confirmation-freshness gate) — applied uniformly to
+all four setup types per real data, not assumed narrower. Deploy still
+held pending AEMD's open position clearing and current market hours
+(unrelated, independent blockers, unaffected by this fix).
+
+### 21. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,
@@ -3193,19 +3309,28 @@ pending AEMD's open position clearing.
    unrelated position closed — a first fix (reset `confirmed` on any
    reversal) was tried, verified, and REVERTED because it broke the
    genuine "recently confirmed" property 20+ other tests and the real
-   entry design depend on; left explicitly OPEN (documented in `evaluate_
-   hold_time_aware`'s own docstring and specs.md section 19) pending a
-   real time-based-staleness design, not silently patched or ignored.
-   Real before/after on the same real AIFF day: MACD sign-flips
-   (bearish→bullish), relative_volume 1.0→0.2516 (trivial→real reading),
-   a support level's hold confirmation False→True — real, consequential
-   differences, not refinements. Uniform-cadence AEMD data confirmed
-   unaffected at the full `build_state` level. Deploy HELD (same open
-   AEMD position); verified isolated against real live DAIC data instead.
-   Phase 3.6's migration work is functionally complete for all four
-   original functions, with one explicitly-tracked open design question
-   remaining before either migration should be considered fully closed
-   out.
+   entry design depend on. Real before/after on the same real AIFF day:
+   MACD sign-flips (bearish→bullish), relative_volume 1.0→0.2516
+   (trivial→real reading), a support level's hold confirmation
+   False→True — real, consequential differences, not refinements.
+   Uniform-cadence AEMD data confirmed unaffected at the full
+   `build_state` level. Deploy HELD (same open AEMD position); verified
+   isolated against real live DAIC data instead. **Confirmation-freshness
+   gate (built, 2026-09-19) — see section 20:** closed the reverted
+   fix's gap properly — a staleness check at the point confirmation is
+   CONSUMED (`journal_logic._first_newly_confirmed`), not inside
+   `evaluate_hold_time_aware`'s state, using a new `confirmed_at_ts`
+   field and a live-tunable `CONFIRMATION_FRESHNESS_SECONDS` (default
+   30.0, matching `REQUIRED_HOLD_SECONDS`). Investigated with real data
+   whether this applies to all four setup types or just round_number_
+   reclaim: found `micro_breakout` independently reproduces the exact
+   same staleness pattern on the same real AIFF day (ages up to 420s),
+   so the gate applies uniformly to all four, not narrowed — a real,
+   data-backed scope decision, not assumed either way. Both real risks
+   phase 3.6's migration surfaced are now fixed and proven; the 20+
+   "recently confirmed, still actionable" tests the first attempt broke
+   all pass unchanged. Phase 3.6's migration work is functionally
+   complete for all four original functions.
 4. **(built)** Virtual trade journal — logs what the system would have
    done (entry, trailing stop) without placing anything, for end-of-day
    review against the user's own judgment. See section 6 for the full

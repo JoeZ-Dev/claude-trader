@@ -26,6 +26,7 @@ RISK_PCT_PER_TRADE = 0.01
 SWING_LOW_BUFFER_PCT = 0.005
 PATTERN_PROGRESS_THRESHOLD_PCT = 0.03
 SESSION_VOLUME_MULTIPLE = 3.0
+CONFIRMATION_FRESHNESS_SECONDS = 30.0
 # session_cumulative_volume's default, paired with avg_daily_volume's own
 # advance_journal default of None below -- None already means "skip the
 # gate" (should_enter's documented behavior), so this value is inert
@@ -39,14 +40,21 @@ def _bar(ts, *, high, low, close, open_=None):
             "volume": 1000.0, "is_extended": False}
 
 
-def _setup(setup_type, *, confirmed, distance=1.0, trigger_price=10.5, **factors):
+def _setup(setup_type, *, confirmed, distance=1.0, trigger_price=10.5,
+          confirmed_at_ts=float("inf"), **factors):
+    # confirmed_at_ts defaults to +inf -- "always fresh," regardless of
+    # whatever new_bars ts a given test happens to use -- since these
+    # tests are about entry/sizing/volume-gate mechanics, not the
+    # confirmation-freshness gate itself (see the dedicated tests for
+    # that, which override this explicitly with a genuinely stale value).
     return {
         "setup_type": setup_type,
         "trigger_price": trigger_price,
         "distance": distance,
-        "hold": {"direction": "above", "required_bars": 3,
-                 "consecutive_bars": 3 if confirmed else 1,
-                 "confirmed": confirmed, "failed_attempts": 0},
+        "hold": {"direction": "above", "required_seconds": 30.0,
+                 "elapsed_seconds": 30.0 if confirmed else 10.0,
+                 "confirmed": confirmed, "failed_attempts": 0,
+                 "confirmed_at_ts": confirmed_at_ts if confirmed else None},
         "factors": factors or {"strength_score": 5.0, "touch_count": 2},
     }
 
@@ -411,7 +419,8 @@ def _advance(*, position=None, new_bars, setups, was_confirmed_types=frozenset()
             swing_low_anchor=None,
             session_cumulative_volume=SESSION_CUMULATIVE_VOLUME,
             avg_daily_volume=None,
-            session_volume_multiple=SESSION_VOLUME_MULTIPLE):
+            session_volume_multiple=SESSION_VOLUME_MULTIPLE,
+            confirmation_freshness_seconds=CONFIRMATION_FRESHNESS_SECONDS):
     return advance_journal(
         position=position, new_bars=new_bars, setups=setups,
         was_confirmed_types=was_confirmed_types, relative_volume=relative_volume,
@@ -424,6 +433,7 @@ def _advance(*, position=None, new_bars, setups, was_confirmed_types=frozenset()
         session_cumulative_volume=session_cumulative_volume,
         avg_daily_volume=avg_daily_volume,
         session_volume_multiple=session_volume_multiple,
+        confirmation_freshness_seconds=confirmation_freshness_seconds,
     )
 
 
@@ -888,3 +898,105 @@ def test_advance_journal_no_bars_is_a_safe_noop():
     assert tick.opened is None
     assert tick.updated is None
     assert tick.closed is None
+
+
+# -- confirmation-freshness gate (phase 3.6 follow-up, specs.md section --
+# 20): fixes the real bug found via downstream regression during the
+# ema/relative_volume/evaluate_hold migration (section 19) -- a
+# confirmation reaffirmed hours (or, on the real AIFF data that
+# originally surfaced this, sometimes just tens/hundreds of seconds)
+# earlier in the SAME session can look like a brand-new one once
+# was_confirmed_types "forgets" the type in between. Fixed at
+# _first_newly_confirmed, not inside evaluate_hold_time_aware's own
+# state (see that function's docstring).
+
+def test_advance_journal_blocks_entry_on_a_stale_confirmation():
+    # A confirmation last genuinely reaffirmed 420 seconds ago -- the
+    # REAL staleness age found on real AIFF data for micro_breakout
+    # (specs.md section 20: a False->True transition at 08:04:00 whose
+    # confirmed_at_ts was frozen at 07:57:00, 420s earlier) -- must not
+    # fire a new entry with the default 30s freshness window.
+    tick = _advance(
+        new_bars=[_bar(1789646640, high=0.94, low=0.92, close=0.9366)],
+        setups=[_setup("micro_breakout", confirmed=True,
+                       confirmed_at_ts=1789646640 - 420, trigger_price=0.9879)],
+    )
+    assert tick.opened is None
+
+
+def test_advance_journal_allows_entry_on_a_fresh_confirmation():
+    # The SAME setup, but reaffirmed only 10 seconds ago (one live bar's
+    # worth of "the entry bar itself ticked back through the level" --
+    # exactly the property the reverted "reset on reversal" fix broke).
+    tick = _advance(
+        new_bars=[_bar(1789646640, high=0.94, low=0.92, close=0.9366)],
+        setups=[_setup("micro_breakout", confirmed=True,
+                       confirmed_at_ts=1789646640 - 10, trigger_price=0.9879)],
+    )
+    assert tick.opened is not None
+    assert tick.opened.setup_type == "micro_breakout"
+
+
+def test_advance_journal_applies_the_freshness_gate_uniformly_across_setup_types():
+    # Investigated with real data (specs.md section 20): the staleness
+    # mechanism is structural to ALL FOUR setup types (every one goes
+    # through the identical evaluate_hold_time_aware + was_confirmed_
+    # types bookkeeping), not unique to round_number_reclaim -- proven
+    # real for round_number_reclaim (age 240s at 07:54:00) AND
+    # micro_breakout (age 420s at 08:04:00) on the real AIFF day;
+    # resistance_breakout/vwap_reclaim simply never confirmed often
+    # enough on that particular real day to independently exhibit it,
+    # but nothing about their mechanism differs. The gate is applied
+    # uniformly in _first_newly_confirmed (no setup_type special-casing),
+    # confirmed here for all four explicitly, not assumed.
+    for setup_type in ("resistance_breakout", "micro_breakout", "vwap_reclaim", "round_number_reclaim"):
+        stale = _advance(
+            new_bars=[_bar(1000, high=10.3, low=10.1, close=10.2)],
+            setups=[_setup(setup_type, confirmed=True, confirmed_at_ts=1000 - 60)],
+        )
+        assert stale.opened is None, f"{setup_type} should be blocked when stale"
+        fresh = _advance(
+            new_bars=[_bar(1000, high=10.3, low=10.1, close=10.2)],
+            setups=[_setup(setup_type, confirmed=True, confirmed_at_ts=1000 - 5)],
+        )
+        assert fresh.opened is not None, f"{setup_type} should fire when fresh"
+
+
+def test_advance_journal_the_real_sharp_breach_scenario_reproduced_then_blocked():
+    # The exact mechanism found real on live AIFF data (specs.md section
+    # 19/20): a position stops out on a sharp price drop; in the SAME
+    # tick, round_number_reclaim's trigger recomputes to a much lower
+    # price, already satisfied by bars from well before the drop.
+    # OLD (no gate, confirmation_freshness_seconds=infinite): fires.
+    old_behavior = _advance(
+        new_bars=[_bar(200, high=8.1, low=7.9, close=8.0)],
+        setups=[_setup("round_number_reclaim", confirmed=True,
+                       confirmed_at_ts=160, trigger_price=8.25)],
+        confirmation_freshness_seconds=float("inf"),
+    )
+    assert old_behavior.opened is not None  # the real bug, reproduced
+    # NEW (default 30s gate): blocked -- age is 200-160=40s, over the window.
+    new_behavior = _advance(
+        new_bars=[_bar(200, high=8.1, low=7.9, close=8.0)],
+        setups=[_setup("round_number_reclaim", confirmed=True,
+                       confirmed_at_ts=160, trigger_price=8.25)],
+    )
+    assert new_behavior.opened is None  # fixed
+
+
+def test_confirmation_freshness_gate_break_then_fix():
+    # Deliberately break the freshness check itself (simulate "always
+    # treat as fresh," i.e. no gate at all) and confirm a stale
+    # confirmation wrongly fires; then restore and confirm it's blocked
+    # again -- proves this test suite can actually catch a regression in
+    # the gate, not just that it currently passes.
+    def _stale_tick(freshness):
+        return _advance(
+            new_bars=[_bar(1000, high=10.3, low=10.1, close=10.2)],
+            setups=[_setup("round_number_reclaim", confirmed=True, confirmed_at_ts=1000 - 300)],
+            confirmation_freshness_seconds=freshness,
+        )
+    broken = _stale_tick(float("inf"))  # simulates the gate being disabled entirely
+    assert broken.opened is not None  # wrongly fires -- the gate is broken here
+    fixed = _stale_tick(CONFIRMATION_FRESHNESS_SECONDS)  # reverted to the real default
+    assert fixed.opened is None  # correctly blocked once restored

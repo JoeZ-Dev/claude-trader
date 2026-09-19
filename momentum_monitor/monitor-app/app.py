@@ -192,6 +192,19 @@ DEFAULT_RISK_PCT_PER_TRADE = 0.01
 DEFAULT_SWING_LOW_BUFFER_PCT = 0.005
 DEFAULT_PATTERN_PROGRESS_THRESHOLD_PCT = 0.03
 DEFAULT_SESSION_VOLUME_MULTIPLE = 3.0
+# How long a persisted confirmed=True stays actionable for a NEW entry
+# after it was last genuinely reaffirmed (phase 3.6 follow-up, specs.md
+# section 20) -- 30.0 matches REQUIRED_HOLD_SECONDS itself (core/levels.
+# evaluate_hold_time_aware's own required_seconds default): a
+# confirmation remains actionable for as long as it took to establish
+# it in the first place. Comfortably covers a brief, one-to-few-tick
+# pullback at live 10s cadence (age 10-20s, well within the window) --
+# exactly the "recently confirmed, still actionable" scenario a stricter
+# fix broke -- while excluding the real bug this was built for (a stale
+# confirmation found real on a 40-second-old reversal, specs.md section
+# 19). Seed/fallback default ONLY, same fallback-vs-live-tunable split
+# as DEFAULT_TRAIL_PCT above.
+DEFAULT_CONFIRMATION_FRESHNESS_SECONDS = 30.0
 # How many trading days of daily history to fetch (once per symbol per
 # watch, cached on _SymbolSlot.avg_daily_volume, never per-bar) for the
 # session-level volume gate's baseline.
@@ -285,6 +298,7 @@ class Poller:
                  session_volume_multiple=DEFAULT_SESSION_VOLUME_MULTIPLE,
                  continuation_lookback_days=DEFAULT_CONTINUATION_LOOKBACK_DAYS,
                  continuation_threshold_pct=DEFAULT_CONTINUATION_THRESHOLD_PCT,
+                 confirmation_freshness_seconds=DEFAULT_CONFIRMATION_FRESHNESS_SECONDS,
                  fetch_daily_bars=None,
                  now_fn=time.time, max_symbols=MAX_SYMBOLS):
         self._fetch_bars = fetch_bars
@@ -305,6 +319,7 @@ class Poller:
         self._session_volume_multiple = session_volume_multiple
         self._continuation_lookback_days = continuation_lookback_days
         self._continuation_threshold_pct = continuation_threshold_pct
+        self._confirmation_freshness_seconds = confirmation_freshness_seconds
         self._now_fn = now_fn
         self._max_symbols = max_symbols
         self._slots: dict[str, _SymbolSlot] = {}
@@ -494,6 +509,8 @@ class Poller:
                     "value": self._continuation_lookback_days, "updated_at": None},
                 "continuation_threshold_pct": {
                     "value": self._continuation_threshold_pct, "updated_at": None},
+                "confirmation_freshness_seconds": {
+                    "value": self._confirmation_freshness_seconds, "updated_at": None},
             }
         return self._journal_store.all_params()
 
@@ -960,6 +977,11 @@ class Poller:
             "session_volume_multiple", self._session_volume_multiple)
         session_cumulative_volume = slot.state.get("session", {}).get(
             "cumulative_volume", 0.0)
+        # Confirmation-freshness gate (phase 3.6 follow-up, specs.md
+        # section 20) -- same live-lookup-then-pass-through discipline as
+        # every other strategy_params read here.
+        confirmation_freshness_seconds = self._journal_store.get_param(
+            "confirmation_freshness_seconds", self._confirmation_freshness_seconds)
         avg_daily_volume = slot.avg_daily_volume
         tick = advance_journal(
             position=slot.journal_position, new_bars=new_bars,
@@ -974,6 +996,7 @@ class Poller:
             session_cumulative_volume=session_cumulative_volume,
             avg_daily_volume=avg_daily_volume,
             session_volume_multiple=session_volume_multiple,
+            confirmation_freshness_seconds=confirmation_freshness_seconds,
         )
         # tick.closed applies independently of opened/updated -- a stop-out
         # can be immediately followed, within the SAME batch of new_bars,
@@ -2117,6 +2140,7 @@ def create_app(*, fetch_bars, watch_symbol=None,
                session_volume_multiple=DEFAULT_SESSION_VOLUME_MULTIPLE,
                continuation_lookback_days=DEFAULT_CONTINUATION_LOOKBACK_DAYS,
                continuation_threshold_pct=DEFAULT_CONTINUATION_THRESHOLD_PCT,
+               confirmation_freshness_seconds=DEFAULT_CONFIRMATION_FRESHNESS_SECONDS,
                fetch_daily_bars=None,
                now_fn=time.time, max_symbols=MAX_SYMBOLS) -> FastAPI:
     poller = Poller(fetch_bars=fetch_bars, watch_symbol=watch_symbol,
@@ -2133,6 +2157,7 @@ def create_app(*, fetch_bars, watch_symbol=None,
                     session_volume_multiple=session_volume_multiple,
                     continuation_lookback_days=continuation_lookback_days,
                     continuation_threshold_pct=continuation_threshold_pct,
+                    confirmation_freshness_seconds=confirmation_freshness_seconds,
                     fetch_daily_bars=fetch_daily_bars,
                     now_fn=now_fn, max_symbols=max_symbols)
 

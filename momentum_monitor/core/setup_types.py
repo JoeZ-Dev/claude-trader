@@ -81,6 +81,13 @@ def _hold_dict(hold: HoldStateTimeAware) -> dict:
         "elapsed_seconds": hold.elapsed_seconds,
         "confirmed": hold.confirmed,
         "failed_attempts": hold.failed_attempts,
+        # When `confirmed` was last genuinely reaffirmed (specs.md
+        # section 20) -- None if never confirmed. journal_logic.py's
+        # staleness gate reads this to decide whether a persisted
+        # confirmed=True is still actionable for a NEW entry; it is
+        # never used to alter `confirmed` itself, which stays exactly as
+        # evaluate_hold_time_aware computed it.
+        "confirmed_at_ts": hold.confirmed_at_ts,
     }
 
 
