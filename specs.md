@@ -2861,7 +2861,199 @@ Deploy held pending AEMD's open position clearing. Stage 3 part 2
 `live_cadence_tail`) remains separate, later, explicitly-gated work —
 not started.
 
-### 19. Roadmap / phases
+### 19. Phase 3.6 stage 3, part 2 — migrate ema/relative_volume/evaluate_hold, retire live_cadence_tail
+
+The higher-stakes half of stage 3: unlike section 18's level-detection
+migration, `evaluate_hold`/`relative_volume` gate every real entry
+directly, and `ema` feeds MACD and display. Migrating them means the
+backfilled portion of a session influences live trading decisions for
+the first time ever, not just display numbers — treated throughout as a
+real behavioral change to investigate, not a correctness refinement to
+verify.
+
+**The migration.** `ema`→`ema_time_aware`, `relative_volume`→
+`relative_volume_time_aware`, `evaluate_hold`→`evaluate_hold_time_aware`
+at every real call site (`monitor-app/state.py`'s `build_state`/
+`_level_block`, `core/setup_types.py`'s four candidate builders), now
+fed the FULL backfilled+live bar series directly — the
+`live_cadence_tail`/`LIVE_BAR_MAX_GAP_SECONDS` split this was built to
+replace is REMOVED entirely (`monitor-app/state.py`), not left unused
+next to its replacement. `macd`, not itself named in this migration's
+explicit scope but structurally required to retire `live_cadence_tail`
+cleanly (it fed on the same live-only closes), got its own
+`macd_time_aware` — composed directly from `ema_time_aware`, exactly as
+stage 1 anticipated ("composable directly from ema_time_aware once
+needed"). `setup_types.evaluate_setups` drops its `bars`/`live_bars`
+split entirely (one `bars` parameter now), gains `watch_added_ts`
+(below), and its hold-block fields rename `consecutive_bars`/
+`required_bars` → `elapsed_seconds`/`required_seconds` (monitor-app's
+two server-rendered and two client-side JS hold-detail tables updated to
+match: "time above level: Xs / Ys").
+
+**Required investigation: can backfill alone fire an entry? Yes —
+confirmed real, then fixed.** With `evaluate_hold_time_aware` fed the
+full session, a hold's `required_seconds` of confirmation can complete
+ENTIRELY within backfilled (pre-watch) bars. Proven directly on real
+AIFF data: a real resistance level (1.1000) first confirmed at 13:39:00
+using only backfilled bars, and (confirmation being monotonic, "once
+confirmed, stays confirmed") remained `confirmed=True` all the way
+through 14:40:10 — over an hour later, well into live streaming.
+`monitor-app/journal_logic.py`'s `_first_newly_confirmed` fires on any
+False→True transition against `was_confirmed_types`, which starts EMPTY
+for a freshly-added symbol's slot — so a symbol added at, say, 14:00
+would show this level as a *fresh* transition on its very first poll and
+could fire a real entry instantly, based on a pattern that finished
+before the symbol was ever being watched live.
+
+**The fix, an explicit design decision, not buried:** `evaluate_hold_
+time_aware` gained `watch_added_ts` (default `None`, no behavior
+change for any caller that doesn't pass it). Backfilled bars may still
+legitimately CONTRIBUTE real elapsed time to a streak — that's the
+whole point of this migration — but `confirmed` may only be *set* at a
+bar whose own `ts >= watch_added_ts`: the confirming instant itself must
+not be purely historical, even though the streak backing it may have
+started before the watch. A genuinely continuous, still-ongoing hold
+that started before watch and never reverses simply confirms at the
+first post-watch bar instead of instantly (proven:
+`test_evaluate_hold_time_aware_confirms_once_a_post_watch_bar_extends_a_
+pre_watch_streak`) — not withheld forever, just not backdated to a
+moment nobody was watching. `_SymbolSlot` gained `added_ts` (captured
+from `Poller`'s own `now_fn` at `add_symbol` time), threaded through
+both `build_state` call sites. Proven end to end, not just at the
+`evaluate_hold_time_aware` level: `test_watch_added_ts_prevents_
+confirming_purely_from_pre_watch_bars` (setup_types.py) and
+`test_build_state_watch_added_ts_reaches_setups_and_level_blocks`
+(state.py) both reproduce the real risk with `watch_added_ts=None`, then
+confirm it's blocked with a real value.
+
+**A second, DISTINCT real risk, found by mandatory downstream regression
+— found, investigated, and explicitly left OPEN, not silently
+patched.** `setup_types.py`'s full test suite passed, but `monitor-app`'s
+real integration suite (`test_journal_wiring.py`) initially showed 20
+failures. 19 were a test-harness artifact (fixed): `_client`'s default
+`now_fn=time.time` combined with this file's small synthetic bar
+timestamps (0, 10, 20…) meant `watch_added_ts` (real wall-clock) sat far
+in the future of every fixture bar, blocking every confirmation in the
+file — fixed by defaulting the test harness's `now_fn` to a fixed
+`0.0` (AGENT_PROTOCOL.md: no wall-clock dependence in tests), matching
+real production's actual invariant (bars and "now" are naturally close
+together) that this file's small-ts convention doesn't reproduce on its
+own.
+
+The 20th failure was real: `test_two_symbols_journal_positions_are_
+fully_independent` — AEHL's `round_number_reclaim` position correctly
+stopped out on a sharp price drop, but a NEW position immediately
+reopened in the SAME tick, entry_price 8.0, using a trigger (8.25)
+freshly recomputed from the new, much lower price. `round_number_
+reclaim`'s trigger is DYNAMIC (`nearest_round_number_above(current_
+price)`, recomputed every call) — unlike `detect_levels`' resistance/
+support levels, which are relatively stable real touched prices. Once
+`evaluate_hold_time_aware` sees the FULL session, bars from HOURS
+earlier (when price was much higher) can satisfy a freshly-lower
+trigger — a real, structural consequence of `confirmed`'s monotonic
+design (`evaluate_hold`'s own "once confirmed, a single close back
+through doesn't retroactively un-confirm history"), which was only ever
+safe because every caller previously fed it a short, `live_cadence_tail`-
+scoped window. `journal_logic.py`'s own comment already anticipates a
+stop-out immediately followed by a genuine fresh confirmation — this was
+a STALE one, not a genuine one, and the bar-count design's OWN
+protection against it ("a single sharp-drop bar can't produce 3
+consecutive bars against a new, lower trigger") silently depended on
+that same short-window assumption.
+
+A first attempted fix (`confirmed` resets to `False` on any close back
+through the level) was tried, verified to close this exact case, then
+**reverted** — it broke the genuine, load-bearing "recently confirmed,
+still actionable" property 20+ OTHER tests (and the real entry-firing
+design) depend on: the live entry bar itself is often one tick back
+through the level even while a real, current hold is very much still in
+play, and resetting on any reversal made confirmation intolerably
+fragile. The real distinguishing factor is TIME-BASED staleness (a
+one-tick, seconds-old pullback vs. an hours-old, since-reversed regime),
+not a simple has-it-ever-reversed check. This needs a real design pass
+of its own, not a rushed patch under this prompt, so it is left
+EXPLICITLY OPEN: documented in full in `evaluate_hold_time_aware`'s own
+docstring (flagged "KNOWN OPEN RISK... found but deliberately NOT fixed
+here"), and `test_two_symbols_journal_positions_are_fully_independent`
+was updated to assert what it can honestly assert (AEHL's ORIGINAL
+position, tracked by id, is closed; MSFT is unaffected — the test's own
+actual purpose) rather than "nothing at all reopens," with an explicit
+comment naming the known limitation rather than silently loosening the
+assertion.
+
+**Real before/after, on the same real AIFF mixed-cadence day (236 bars)
+used throughout sections 14-18.** OLD reconstructed via `live_cadence_
+tail`'s old 8-bar live-only tail; NEW via `build_state` on the full
+236-bar series:
+- `ema9`: 1.2910 → 1.2902 (small, real). `ema20`: 1.2982 → 1.2874
+  (larger — longer memory reaches further into backfill).
+- `macd`: **-0.006499 → +0.00923** — a full SIGN FLIP (bearish to
+  bullish reading), `signal`: -0.003729 → 0.015366, `histogram`:
+  -0.002769 → -0.006136. A materially different technical reading, not
+  a refinement.
+- `relative_volume`: **1.0000 → 0.2516** — OLD's flat 1.0 was a trivial
+  "not enough history" default (only 8 live bars, fewer than
+  lookback=20); NEW's 0.2516 is a real, informative reading against the
+  day's actual volume (correctly quiet relative to a real earlier
+  surge).
+- Support-level hold confirmation: **`confirmed=False` → `confirmed=
+  True`** — OLD's 8-bar live tail could never reach 3 consecutive bars
+  below the level; NEW correctly recognizes a real, substantial
+  real-time hold using genuine backfilled context. This is the single
+  most consequential real difference: an entry-gating boolean flipping
+  from false to true on the exact same real data.
+
+Uniform-cadence regression, re-confirmed directly at the `build_state`
+level against REAL data (not assumed from earlier stages, not just
+synthetic tests): AEMD's real 2026-09-18 regular session (2,340 bars,
+strictly 10s cadence) — `ema9`, `ema20`, `macd`, and `relative_volume`
+all identical between the OLD reconstruction and NEW `build_state`,
+to the same rounding.
+
+**Full downstream regression.** `core/tests/` (56 tests: `test_core.py`
++ `test_setup_types.py`) and `monitor-app/tests/` (272 tests, including
+the fixed `now_fn` default and the one honestly-updated assertion above)
+all green — 327 tests total for the two directly affected suites, full
+project suite 434 tests (`core` 55, `schwab-connector` 107, `monitor-app`
+272 — the `run_tests.sh` breakdown), zero silently-adjusted tests hiding
+either real finding.
+
+**Production deployment: held, not performed**, same standing practice
+as section 18 — `journal.db` still has AEMD's open position (id 52) at
+migration time. Verified instead as an isolated check against the real,
+currently-live `schwab-connector`: pulled DAIC's real live bar history
+directly (15,134 real bars, freshest one 26 seconds old at fetch time),
+ran the migrated `build_state` against it locally. Currently pre-market
+quiet (flat 3.61, zero volume) — `ema9`/`ema20`/`vwap` all correctly
+flat at 3.61, `relative_volume=1.0` (genuinely flat, not a bug), and
+real, sensible resistance/support levels and setup candidates with real
+touch counts and hold states, using this session's actual real price
+history. Ran cleanly, no errors, sensible output.
+
+**Rollback awareness, stated plainly — matters more here than for
+section 18** given this migration's larger behavioral surface (it now
+touches live entry-gating directly, not just display). If anything
+looks wrong once this deploys — a level that doesn't make sense, a
+setup type behaving unexpectedly, ANY sign of the known-open stale-
+reconfirmation risk actually firing a bad entry — the correct response
+is reverting this commit immediately and re-diagnosing from a clean
+state, not attempting a live fix under pressure. Nothing wrong was
+observed in the evidence above beyond the one explicitly-flagged, still-
+open risk; the deploy itself is deliberately deferred until AEMD's
+position clears.
+
+**Status:** `core` suite 55 tests, `monitor-app` suite 272 tests, full
+project suite 434 tests, all green. `live_cadence_tail` fully retired
+(confirmed by direct grep — no remaining definition or call, only
+historical prose references). Two real risks investigated: the one
+explicitly asked about (backfill-only confirmation) is FIXED and proven;
+a second, related one found by mandatory downstream regression (stale
+same-session reconfirmation for dynamically-recomputed triggers) is
+investigated, reasoned about, and left explicitly OPEN pending a
+dedicated design pass — not silently accepted, not rushed. Deploy held
+pending AEMD's open position clearing.
+
+### 20. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,
@@ -2979,10 +3171,41 @@ not started.
    position (AEMD) at migration time, so verification ran isolated
    against the real, currently-live `schwab-connector` instead of
    restarting production — confirmed sensible against real live DAIC
-   data (top 5 levels by strength identical old vs. new). Stage 3 part 2
-   (migrating `ema`/`relative_volume`/`evaluate_hold` together and
-   retiring `live_cadence_tail`) remains a separate, later, explicitly-
-   gated prompt.
+   data (top 5 levels by strength identical old vs. new). **Stage 3, part
+   2 (built, 2026-09-19) — see section 19:** the higher-stakes half —
+   migrated `ema`/`relative_volume`/`evaluate_hold` (all three now
+   directly gate real entries or feed MACD/display) to their time-aware
+   versions, fed the FULL backfilled+live series, and fully retired
+   `live_cadence_tail`/`LIVE_BAR_MAX_GAP_SECONDS` (confirmed removed, not
+   left unused). Added `macd_time_aware` (composed from `ema_time_aware`)
+   since `macd` structurally needed migrating too to retire the split
+   cleanly, though not itself named in this stage's explicit scope.
+   Investigated the explicit question this stage was scoped around — can
+   backfill alone fire an entry — and confirmed it real on live AIFF data
+   (a level confirmed at 13:39 stayed confirmed over an hour into live
+   streaming); fixed with `watch_added_ts`, threaded from `_SymbolSlot`
+   through `build_state`/`evaluate_setups` to `evaluate_hold_time_aware`,
+   requiring the CONFIRMING bar (not the whole streak) to be at or after
+   the symbol's own watch time. Downstream regression then found a
+   SECOND, distinct real risk unprompted: `round_number_reclaim`'s
+   dynamically-recomputed trigger could satisfy a stale, hours-old streak
+   right after a sharp reversal, re-firing an entry the instant an
+   unrelated position closed — a first fix (reset `confirmed` on any
+   reversal) was tried, verified, and REVERTED because it broke the
+   genuine "recently confirmed" property 20+ other tests and the real
+   entry design depend on; left explicitly OPEN (documented in `evaluate_
+   hold_time_aware`'s own docstring and specs.md section 19) pending a
+   real time-based-staleness design, not silently patched or ignored.
+   Real before/after on the same real AIFF day: MACD sign-flips
+   (bearish→bullish), relative_volume 1.0→0.2516 (trivial→real reading),
+   a support level's hold confirmation False→True — real, consequential
+   differences, not refinements. Uniform-cadence AEMD data confirmed
+   unaffected at the full `build_state` level. Deploy HELD (same open
+   AEMD position); verified isolated against real live DAIC data instead.
+   Phase 3.6's migration work is functionally complete for all four
+   original functions, with one explicitly-tracked open design question
+   remaining before either migration should be considered fully closed
+   out.
 4. **(built)** Virtual trade journal — logs what the system would have
    done (entry, trailing stop) without placing anything, for end-of-day
    review against the user's own judgment. See section 6 for the full

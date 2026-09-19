@@ -96,6 +96,28 @@ def macd(closes: list[float], fast: int = 12, slow: int = 26, signal: int = 9) -
     return {"macd": macd_line, "signal": signal_line, "histogram": histogram}
 
 
+def macd_time_aware(closes: list[float], timestamps: list[float], fast: int = 12,
+                    slow: int = 26, signal: int = 9,
+                    reference_interval_seconds: float = 10.0) -> dict:
+    """Time-aware `macd` (phase 3.6 stage 3 part 2, specs.md section 19):
+    composed directly from `ema_time_aware` -- exactly the composition
+    stage 1 anticipated ("macd's own time-aware version deferred to a
+    later stage, composable directly from ema_time_aware once needed").
+    Same structure as `macd`, just every `ema` call replaced with
+    `ema_time_aware` fed the SAME `timestamps` the input `closes` share
+    (the derived macd line lives at those same real moments in time, so
+    its own signal-line EMA decays against the same real gaps). Bit-exact
+    equal to `macd` on uniform cadence, by the already-proven exactness
+    of `ema_time_aware` itself -- each component call is bit-identical,
+    so the subtractions producing `macd_line`/`histogram` are too."""
+    fast_ema = ema_time_aware(closes, timestamps, fast, reference_interval_seconds)
+    slow_ema = ema_time_aware(closes, timestamps, slow, reference_interval_seconds)
+    macd_line = [f - s for f, s in zip(fast_ema, slow_ema)]
+    signal_line = ema_time_aware(macd_line, timestamps, signal, reference_interval_seconds)
+    histogram = [m - s for m, s in zip(macd_line, signal_line)]
+    return {"macd": macd_line, "signal": signal_line, "histogram": histogram}
+
+
 def relative_volume(bars: list[dict], lookback: int = 20) -> list[float]:
     """
     Each bar's volume divided by the rolling average of the preceding

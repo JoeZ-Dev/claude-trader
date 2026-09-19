@@ -5,7 +5,7 @@ import pytest
 
 from indicators import (
     continuation_days, session_vwap, ema, macd, relative_volume,
-    ema_time_aware, relative_volume_time_aware,
+    ema_time_aware, relative_volume_time_aware, macd_time_aware,
 )
 from levels import (
     confirmed_swing_lows, detect_levels, evaluate_hold,
@@ -585,6 +585,90 @@ def test_swing_points_time_aware_requires_reaching_the_full_target_not_a_partial
     assert swing_points_time_aware(bars, kind="low", multiple=3.0) == []
     # multiple=1 only needs 60s -- one real hop away, well within reach.
     assert swing_points_time_aware(bars, kind="low", multiple=1.0) == [2]
+
+
+# -- Phase 3.6 stage 3 part 2: watch_added_ts (specs.md section 19) -------
+# Migrating evaluate_hold to feed the full backfilled+live series means a
+# hold can complete ENTIRELY within backfilled (pre-watch) bars. This
+# must not let a symbol show "confirmed" the instant it's added, purely
+# from history that predates ever watching it.
+
+def test_evaluate_hold_time_aware_does_not_confirm_purely_from_pre_watch_history():
+    # A hold completes entirely at ts=0..20 (well before watch_added_ts)
+    # and is STILL ongoing (no reversal) right up through the moment
+    # watching begins -- the real risk found on live AIFF data: a
+    # genuinely, currently-true state whose CONFIRMING instant is
+    # nonetheless purely historical must not show confirmed the instant
+    # a symbol is added, before any bar has actually been observed live.
+    bars = [
+        bar(0, 8.5, 8.6, 8.4, 8.72, 100_000),   # on-side, pre-watch
+        bar(10, 8.72, 8.9, 8.6, 8.85, 100_000),  # on-side, pre-watch
+        bar(20, 8.72, 8.9, 8.6, 8.90, 100_000),  # on-side, pre-watch -- confirms here (elapsed=30) if unrestricted
+        bar(30, 8.72, 8.9, 8.6, 8.92, 100_000),  # still on-side, pre-watch -- streak continues, uninterrupted
+    ]
+    watch_added_ts = 1_000_000  # watching begins long after these bars
+    # Unrestricted: the pre-watch confirmation at ts=20 sticks (no
+    # reversal ever occurs in this fixture) -- this is exactly the real
+    # risk found on live AIFF data.
+    unrestricted = evaluate_hold_time_aware(bars, level_price=8.69, direction="above",
+                                            required_seconds=30.0)
+    assert unrestricted.confirmed is True
+    # Restricted: the confirming instant itself must be at or after
+    # watch_added_ts. No bar in this fixture is at or after it yet.
+    restricted = evaluate_hold_time_aware(bars, level_price=8.69, direction="above",
+                                          required_seconds=30.0, watch_added_ts=watch_added_ts)
+    assert restricted.confirmed is False
+
+
+def test_evaluate_hold_time_aware_confirms_once_a_post_watch_bar_extends_a_pre_watch_streak():
+    # The SAME streak that started before watch continues, uninterrupted,
+    # through and past watch_added_ts -- this is a genuinely still-true,
+    # currently-observable state (price really has been above the level
+    # continuously), so it's correct to confirm once a post-watch bar
+    # naturally extends the already-past-threshold streak, not withheld
+    # forever just because the streak itself started in the backfill.
+    bars = [
+        bar(0, 8.5, 8.6, 8.4, 8.72, 100_000),
+        bar(10, 8.72, 8.9, 8.6, 8.85, 100_000),
+        bar(20, 8.72, 8.9, 8.6, 8.90, 100_000),   # elapsed=30 here if unrestricted -- but pre-watch
+        bar(30, 8.72, 8.9, 8.6, 8.95, 100_000),   # still on-side, still pre-watch
+        bar(1_000_000, 8.72, 8.9, 8.6, 8.96, 100_000),  # watch begins, streak continues uninterrupted
+    ]
+    restricted = evaluate_hold_time_aware(bars, level_price=8.69, direction="above",
+                                          required_seconds=30.0, watch_added_ts=1_000_000)
+    assert restricted.confirmed is True  # confirms AT the first post-watch bar
+    unrestricted = evaluate_hold_time_aware(bars, level_price=8.69, direction="above",
+                                            required_seconds=30.0)
+    assert unrestricted.confirmed is True  # already confirmed earlier -- same final answer, different timing
+
+
+def test_evaluate_hold_time_aware_watch_added_ts_none_is_unrestricted_default():
+    # No watch_added_ts given (every stage 1-3-part-1 test, and any
+    # caller that doesn't track a watch time) -- behavior is completely
+    # unchanged.
+    bars = [
+        bar(0, 8.5, 8.6, 8.4, 8.72, 100_000),
+        bar(10, 8.72, 8.9, 8.6, 8.85, 100_000),
+        bar(20, 8.72, 8.9, 8.6, 8.90, 100_000),
+    ]
+    with_none = evaluate_hold_time_aware(bars, level_price=8.69, direction="above", required_seconds=30.0,
+                                         watch_added_ts=None)
+    without = evaluate_hold_time_aware(bars, level_price=8.69, direction="above", required_seconds=30.0)
+    assert with_none == without
+
+
+def test_macd_time_aware_exactly_equals_bar_count_macd_on_uniform_cadence():
+    # Composed directly from ema_time_aware (specs.md section 19) --
+    # bit-exact equal to macd() on uniform 10s cadence, by ema_time_
+    # aware's own already-proven exactness.
+    closes = [5.0, 5.2, 5.1, 5.4, 5.6, 5.3, 5.8, 6.0, 5.9, 6.2,
+              6.5, 6.3, 6.6, 6.8, 6.7, 7.0, 7.2, 7.1, 7.4, 7.6]
+    timestamps = [1_700_000_000 + i * 10 for i in range(len(closes))]
+    old = macd(closes)
+    new = macd_time_aware(closes, timestamps)
+    assert new["macd"] == old["macd"]
+    assert new["signal"] == old["signal"]
+    assert new["histogram"] == old["histogram"]
 
 
 if __name__ == "__main__":

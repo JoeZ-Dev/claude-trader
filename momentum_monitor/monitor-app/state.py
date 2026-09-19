@@ -17,21 +17,19 @@ Three policy choices for phase 1, from the build session:
   resistance priced ABOVE the last price (direction "above") and the
   strongest support priced BELOW it (direction "below"). Entry-side
   evaluation only -- there is no stop-loss evaluation anywhere in this
-  tool. required_bars = 3 (the core default).
-- Bar-count-windowed indicators (ema/macd/relative_volume/hold-
-  confirmation) only ever see the LIVE, uniform-10s-cadence tail of the
-  bar list, never the coarser/irregular backfilled bars schwab-connector
-  prepends ahead of it (see price_history.py there, and specs.md section
-  3, "Backfill vs. live bar width"). session_vwap and detect_levels are
-  not window-based this way and keep seeing the full backfilled+live
-  series on purpose -- see live_cadence_tail() below for why and how the
-  split is found.
+  tool. required_seconds = 30.0 (the core default, 3 bars' worth at live
+  10s cadence).
+- Migrated (phase 3.6 stage 3 part 2, specs.md section 19) OFF the old
+  `live_cadence_tail` split: ema/macd/relative_volume/hold-confirmation
+  now all see the FULL backfilled+live series directly, via their
+  time-aware versions (sections 15-17), which correctly weight whatever
+  cadence each bar actually has instead of needing a pre-filtered
+  uniform-cadence subset. `live_cadence_tail` itself is retired --
+  nothing in this module depends on it anymore.
 
 Phase 3.5 addition: `setups` runs core/setup_types.py's evaluate_setups()
-alongside the existing resistance/support block, using the exact same
-`bars`/`live_bars` split (detect_levels sees the full series, every
-evaluate_hold call inside it sees only the live tail) -- one split,
-reused everywhere it applies, not a second one invented for setups.
+alongside the existing resistance/support block, now sharing the SAME
+single `bars` list (no more separate `live_bars` split -- see above).
 """
 from __future__ import annotations
 
@@ -47,29 +45,13 @@ _CORE = os.environ.get("CORE_PATH") or os.path.join(
 if _CORE not in sys.path:
     sys.path.insert(0, _CORE)
 
-from indicators import ema, macd, relative_volume, session_vwap  # noqa: E402
-from levels import detect_levels, evaluate_hold  # noqa: E402
+from indicators import ema_time_aware, macd_time_aware, relative_volume_time_aware, session_vwap  # noqa: E402
+from levels import detect_levels, evaluate_hold_time_aware  # noqa: E402
 from setup_types import evaluate_setups  # noqa: E402
 
 _NY = ZoneInfo("America/New_York")
-REQUIRED_HOLD_BARS = 3
-RELVOL_LOOKBACK = 20
-
-# schwab-connector's live aggregator (aggregator.py, BUCKET_SECONDS=10)
-# forward-fills exactly one bar per bucket once streaming has started, so
-# no two consecutive live bars are ever more than 10s apart. Backfilled
-# bars (price_history.py) are Schwab price-history candles no finer than
-# 1 minute, and Schwab omits zero-volume minutes entirely, so consecutive
-# backfilled bars can be 60s to 900+s apart. 15s sits safely between the
-# two: comfortably above live's 10s cadence (with slack for jitter),
-# comfortably below backfill's 60s floor. This constant intentionally
-# duplicates schwab-connector's BUCKET_SECONDS rather than importing it --
-# the two containers don't share code across that boundary
-# (AGENT_PROTOCOL.md's directory-boundary rule) or even run in the same
-# process; the boundary between them is detected from the DATA (the
-# spacing between bars monitor-app already receives), not from a shared
-# constant.
-LIVE_BAR_MAX_GAP_SECONDS = 15.0
+REQUIRED_HOLD_SECONDS = 30.0
+RELVOL_LOOKBACK_SECONDS = 200.0
 
 
 def _ny_date(ts: float):
@@ -84,26 +66,6 @@ def session_bars_for_vwap(bars: list[dict]) -> list[dict]:
     return [b for b in bars if _ny_date(b["ts"]) == latest]
 
 
-def live_cadence_tail(bars: list[dict],
-                      max_gap: float = LIVE_BAR_MAX_GAP_SECONDS) -> list[dict]:
-    """The contiguous suffix of `bars` produced at live-stream cadence,
-    isolated from any coarser/irregular backfilled history ahead of it.
-
-    Walks backward from the most recent bar; a gap larger than `max_gap`
-    marks the boundary where backfilled history ends and live streaming
-    begins. When there's no backfill at all (replay mode, or a fresh watch
-    whose backfill hasn't landed yet), every bar already has live cadence
-    and the whole list comes back unchanged -- this is what keeps existing
-    all-live-bar behavior (and its tests) unaffected by this function's
-    existence."""
-    if not bars:
-        return []
-    i = len(bars) - 1
-    while i > 0 and bars[i]["ts"] - bars[i - 1]["ts"] <= max_gap:
-        i -= 1
-    return bars[i:]
-
-
 def select_levels(levels, current_price: float) -> dict:
     """Strongest resistance above price, strongest support below price."""
     above = [l for l in levels
@@ -116,11 +78,12 @@ def select_levels(levels, current_price: float) -> dict:
     }
 
 
-def _level_block(bars, level, direction: str) -> dict | None:
+def _level_block(bars, level, direction: str, watch_added_ts: float | None) -> dict | None:
     if level is None:
         return None
-    hold = evaluate_hold(bars, level.price, direction=direction,
-                         required_bars=REQUIRED_HOLD_BARS)
+    hold = evaluate_hold_time_aware(bars, level.price, direction=direction,
+                                    required_seconds=REQUIRED_HOLD_SECONDS,
+                                    watch_added_ts=watch_added_ts)
     return {
         "price": round(level.price, 4),
         "kind": level.kind,
@@ -134,15 +97,23 @@ def _level_block(bars, level, direction: str) -> dict | None:
         },
         "hold": {
             "direction": direction,
-            "required_bars": REQUIRED_HOLD_BARS,
-            "consecutive_bars": hold.consecutive_bars,
+            "required_seconds": REQUIRED_HOLD_SECONDS,
+            "elapsed_seconds": hold.elapsed_seconds,
             "confirmed": hold.confirmed,
             "failed_attempts": hold.failed_attempts,
         },
     }
 
 
-def build_state(bars: list[dict], symbol: str | None = None) -> dict:
+def build_state(bars: list[dict], symbol: str | None = None,
+                watch_added_ts: float | None = None) -> dict:
+    """`watch_added_ts` (phase 3.6 stage 3 part 2, specs.md section 19):
+    this symbol's own watch-start time (epoch seconds), threaded through
+    to every hold-confirmation call so a hold can't show "confirmed" from
+    purely pre-watch backfilled history the instant a symbol is added --
+    see `evaluate_hold_time_aware`'s docstring for the full real-data
+    finding this guards against. `None` (the default) disables the
+    guard, for callers that don't track a watch time."""
     if not bars:
         return {"status": "warming_up", "symbol": symbol, "bar_count": 0}
 
@@ -155,16 +126,15 @@ def build_state(bars: list[dict], symbol: str | None = None) -> dict:
     # above, not a separately-invented one.
     cumulative_volume = sum(b["volume"] for b in session)
 
-    # ema/macd/relative_volume/hold-confirmation are bar-count-windowed and
-    # implicitly assume uniform bar width -- see the module docstring and
-    # live_cadence_tail() above. detect_levels (level identification) and
-    # session_vwap, above, are not window-based this way and deliberately
-    # keep seeing the full backfilled+live series.
-    live_bars = live_cadence_tail(bars)
-    live_closes = [b["close"] for b in live_bars]
+    # ema/macd/relative_volume/hold-confirmation now all see the FULL
+    # backfilled+live series directly (specs.md section 19) -- their
+    # time-aware versions correctly weight whatever cadence each bar
+    # actually has, replacing the old live_cadence_tail split entirely.
+    closes = [b["close"] for b in bars]
+    timestamps = [b["ts"] for b in bars]
 
-    macd_result = macd(live_closes)
-    relvol = relative_volume(live_bars, lookback=RELVOL_LOOKBACK)[-1]
+    macd_result = macd_time_aware(closes, timestamps)
+    relvol = relative_volume_time_aware(bars, lookback_seconds=RELVOL_LOOKBACK_SECONDS)[-1]
 
     picked = select_levels(detect_levels(bars), last_price)
 
@@ -173,7 +143,8 @@ def build_state(bars: list[dict], symbol: str | None = None) -> dict:
     # "closest." A type that isn't currently watchable (no level above
     # price, no real VWAP pullback in progress) is simply absent, not a
     # null placeholder entry.
-    setups = [asdict(c) for c in evaluate_setups(bars, live_bars, last_price, vwap)]
+    setups = [asdict(c) for c in
+              evaluate_setups(bars, last_price, vwap, watch_added_ts=watch_added_ts)]
 
     return {
         "status": "ok",
@@ -184,8 +155,8 @@ def build_state(bars: list[dict], symbol: str | None = None) -> dict:
         "last_bar_is_extended": bars[-1]["is_extended"],
         "session": {
             "vwap": round(vwap, 4) if vwap is not None else None,
-            "ema9": round(ema(live_closes, 9)[-1], 4),
-            "ema20": round(ema(live_closes, 20)[-1], 4),
+            "ema9": round(ema_time_aware(closes, timestamps, 9)[-1], 4),
+            "ema20": round(ema_time_aware(closes, timestamps, 20)[-1], 4),
             "macd": {
                 "macd": round(macd_result["macd"][-1], 6),
                 "signal": round(macd_result["signal"][-1], 6),
@@ -195,8 +166,8 @@ def build_state(bars: list[dict], symbol: str | None = None) -> dict:
             "cumulative_volume": round(cumulative_volume, 4),
         },
         "levels": {
-            "resistance": _level_block(live_bars, picked["resistance"], "above"),
-            "support": _level_block(live_bars, picked["support"], "below"),
+            "resistance": _level_block(bars, picked["resistance"], "above", watch_added_ts),
+            "support": _level_block(bars, picked["support"], "below", watch_added_ts),
         },
         "setups": setups,
     }

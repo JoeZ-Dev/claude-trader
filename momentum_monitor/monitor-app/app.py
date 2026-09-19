@@ -245,6 +245,14 @@ class _SymbolSlot:
     poll_ok: bool = False
     journal_position: OpenPosition | None = None
     journal_confirmed_types: frozenset[str] = field(default_factory=frozenset)
+    # When this symbol was actually added to the watchlist (Poller's own
+    # now_fn, for testability) -- threaded through to build_state's
+    # watch_added_ts (specs.md section 19, phase 3.6 stage 3 part 2) so a
+    # hold-confirmation can't complete entirely within pre-watch backfilled
+    # bars and fire an entry the instant the symbol is added. None only
+    # transiently, between slot construction and the line that sets it in
+    # add_symbol -- every real slot gets a real value.
+    added_ts: float | None = None
     # Fetched ONCE, when the symbol is first added (specs.md section 12's
     # session-level volume gate), never per-bar -- None if never fetched
     # yet, or if the fetch failed/returned nothing (too new a symbol, a
@@ -618,7 +626,9 @@ class Poller:
             await self.remove_symbol(oldest)
             note = f"dropped {oldest} (oldest) to make room for {symbol}"
 
-        self._slots[symbol] = _SymbolSlot(symbol=symbol, state=build_state([], symbol))
+        added_ts = self._now_fn()
+        self._slots[symbol] = _SymbolSlot(symbol=symbol, added_ts=added_ts,
+                                          state=build_state([], symbol, watch_added_ts=added_ts))
         if self._fetch_daily_bars is not None:
             # Fetched ONCE per symbol, right here at add-time, never
             # per-bar (specs.md section 12) -- a failure (too new a
@@ -769,7 +779,7 @@ class Poller:
                 new_bars.append(bar)
         if new_bars:
             slot.last_ts = slot.bars[-1]["ts"]
-        slot.state = build_state(slot.bars, symbol)
+        slot.state = build_state(slot.bars, symbol, watch_added_ts=slot.added_ts)
         slot.poll_ok = True
         self._update_journal(symbol, slot, new_bars)
         self._broadcast_state()
@@ -1081,7 +1091,7 @@ def _setup_hold_and_factor_rows_html(setup: dict) -> str:
     )
     rows = [
         f"<tr><th>hold direction</th><td>{html.escape(h['direction'])}</td></tr>",
-        f"<tr><th>consecutive closes</th><td>{h['consecutive_bars']} / {h['required_bars']}</td></tr>",
+        f"<tr><th>time above level</th><td>{_fmt(h['elapsed_seconds'], 0)}s / {_fmt(h['required_seconds'], 0)}s</td></tr>",
         f"<tr><th>hold confirmed</th><td>{badge}</td></tr>",
         f"<tr><th>failed attempts</th><td>{h['failed_attempts']}</td></tr>",
     ]
@@ -1155,7 +1165,7 @@ def _level_rows_html(block: dict) -> str:
         f"<tr><th>touch volume</th><td>{_fmt(c['total_touch_volume'], 0)}</td></tr>"
         f"<tr><th>round-number bonus</th><td>{_fmt(c['round_number_bonus'], 2)}</td></tr>"
         f"<tr><th>hold direction</th><td>{html.escape(h['direction'])}</td></tr>"
-        f"<tr><th>consecutive closes</th><td>{h['consecutive_bars']} / {h['required_bars']}</td></tr>"
+        f"<tr><th>time above level</th><td>{_fmt(h['elapsed_seconds'], 0)}s / {_fmt(h['required_seconds'], 0)}s</td></tr>"
         f"<tr><th>hold confirmed</th><td>{badge}</td></tr>"
         f"<tr><th>failed attempts</th><td>{h['failed_attempts']}</td></tr>"
     )
@@ -1532,7 +1542,7 @@ function levelRows(block) {
     '<tr><th>touch volume</th><td>' + fmt(c.total_touch_volume, 0) + '</td></tr>' +
     '<tr><th>round-number bonus</th><td>' + fmt(c.round_number_bonus, 2) + '</td></tr>' +
     '<tr><th>hold direction</th><td>' + esc(h.direction) + '</td></tr>' +
-    '<tr><th>consecutive closes</th><td>' + h.consecutive_bars + ' / ' + h.required_bars + '</td></tr>' +
+    '<tr><th>time above level</th><td>' + fmt(h.elapsed_seconds, 0) + 's / ' + fmt(h.required_seconds, 0) + 's</td></tr>' +
     '<tr><th>hold confirmed</th><td>' + badge + '</td></tr>' +
     '<tr><th>failed attempts</th><td>' + h.failed_attempts + '</td></tr>';
 }
@@ -1620,7 +1630,7 @@ function setupHoldAndFactorRows(setup) {
     ? '<span class="badge badge-confirmed">confirmed</span>'
     : '<span class="badge badge-pending">not confirmed</span>';
   let rows = '<tr><th>hold direction</th><td>' + esc(h.direction) + '</td></tr>' +
-    '<tr><th>consecutive closes</th><td>' + h.consecutive_bars + ' / ' + h.required_bars + '</td></tr>' +
+    '<tr><th>time above level</th><td>' + fmt(h.elapsed_seconds, 0) + 's / ' + fmt(h.required_seconds, 0) + 's</td></tr>' +
     '<tr><th>hold confirmed</th><td>' + badge + '</td></tr>' +
     '<tr><th>failed attempts</th><td>' + h.failed_attempts + '</td></tr>';
   Object.keys(setup.factors).forEach(function (key) {

@@ -26,23 +26,27 @@ level-strength components -- picking "closest" should stay as legible as
 asked for. evaluate_setups() returns candidates already sorted ascending
 by this distance -- the first element (if any) is "closest."
 
-Bar-list split mirrors monitor-app/state.py's existing live_cadence_tail
-convention exactly, for the reason documented there (specs.md section 3,
-"Backfill vs. live bar width"): detect_levels is a whole-session scan
-and deliberately sees the FULL bar history (`bars`); evaluate_hold is
-bar-count-windowed and must only ever see the live tail (`live_bars`),
-never the coarser/irregular backfilled bars ahead of it. This module has
-no opinion on how that split is found -- it takes both lists already
-split, exactly as state.py already does for the existing
-resistance/support hold blocks.
+Migrated (phase 3.6 stage 3 part 2, specs.md section 19) off the
+`bars`/`live_bars` split this module used to mirror from monitor-app/
+state.py's now-retired `live_cadence_tail`: both `detect_levels` and
+`evaluate_hold_time_aware` now see the SAME single `bars` list, the full
+backfilled+live history -- `detect_levels` already did (a whole-session
+scan), and `evaluate_hold_time_aware` correctly weights whatever cadence
+each bar actually has instead of needing a pre-filtered uniform-cadence
+subset (specs.md sections 15-17). `watch_added_ts`, threaded through to
+every `evaluate_hold_time_aware` call here, guards the real risk this
+migration introduced: a hold could otherwise complete ENTIRELY within
+backfilled (pre-watch) bars, showing "confirmed" the instant a symbol is
+added -- see `evaluate_hold_time_aware`'s own docstring and specs.md
+section 19 for the full real-data finding and fix.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from levels import Level, HoldState, detect_levels, evaluate_hold, nearest_round_number_above
+from levels import Level, HoldStateTimeAware, detect_levels, evaluate_hold_time_aware, nearest_round_number_above
 
-REQUIRED_HOLD_BARS = 3
+REQUIRED_HOLD_SECONDS = 30.0
 
 # Half of detect_levels' own default swing_window (3), floored to an
 # integer -- literally "the same function, called a second time with a
@@ -70,11 +74,11 @@ class SetupCandidate:
     factors: dict        # type-specific detail -- never collapsed into one score
 
 
-def _hold_dict(hold: HoldState) -> dict:
+def _hold_dict(hold: HoldStateTimeAware) -> dict:
     return {
         "direction": hold.direction,
-        "required_bars": REQUIRED_HOLD_BARS,
-        "consecutive_bars": hold.consecutive_bars,
+        "required_seconds": REQUIRED_HOLD_SECONDS,
+        "elapsed_seconds": hold.elapsed_seconds,
         "confirmed": hold.confirmed,
         "failed_attempts": hold.failed_attempts,
     }
@@ -90,19 +94,21 @@ def _nearest_above(levels: list[Level], current_price: float) -> Level | None:
     return max(above, key=lambda l: l.strength_score) if above else None
 
 
-def _breakout_candidate(setup_type: str, bars: list[dict], live_bars: list[dict],
-                        current_price: float, swing_window: int) -> SetupCandidate | None:
+def _breakout_candidate(setup_type: str, bars: list[dict],
+                        current_price: float, swing_window: int,
+                        watch_added_ts: float | None) -> SetupCandidate | None:
     """Shared implementation for both resistance_breakout (swing_window=3,
     the detect_levels default) and micro_breakout (swing_window=
     MICRO_SWING_WINDOW) -- same detect_levels function, same nearest-above
-    picking, same evaluate_hold call; only the window differs. No new
-    detection logic for micro_breakout, exactly as specced."""
+    picking, same evaluate_hold_time_aware call; only the window differs.
+    No new detection logic for micro_breakout, exactly as specced."""
     levels = detect_levels(bars, swing_window=swing_window)
     level = _nearest_above(levels, current_price)
     if level is None:
         return None
-    hold = evaluate_hold(live_bars, level.price, direction="above",
-                         required_bars=REQUIRED_HOLD_BARS)
+    hold = evaluate_hold_time_aware(bars, level.price, direction="above",
+                                    required_seconds=REQUIRED_HOLD_SECONDS,
+                                    watch_added_ts=watch_added_ts)
     return SetupCandidate(
         setup_type=setup_type,
         trigger_price=round(level.price, 4),
@@ -117,16 +123,18 @@ def _breakout_candidate(setup_type: str, bars: list[dict], live_bars: list[dict]
     )
 
 
-def _vwap_reclaim_candidate(live_bars: list[dict], current_price: float,
-                            vwap: float | None) -> SetupCandidate | None:
+def _vwap_reclaim_candidate(bars: list[dict], current_price: float,
+                            vwap: float | None,
+                            watch_added_ts: float | None) -> SetupCandidate | None:
     """Trend: current price at/above session VWAP (a simple instantaneous
     check, deliberately not a multi-bar trend model -- keeps this pass a
     manageable size, same spirit as the breakout-above-only scope).
     Pullback: price within VWAP_PULLBACK_THRESHOLD_PCT of VWAP. Reclaim:
-    evaluate_hold treating VWAP itself as the level to hold/reclaim
-    closes above, same 3-bar confirmation as everything else. Absent
-    (not a zero/null candidate) when either condition doesn't hold --
-    same "not watchable right now" convention as the other three types."""
+    evaluate_hold_time_aware treating VWAP itself as the level to
+    hold/reclaim closes above, same 30-second confirmation as everything
+    else. Absent (not a zero/null candidate) when either condition
+    doesn't hold -- same "not watchable right now" convention as the
+    other three types."""
     if vwap is None or vwap <= 0:
         return None
     is_uptrend = current_price >= vwap
@@ -134,8 +142,9 @@ def _vwap_reclaim_candidate(live_bars: list[dict], current_price: float,
     is_pullback = distance_pct <= VWAP_PULLBACK_THRESHOLD_PCT
     if not (is_uptrend and is_pullback):
         return None
-    hold = evaluate_hold(live_bars, vwap, direction="above",
-                         required_bars=REQUIRED_HOLD_BARS)
+    hold = evaluate_hold_time_aware(bars, vwap, direction="above",
+                                    required_seconds=REQUIRED_HOLD_SECONDS,
+                                    watch_added_ts=watch_added_ts)
     return SetupCandidate(
         setup_type="vwap_reclaim",
         trigger_price=round(vwap, 4),
@@ -149,8 +158,8 @@ def _vwap_reclaim_candidate(live_bars: list[dict], current_price: float,
     )
 
 
-def _round_number_reclaim_candidate(live_bars: list[dict],
-                                    current_price: float) -> SetupCandidate | None:
+def _round_number_reclaim_candidate(bars: list[dict], current_price: float,
+                                    watch_added_ts: float | None) -> SetupCandidate | None:
     """The one type watchable even with ZERO prior price touches at that
     level -- an untested round number is still a psychologically real
     level to retail traders, unlike a swing level which requires an
@@ -159,8 +168,9 @@ def _round_number_reclaim_candidate(live_bars: list[dict],
     price, so unlike the other three types this one never comes back
     None."""
     trigger = nearest_round_number_above(current_price)
-    hold = evaluate_hold(live_bars, trigger, direction="above",
-                         required_bars=REQUIRED_HOLD_BARS)
+    hold = evaluate_hold_time_aware(bars, trigger, direction="above",
+                                    required_seconds=REQUIRED_HOLD_SECONDS,
+                                    watch_added_ts=watch_added_ts)
     return SetupCandidate(
         setup_type="round_number_reclaim",
         trigger_price=round(trigger, 4),
@@ -175,24 +185,31 @@ def _round_number_reclaim_candidate(live_bars: list[dict],
 
 def evaluate_setups(
     bars: list[dict],
-    live_bars: list[dict],
     current_price: float,
     vwap: float | None,
     main_swing_window: int = 3,
+    watch_added_ts: float | None = None,
 ) -> list[SetupCandidate]:
     """All setup-type candidates currently watchable (breakout-above
     direction only -- see module docstring), sorted ascending by dollar
     distance to trigger; candidates[0] (if the list is non-empty) is
     "closest." A type that isn't watchable right now (no level above
     price, no real VWAP pullback in progress) is simply absent from the
-    result, never a null/zero placeholder entry."""
+    result, never a null/zero placeholder entry.
+
+    `bars` is the FULL backfilled+live series (phase 3.6 stage 3 part 2 --
+    the old `live_bars` split is retired, see module docstring).
+    `watch_added_ts`, when given, is this symbol's own watch-start time
+    (epoch seconds) -- passed straight through to every
+    `evaluate_hold_time_aware` call so a hold can't show "confirmed" from
+    purely pre-watch backfilled history (see that function's docstring)."""
     candidates = [
-        _breakout_candidate("resistance_breakout", bars, live_bars, current_price,
-                            main_swing_window),
-        _breakout_candidate("micro_breakout", bars, live_bars, current_price,
-                            MICRO_SWING_WINDOW),
-        _vwap_reclaim_candidate(live_bars, current_price, vwap),
-        _round_number_reclaim_candidate(live_bars, current_price),
+        _breakout_candidate("resistance_breakout", bars, current_price,
+                            main_swing_window, watch_added_ts),
+        _breakout_candidate("micro_breakout", bars, current_price,
+                            MICRO_SWING_WINDOW, watch_added_ts),
+        _vwap_reclaim_candidate(bars, current_price, vwap, watch_added_ts),
+        _round_number_reclaim_candidate(bars, current_price, watch_added_ts),
     ]
     present = [c for c in candidates if c is not None]
     return sorted(present, key=lambda c: c.distance)

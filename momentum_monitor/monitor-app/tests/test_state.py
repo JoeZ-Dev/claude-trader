@@ -7,14 +7,12 @@ sys.path.insert(0, _APP_DIR)
 _CORE = os.path.join(os.path.dirname(_APP_DIR), "core")
 sys.path.insert(0, _CORE)
 
-from indicators import ema, relative_volume, session_vwap  # from core
-from levels import Level, detect_levels, evaluate_hold  # from core
+from indicators import ema_time_aware, relative_volume_time_aware, session_vwap  # from core
+from levels import Level, detect_levels, evaluate_hold_time_aware  # from core
 from state import (
-    LIVE_BAR_MAX_GAP_SECONDS,
-    RELVOL_LOOKBACK,
-    REQUIRED_HOLD_BARS,
+    RELVOL_LOOKBACK_SECONDS,
+    REQUIRED_HOLD_SECONDS,
     build_state,
-    live_cadence_tail,
     select_levels,
     session_bars_for_vwap,
 )
@@ -135,46 +133,18 @@ def test_build_state_short_history_does_not_crash():
     assert "histogram" in st["session"]["macd"]
 
 
-# -- live_cadence_tail ---------------------------------------------------
-
-def test_live_cadence_tail_returns_everything_when_uniformly_spaced():
-    bars = [{"ts": i * 10} for i in range(5)]
-    assert live_cadence_tail(bars) == bars
-
-
-def test_live_cadence_tail_isolates_segment_after_a_large_gap():
-    backfill = [{"ts": t} for t in (0, 60, 120)]
-    live = [{"ts": t} for t in (300, 310, 320)]
-    assert live_cadence_tail(backfill + live) == live
-
-
-def test_live_cadence_tail_empty_list():
-    assert live_cadence_tail([]) == []
-
-
-def test_live_cadence_tail_single_bar():
-    bars = [{"ts": 100}]
-    assert live_cadence_tail(bars) == bars
-
-
-def test_live_cadence_tail_gap_exactly_at_threshold_still_counts_as_live():
-    bars = [{"ts": 0}, {"ts": LIVE_BAR_MAX_GAP_SECONDS}]
-    assert live_cadence_tail(bars) == bars
-
-
-# -- build_state: backfill (coarse/irregular) vs. live (uniform 10s) -----
+# -- build_state: backfilled+live series, all functions now time-aware --
 #
+# Migrated (phase 3.6 stage 3 part 2, specs.md section 19) OFF the old
+# live_cadence_tail split -- ema/macd/relative_volume/hold-confirmation
+# now all see the FULL backfilled+live series directly, via their
+# time-aware versions, which correctly weight whatever cadence each bar
+# actually has instead of needing a pre-filtered uniform-cadence subset.
 # Backfilled bars (schwab-connector/price_history.py) are Schwab
 # price-history candles, no finer than 1 minute and with zero-volume
 # minutes skipped entirely -- irregular, never as tight as 10s apart.
 # Live bars (schwab-connector/aggregator.py) are always exactly
-# BUCKET_SECONDS=10 apart once streaming starts. Bar-count-windowed
-# functions (ema/macd/relative_volume/hold-confirmation) implicitly assume
-# uniform bar width, so mixing the two would make a "9-period EMA" mean 9
-# minutes one moment and 90 seconds the next. session_vwap and
-# detect_levels are not window-based this way and are meant to see the
-# whole session, backfill included -- see specs.md section 3 for the full
-# rationale and the explicitly-deferred time-aware alternative.
+# BUCKET_SECONDS=10 apart once streaming starts.
 
 def _flat_backfill_bars(price: float, count: int = 10, step: int = 60):
     return [{"ts": i * step, "open": price, "high": price, "low": price,
@@ -188,21 +158,26 @@ def _flat_live_bars(price: float, start_ts: int, count: int = 5, step: int = 10)
             for i in range(count)]
 
 
-def test_build_state_ema_and_relative_volume_ignore_backfilled_bars():
-    backfill = _flat_backfill_bars(100.0)  # would badly skew EMA/relvol if counted
-    live = _flat_live_bars(10.0, backfill[-1]["ts"] + 300)
+def test_build_state_ema_and_relative_volume_now_include_backfilled_bars():
+    # The migration's whole point: build_state's ema9/relative_volume must
+    # match the time-aware functions run directly on the FULL bars list,
+    # not a live-only tail -- and backfill must now measurably influence
+    # the result (a realistic near-immediate transition gap, like real
+    # AIFF's, not an artificial one large enough to itself decay the old
+    # value away).
+    backfill = _flat_backfill_bars(100.0)
+    live = _flat_live_bars(10.0, backfill[-1]["ts"] + 10)
     bars = backfill + live
 
     st = build_state(bars, symbol="X")
-    live_bars = live_cadence_tail(bars)
-    assert live_bars == live  # sanity: the split landed where expected
-
-    live_closes = [b["close"] for b in live_bars]
-    assert st["session"]["ema9"] == round(ema(live_closes, 9)[-1], 4)
+    closes = [b["close"] for b in bars]
+    timestamps = [b["ts"] for b in bars]
+    assert st["session"]["ema9"] == round(ema_time_aware(closes, timestamps, 9)[-1], 4)
     assert st["session"]["relative_volume"] == round(
-        relative_volume(live_bars, lookback=RELVOL_LOOKBACK)[-1], 4)
-    # A 100.0-heavy EMA would round to 100.0-ish; confirm it doesn't.
-    assert st["session"]["ema9"] < 50.0
+        relative_volume_time_aware(bars, lookback_seconds=RELVOL_LOOKBACK_SECONDS)[-1], 4)
+    # The heavy backfilled volume at 100.0 now genuinely pulls the EMA up
+    # well above the pure-live value (10.0), rather than being invisible.
+    assert st["session"]["ema9"] > 30.0
 
 
 def test_build_state_vwap_still_spans_the_full_backfilled_and_live_session():
@@ -211,16 +186,18 @@ def test_build_state_vwap_still_spans_the_full_backfilled_and_live_session():
     bars = backfill + live
 
     st = build_state(bars, symbol="X")
-    live_only_vwap = session_vwap(live_cadence_tail(bars))[-1]
+    live_only_vwap = session_vwap(live)[-1]
     # If VWAP only saw the live tail it would sit right at 10.0; seeing the
     # full session (10x more backfilled volume at 100.0) pulls it way up.
+    # (VWAP was never live_cadence_tail-filtered -- unaffected by this
+    # migration -- this test just reconfirms that's still true.)
     assert st["session"]["vwap"] > live_only_vwap + 10.0
 
 
-def test_build_state_hold_confirmation_uses_only_live_cadence_bars():
-    # A dip mid-backfill gives detect_levels an obvious support candidate
-    # whose backfilled closes alone would look "held" below it if counted;
-    # the short live tail alone is too short to confirm anything.
+def test_build_state_hold_confirmation_now_uses_the_full_bar_series():
+    # A dip mid-backfill gives detect_levels an obvious support candidate;
+    # build_state's hold block must match evaluate_hold_time_aware run
+    # directly on the FULL bars list.
     ts = 0
     prices = [10, 10, 9, 8, 6, 4, 6, 8, 9, 10]
     backfill = []
@@ -232,7 +209,6 @@ def test_build_state_hold_confirmation_uses_only_live_cadence_bars():
     bars = backfill + live
 
     st = build_state(bars, symbol="X")
-    live_bars = live_cadence_tail(bars)
     picked = select_levels(detect_levels(bars), bars[-1]["close"])
 
     for side, direction in (("resistance", "above"), ("support", "below")):
@@ -241,9 +217,9 @@ def test_build_state_hold_confirmation_uses_only_live_cadence_bars():
         if level is None:
             assert block is None
             continue
-        expected = evaluate_hold(live_bars, level.price, direction=direction,
-                                 required_bars=REQUIRED_HOLD_BARS)
-        assert block["hold"]["consecutive_bars"] == expected.consecutive_bars
+        expected = evaluate_hold_time_aware(bars, level.price, direction=direction,
+                                            required_seconds=REQUIRED_HOLD_SECONDS)
+        assert block["hold"]["elapsed_seconds"] == expected.elapsed_seconds
         assert block["hold"]["confirmed"] == expected.confirmed
 
 
@@ -275,3 +251,32 @@ def test_session_bars_for_vwap_slices_to_latest_ny_date():
     ]
     got = session_bars_for_vwap(bars)
     assert [b["ts"] for b in got] == [day2, day2 + 10]
+
+
+# -- watch_added_ts (phase 3.6 stage 3 part 2, specs.md section 19) ------
+
+def test_build_state_watch_added_ts_reaches_setups_and_level_blocks():
+    # A round-number reclaim (and, by the same code path, the resistance/
+    # support hold blocks) that would otherwise confirm entirely within
+    # pre-watch bars must not show confirmed=True when watch_added_ts is
+    # given -- must actually reach build_state's own call sites, not just
+    # setup_types.py's in isolation.
+    bars = [
+        {"ts": 0, "open": 1.3, "high": 1.35, "low": 1.25, "close": 1.32,
+         "volume": 10_000.0, "is_extended": False},
+        {"ts": 10, "open": 1.32, "high": 1.36, "low": 1.28, "close": 1.33,
+         "volume": 10_000.0, "is_extended": False},
+        {"ts": 20, "open": 1.33, "high": 1.37, "low": 1.29, "close": 1.34,
+         "volume": 10_000.0, "is_extended": False},
+        # closes below the 1.30 trigger the FINAL close itself derives --
+        # confirmation (if any) must have already happened at ts=20.
+        {"ts": 30, "open": 1.3, "high": 1.32, "low": 1.24, "close": 1.29,
+         "volume": 10_000.0, "is_extended": False},
+    ]
+    unrestricted = build_state(bars, symbol="X")
+    reclaim = next(s for s in unrestricted["setups"] if s["setup_type"] == "round_number_reclaim")
+    assert reclaim["hold"]["confirmed"] is True  # the real risk, reproduced at build_state level
+
+    restricted = build_state(bars, symbol="X", watch_added_ts=1_000_000)
+    reclaim_restricted = next(s for s in restricted["setups"] if s["setup_type"] == "round_number_reclaim")
+    assert reclaim_restricted["hold"]["confirmed"] is False

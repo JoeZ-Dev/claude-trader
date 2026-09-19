@@ -392,6 +392,7 @@ def evaluate_hold_time_aware(
     direction: str = "above",
     required_seconds: float = 30.0,
     reference_interval_seconds: float = 10.0,
+    watch_added_ts: float | None = None,
 ) -> HoldStateTimeAware:
     """Time-aware `evaluate_hold` (specs.md section 15/16, phase 3.6):
     tracks real ELAPSED SECONDS on the required side of the level, rather
@@ -417,6 +418,55 @@ def evaluate_hold_time_aware(
     This is why `required_seconds=30.0`, not `20.0`, on uniform data --
     "3 consecutive bars" means 3 FULL bar-widths of confirmed time, not
     the gap between the 1st and 3rd bar starts.
+
+    `watch_added_ts` (phase 3.6 stage 3 part 2, specs.md section 19):
+    once this function is fed the FULL backfilled+live series, a hold
+    could complete ENTIRELY within backfilled (pre-watch) bars -- found
+    real on live AIFF data: a level confirmed at 13:39 from purely
+    historical backfill stayed `confirmed=True` for the rest of the
+    day, over an hour later, because confirmation is monotonic ("once
+    confirmed, a single close back through doesn't retroactively
+    un-confirm history"). Fed straight into `should_enter` (monitor-app/
+    journal_logic.py), a symbol newly added AFTER such a historical
+    confirmation would show it as a FRESH False->True transition on its
+    very first poll (a fresh slot's `journal_confirmed_types` starts
+    empty) and could fire a real entry the instant it's added, based on
+    a pattern that finished before the symbol was ever being watched
+    live. Backfilled bars may still legitimately CONTRIBUTE real elapsed
+    time to a streak (that's the whole point of this migration), but
+    `confirmed` may only be SET at a bar whose own `ts >= watch_added_ts`
+    -- the confirming instant itself must not be purely historical, even
+    though the streak backing it may have started before the watch.
+    `None` (the default) disables this check entirely, for every
+    existing caller/test that doesn't track a watch time.
+
+    KNOWN OPEN RISK, found but deliberately NOT fixed here (phase 3.6
+    stage 3 part 2, specs.md section 19 -- flagged for an explicit
+    decision, not silently patched): `confirmed` is still monotonic,
+    same as `evaluate_hold` ("once confirmed, a single close back through
+    doesn't retroactively un-confirm history"). That was only ever safe
+    because every caller fed `evaluate_hold` a short, freshly-scoped bars
+    window (`live_cadence_tail`'s tail) -- "stays confirmed" meant
+    "stays confirmed for the rest of THIS short window," not "forever, no
+    matter how much later or how different the market looks." Now that
+    this function sees the FULL session directly, a DYNAMICALLY-derived
+    level_price (round_number_reclaim's nearest-round-number-above-
+    current-price, recomputed fresh every call) can, after a sharp price
+    drop, find itself ALREADY "satisfied" by bars from hours earlier in
+    the same session, when price was much higher -- found real via a
+    downstream integration test (a stop-out on a sharp drop immediately
+    followed by a spurious fresh entry, using stale pre-drop bars against
+    the newly-lower trigger). A first attempted fix (reset `confirmed` on
+    every reversal) was reverted: it also broke the genuine, load-bearing
+    "recently confirmed, still actionable" property that real entries
+    depend on (the live entry bar itself is often one tick back through
+    the level even while a real, current hold is still very much in
+    play) -- 20+ existing tests, and the real entry-firing design,
+    assume a brief pullback right after confirming doesn't erase it. The
+    real distinguishing factor is TIME-BASED staleness (a one-tick,
+    seconds-old pullback vs. an hours-old, since-reversed regime), not a
+    simple has-it-ever-reversed check, and needs its own careful design
+    pass rather than a quick patch under this prompt.
     """
     streak_start_ts = None
     failed_attempts = 0
@@ -432,7 +482,8 @@ def evaluate_hold_time_aware(
             was_attempting = True
             bar_end_ts = bars[i + 1]["ts"] if i + 1 < len(bars) else b["ts"] + reference_interval_seconds
             elapsed_seconds = bar_end_ts - streak_start_ts
-            if elapsed_seconds >= required_seconds:
+            if elapsed_seconds >= required_seconds and (
+                    watch_added_ts is None or b["ts"] >= watch_added_ts):
                 confirmed = True
         else:
             if was_attempting and streak_start_ts is not None and not confirmed:
