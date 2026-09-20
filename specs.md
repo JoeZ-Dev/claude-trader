@@ -68,53 +68,49 @@ own window comparison; only candidacy as the touch itself is restricted.
 Covered by unit tests in `momentum_monitor/core/tests/` — see that
 directory for the current, authoritative test suite.
 
-**Backfill vs. live bar width (known, intentional, temporary tradeoff):**
-Every function in this module except `session_vwap` implicitly assumes
-uniform bar width — `ema`/`macd`'s decay factor is applied per bar, not
-per elapsed second; `relative_volume` compares one bar's volume to a
-rolling average of others'; `detect_levels`'s swing-point window and
-`evaluate_hold`'s `required_bars` both count bars, not time. That
-assumption held by construction through the first backfill implementation
-(section 5), the whole live bar series came from one 10s aggregator.
-Backfill breaks it: `schwab-connector/price_history.py` prepends Schwab
-price-history candles, no finer than 1 minute and with zero-volume
-minutes skipped entirely (gaps observed live, backfilling QCLS on
-2026-09-16, ranging from 60s to over 900s) — genuinely irregular, not
-just "coarser than 10s." A "9-period EMA" or "3-bar hold" computed across
-that boundary means a different amount of real time depending on which
-bars happen to be in the window, which is a real correctness bug, not
-cosmetic.
+**Backfill vs. live bar width — ORIGINAL problem statement and stopgap,
+SUPERSEDED, kept for history (not current behavior; see phase 3.6,
+sections 14-20, for the actual current design).** This whole block
+describes the situation as it stood before phase 3.6: every function in
+this module except `session_vwap` implicitly assumed uniform bar
+width — `ema`/`macd`'s decay factor applied per bar, not per elapsed
+second; `relative_volume` compared one bar's volume to a rolling average
+of others'; `detect_levels`'s swing-point window and `evaluate_hold`'s
+`required_bars` both counted bars, not time. That assumption held by
+construction through the first backfill implementation (section 5), the
+whole live bar series came from one 10s aggregator. Backfill broke it:
+`schwab-connector/price_history.py` prepends Schwab price-history
+candles, no finer than 1 minute and with zero-volume minutes skipped
+entirely (gaps observed live, backfilling QCLS on 2026-09-16, ranging
+from 60s to over 900s) — genuinely irregular, not just "coarser than
+10s." A "9-period EMA" or "3-bar hold" computed across that boundary
+meant a different amount of real time depending on which bars happened
+to be in the window, a real correctness bug, not cosmetic.
 
-The fix adopted for now, confined to `monitor-app/state.py`
+The stopgap adopted at the time, confined to `monitor-app/state.py`
 (`live_cadence_tail`): `ema`, `macd`, `relative_volume`, and
-hold-confirmation only ever see the contiguous LIVE tail of the bar
+hold-confirmation only ever saw the contiguous LIVE tail of the bar
 list — found by walking backward from the most recent bar and stopping at
-the first gap wider than 15s (comfortably between live's 10s cadence and
-backfill's 60s floor) — never the backfilled bars ahead of it.
-`session_vwap` (genuinely granularity-agnostic — a cumulative sum, not a
-window) and `detect_levels` (a whole-session swing scan, not a
-decay-weighted average — the softer, more forgivable case of this same
-assumption) deliberately keep seeing the full backfilled+live series.
-Practical effect: EMA/MACD/relative_volume/hold-confirmation warm up from
-scratch on live data alone after every fresh watch, same as the
-already-accepted EMA "first value seeds on itself" warm-up transient —
-not a new limitation, just the existing one now correctly scoped away
-from misleading coarse data instead of contaminated by it.
+the first gap wider than 15s — never the backfilled bars ahead of it.
+`session_vwap` and `detect_levels` (a whole-session swing scan, not a
+decay-weighted average) deliberately kept seeing the full
+backfilled+live series throughout.
 
-This is explicitly a stopgap, not the intended end state. The correct,
-durable fix is to make these functions genuinely time-aware — decay by
-elapsed seconds rather than by bar count, compare volume *rates*
-(volume/duration) rather than raw per-bar volume, and require a minimum
-elapsed *time* on the correct side of a level rather than a bar count.
-That also fixes the irregular gaps *within* the backfilled portion itself
-(this stopgap doesn't touch those, since detect_levels still sees them
-as-is), not just the live-transition boundary. It was deferred rather
-than built immediately because it means reworking `core/`'s public
-function signatures (`ema`/`macd` currently take plain `values:
-list[float]`, with no timestamps) and its authoritative test suite — a
-real redesign, not a quick patch. Candidate for a future phase (roadmap
-item 3.6 below — 3.5, the other item originally listed alongside it, is
-now built, see below), not assumed by the current one.
+**Current state (built, phase 3.6, sections 14-20): the stopgap above is
+fully retired.** `ema`/`macd`/`relative_volume`/`evaluate_hold`/the
+swing-point window are now genuinely time-aware —
+`ema_time_aware`/`macd_time_aware`/`relative_volume_time_aware`/
+`evaluate_hold_time_aware`/`swing_points_time_aware`, decaying/comparing/
+requiring by real elapsed seconds rather than bar count, all fed the FULL
+backfilled+live series directly. `live_cadence_tail`/
+`LIVE_BAR_MAX_GAP_SECONDS` are removed from the codebase entirely
+(confirmed by direct grep, not assumed — only historical prose
+references like this one remain). This also closed the irregular-gap
+problem *within* the backfilled portion itself, which the old stopgap
+never addressed. See section 14 for the additive equivalence-proof stage,
+section 15-17 for the genuine-improvement and cadence-adaptive-window
+work, and sections 18-20 for the actual production migration and its two
+follow-up fixes (`watch_added_ts`, the confirmation-freshness gate).
 
 **Multi-scenario setup evaluation (phase 3.5, built 2026-09-17) —
 `core/setup_types.py`.** Rather than surfacing only the nearest
@@ -126,9 +122,14 @@ caller compare them side by side — a direct evolution of ToS_Companion's
 repo's corrected level detection instead of its buggy nearest-price
 picking.
 
+(Originally built against the bar-count `evaluate_hold`; migrated to
+`evaluate_hold_time_aware` along with every other real call site in
+phase 3.6, section 19 — the four candidate builders below have used the
+time-aware version ever since, not the name that follows.)
+
 - **Resistance breakout** — the existing `detect_levels` +
-  `evaluate_hold`, reused completely unchanged (swing_window=3, the
-  `detect_levels` default).
+  `evaluate_hold_time_aware`, reused completely unchanged (swing_window=3,
+  the `detect_levels` default).
 - **Micro-breakout** — the SAME `detect_levels` function, called a
   second time with `swing_window=1` (`MICRO_SWING_WINDOW`) instead of 3.
   No new detection logic. 1 is half of the main window's default (3),
@@ -138,17 +139,17 @@ picking.
 - **VWAP pullback-reclaim** — trend context (current price at/above
   session VWAP, a simple instantaneous check, not a multi-bar trend
   model), gated by a pullback proximity check (`VWAP_PULLBACK_
-  THRESHOLD_PCT = 0.5%` of VWAP), then `evaluate_hold` treating VWAP
-  itself as the level to hold/reclaim closes above, same 3-bar
-  confirmation as everywhere else.
+  THRESHOLD_PCT = 0.5%` of VWAP), then `evaluate_hold_time_aware` treating
+  VWAP itself as the level to hold/reclaim closes above, same required-
+  hold-duration confirmation as everywhere else.
 - **Round-number reclaim** — `nearest_round_number_above()` (refactored
   out of `levels.py`'s existing `_round_number_bonus` scoring, which
   keeps its own nondirectional "nearest either side" version for
-  proximity scoring) treated as the level for `evaluate_hold`. The one
-  type watchable even with ZERO prior price touches at that level — an
-  untested round number is still a psychologically real level to retail
-  traders, unlike a swing level which requires an actual prior touch to
-  exist at all.
+  proximity scoring) treated as the level for `evaluate_hold_time_aware`.
+  The one type watchable even with ZERO prior price touches at that
+  level — an untested round number is still a psychologically real level
+  to retail traders, unlike a swing level which requires an actual prior
+  touch to exist at all.
 
 **Round-number grid, TIERED by price (fixed 2026-09-17 — see
 `levels.py`'s `_round_number_increment`).** The original version used a
@@ -201,13 +202,20 @@ candidates pre-sorted ascending by this distance; the first one is
 "closest," surfaced with full visual weight in the UI (section 5), the
 rest as expandable chips.
 
-**Scope for this pass (deliberate, not an oversight): bullish/
+**Scope for this pass (deliberate, not an oversight, AT THE TIME): bullish/
 breakout-ABOVE direction only.** A symmetric breakdown-below version of
-each type is a natural future extension, not built now — kept this pass
-a manageable size. All four trigger prices are therefore always
+each type was a natural future extension, not built at the time — kept
+this pass a manageable size. All four trigger prices are therefore always
 `>= current_price` by construction; a type that isn't watchable right
 now (no level above price, no real VWAP pullback in progress) is simply
-absent from the result, never a null/zero placeholder entry.
+absent from the result, never a null/zero placeholder entry. **Built,
+2026-09-19 — see section 22:** the four downside mirrors
+(`support_breakdown`/`micro_breakdown`/`vwap_breakdown`/
+`round_number_breakdown`) now exist too, as a completely separate,
+informational-only, structurally-non-tradeable set — `evaluate_setups()`
+above (the four types documented in this subsection) remains bullish-only
+and unchanged; the breakdown mirrors live in their own function,
+`evaluate_breakdown_setups()`, never merged into this one's output.
 
 ### 4. Data source
 
@@ -977,8 +985,9 @@ confirmation, now also real volume; stops fire fast and unconditionally,
 no exceptions), applied here too, not a new rule. `entry_price` is the
 close of the bar the transition is observed at (in practice: the latest
 bar in the poll cycle where the transition is first seen — the finest
-granularity available without re-running `evaluate_hold` per-bar inside
-a single poll, which would itself be inventing new entry logic). At most
+granularity available without re-running `evaluate_hold_time_aware`
+per-bar inside a single poll, which would itself be inventing new entry
+logic). At most
 one open virtual position PER SYMBOL (phase 2: up to 4 symbols can each
 have their own independently open position at once, not one global
 position for whichever symbol happens to be watched); if a position is
@@ -1846,16 +1855,16 @@ already use.
   value through the whole ratchet loop for that batch, the same
   granularity tradeoff this codebase already accepted for
   `round_number_reclaim`'s own entry timing (section 6: "the finest
-  granularity available without re-running `evaluate_hold` per-bar
-  inside a single poll cycle, which would be inventing new entry
+  granularity available without re-running `evaluate_hold_time_aware`
+  per-bar inside a single poll cycle, which would be inventing new entry
   logic"). The PHASE TRANSITION check, by contrast, needs no swing-low
   data at all (just `entry_price`/`high_water_mark`/the threshold
   already on the position) and is checked exactly per-bar.
 - **A real bug found and fixed while building this, not by inspection
   — `_phase1_anchor`'s clamp.** `entry_price` is the CONFIRMING bar's
   own close (section 6's existing "finest granularity" rule); but
-  `evaluate_hold`'s "once confirmed, a single close back through
-  doesn't retroactively un-confirm history" rule (`core/levels.py`)
+  `evaluate_hold_time_aware`'s "once confirmed, a single close back
+  through doesn't retroactively un-confirm history" rule (`core/levels.py`)
   means the level that triggered confirmation can sit ABOVE the price
   the position actually enters at, if price pulled back between
   confirming and the entry bar itself. Confirmed directly against real
