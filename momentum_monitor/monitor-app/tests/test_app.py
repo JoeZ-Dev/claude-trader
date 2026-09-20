@@ -18,6 +18,8 @@ from app import (
     _journal_closed_rows_html,
     _journal_open_html,
     _market_backdrop_html,
+    _narration_log_html,
+    _narration_status_html,
     create_app,
 )
 
@@ -115,7 +117,10 @@ def _client(fetch, *, symbol="AEHL", announce=None, unwatch=None,
             announce_retry_max_delay=0.02, journal_store=None,
             trail_pct=0.05, max_symbols=4, stream_events=None,
             fetch_daily_bars=None, fetch_market_backdrop=None,
-            market_backdrop_symbol="SPY", market_backdrop_refresh_seconds=180.0):
+            market_backdrop_symbol="SPY", market_backdrop_refresh_seconds=180.0,
+            fetch_narration=None, narration_max_calls_per_window=10.0,
+            narration_window_minutes=15.0, narration_rearm_minutes=60.0,
+            now_fn=time.time):
     app = create_app(fetch_bars=fetch, watch_symbol=symbol,
                      announce_watch=announce,
                      announce_unwatch=unwatch,
@@ -127,7 +132,12 @@ def _client(fetch, *, symbol="AEHL", announce=None, unwatch=None,
                      fetch_daily_bars=fetch_daily_bars,
                      fetch_market_backdrop=fetch_market_backdrop,
                      market_backdrop_symbol=market_backdrop_symbol,
-                     market_backdrop_refresh_seconds=market_backdrop_refresh_seconds)
+                     market_backdrop_refresh_seconds=market_backdrop_refresh_seconds,
+                     fetch_narration=fetch_narration,
+                     narration_max_calls_per_window=narration_max_calls_per_window,
+                     narration_window_minutes=narration_window_minutes,
+                     narration_rearm_minutes=narration_rearm_minutes,
+                     now_fn=now_fn)
     return TestClient(app)
 
 
@@ -142,7 +152,7 @@ def test_api_state_shape_has_symbols_recent_closed_poll_enabled_max_symbols():
         body = c.get("/api/state").json()
         assert set(body) == {"symbols", "recent_closed", "poll_enabled",
                              "max_symbols", "strategy_params", "current_equity",
-                             "market_backdrop"}
+                             "market_backdrop", "narration"}
         assert isinstance(body["symbols"], dict)
         assert isinstance(body["recent_closed"], list)
         assert body["max_symbols"] == 4
@@ -2147,3 +2157,85 @@ def test_analysis_page_is_a_separate_view_not_part_of_the_live_symbol_grid():
         symbols_section = page[symbols_start:symbols_start + 2000]
         assert "Loss monitoring" not in symbols_section
         assert "overall_loss_rate" not in symbols_section
+
+
+# -- event-triggered narration display, phase 3 stage 1 (specs.md ---------
+# section 27). The trigger detection/safety-gate wiring is fully covered
+# end to end against real bar sequences in test_journal_wiring.py; these
+# tests only cover the RENDERING of status/log, and the page-level
+# reachability of the arm/reset controls.
+
+def test_narration_status_html_shows_disarmed_and_ok_by_default():
+    status = {"armed": False, "seconds_remaining": None, "breaker_tripped": False,
+             "recent_call_count": 0, "max_calls_per_window": 10.0,
+             "window_minutes": 15.0, "rearm_minutes": 60.0}
+    html_out = _narration_status_html(status)
+    assert "DISARMED" in html_out
+    assert "Circuit breaker: OK" in html_out
+    assert "disabled" in html_out  # reset button disabled when not tripped
+
+
+def test_narration_status_html_shows_armed_with_time_remaining():
+    status = {"armed": True, "seconds_remaining": 1800.0, "breaker_tripped": False,
+             "recent_call_count": 2, "max_calls_per_window": 10.0,
+             "window_minutes": 15.0, "rearm_minutes": 60.0}
+    html_out = _narration_status_html(status)
+    assert "ARMED" in html_out
+    assert "30m remaining" in html_out
+    assert "2/10 calls in 15m window" in html_out
+
+
+def test_narration_status_html_shows_tripped_breaker_and_enables_reset():
+    status = {"armed": True, "seconds_remaining": 100.0, "breaker_tripped": True,
+             "recent_call_count": 11, "max_calls_per_window": 10.0,
+             "window_minutes": 15.0, "rearm_minutes": 60.0}
+    html_out = _narration_status_html(status)
+    assert "Circuit breaker: TRIPPED" in html_out
+    # the reset button itself must NOT carry the disabled attribute now
+    reset_btn_start = html_out.find("narration-reset-breaker-btn")
+    reset_btn_tag = html_out[reset_btn_start - 40:reset_btn_start + 40]
+    assert "disabled" not in reset_btn_tag
+
+
+def test_narration_log_html_shows_no_narration_yet_when_empty():
+    assert "No narration yet" in _narration_log_html([])
+
+
+def test_narration_log_html_shows_successful_entry_text():
+    log = [{"ts": 1756909800, "symbol": "AEHL", "kind": "entry",
+           "ok": True, "text": "Entered a virtual long at 10.20."}]
+    html_out = _narration_log_html(log)
+    assert "AEHL" in html_out
+    assert "Entered a virtual long at 10.20." in html_out
+    assert "entry" in html_out
+
+
+def test_narration_log_html_visibly_flags_a_failed_entry():
+    # The actual "surfaced clearly, never silently swallowed" proof at
+    # the DISPLAY layer -- a failure must render distinctly, not blend
+    # in as if it were a normal narration line.
+    log = [{"ts": 1756909800, "symbol": "AEHL", "kind": "confirmation",
+           "ok": False, "error": "claude -p timed out after 30.0s"}]
+    html_out = _narration_log_html(log)
+    assert "FAILED" in html_out
+    assert "timed out" in html_out
+    assert "narration-entry neg" in html_out  # visually distinct styling
+
+
+def test_root_page_has_the_narration_section_with_arm_and_reset_controls():
+    with _client(FakeFetch({"AEHL": [_bars(3)]}), symbol="AEHL") as c:
+        page = c.get("/").text
+        assert "id=\"narration-section\"" in page
+        assert "id='narration-status'" in page  # Python-rendered, single-quoted
+        assert "narration-arm-btn" in page
+        assert "narration-reset-breaker-btn" in page
+
+
+def test_root_page_narration_section_defaults_to_disarmed_display():
+    with _client(FakeFetch({"AEHL": [_bars(3)]}), symbol="AEHL") as c:
+        page = c.get("/").text
+        section_start = page.find("id=\"narration-section\"")
+        section_end = page.find("</section>", section_start)
+        section = page[section_start:section_end]
+        assert "DISARMED" in section
+        assert "Circuit breaker: OK" in section

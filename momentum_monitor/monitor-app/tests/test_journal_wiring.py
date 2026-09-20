@@ -112,7 +112,9 @@ class FakeFetch:
 
 def _client(fetch, *, journal_store, symbol="AEHL", trail_pct=TRAIL_PCT,
            announce=None, unwatch=None, now_fn=lambda: 0.0,
-           volume_confirm_threshold=0.0, fetch_daily_bars=None):
+           volume_confirm_threshold=0.0, fetch_daily_bars=None,
+           fetch_narration=None, narration_max_calls_per_window=10.0,
+           narration_window_minutes=15.0, narration_rearm_minutes=60.0):
     # Threshold defaults to 0.0 (always clears) -- this file proves the
     # Poller<->journal_logic<->journal_store WIRING against real bar-
     # driven hold_confirmed transitions, not the volume gate itself
@@ -138,6 +140,10 @@ def _client(fetch, *, journal_store, symbol="AEHL", trail_pct=TRAIL_PCT,
                      journal_store=journal_store, trail_pct=trail_pct,
                      volume_confirm_threshold=volume_confirm_threshold,
                      fetch_daily_bars=fetch_daily_bars,
+                     fetch_narration=fetch_narration,
+                     narration_max_calls_per_window=narration_max_calls_per_window,
+                     narration_window_minutes=narration_window_minutes,
+                     narration_rearm_minutes=narration_rearm_minutes,
                      now_fn=now_fn)
     return TestClient(app)
 
@@ -796,3 +802,296 @@ def test_a_fresh_symbol_also_enters_normally_no_different_treatment(tmp_path):
         assert _sym(c, "AEHL")["continuation"]["status"] == "fresh"
 
     assert store.open_position_for("AEHL") is not None
+
+
+# -- event-triggered narration, phase 3 stage 1 (specs.md section 27) -----
+# Real bar sequences already verified above to produce genuine hold_
+# confirmed transitions / entries / exits through the real triggering
+# logic, replayed here to prove narration fires (or correctly doesn't) at
+# genuine trigger moments -- never a hand-built JournalTick.
+
+class _Clock:
+    """Mutable now_fn for tests that need to advance wall-clock time
+    between an arm action and a later poll (AGENT_PROTOCOL.md: still no
+    real wall-clock dependence -- this is a fully deterministic, manually
+    advanced fake, not time.time)."""
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def _recording_narration_fetcher(responses=None):
+    """Fake fetch_narration -- records every prompt it's called with and
+    returns a real, distinguishable string per call (or raises, for
+    failure-path tests) rather than a canned single response, so a test
+    can assert on call COUNT and per-call content precisely."""
+    calls = []
+
+    async def fetch_narration(prompt):
+        calls.append(prompt)
+        if responses is not None:
+            result = responses[len(calls) - 1]
+            if isinstance(result, Exception):
+                raise result
+            return result
+        return f"narration #{len(calls)}"
+
+    fetch_narration.calls = calls
+    return fetch_narration
+
+
+def _narration_log(client):
+    return client.get("/api/state").json()["narration"]["log"]
+
+
+def _narration_status(client):
+    return client.get("/api/state").json()["narration"]["status"]
+
+
+def test_narration_fires_on_a_real_confirmation_and_a_real_entry_when_armed(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    # An empty FIRST batch (auto-fetched at startup, before the test body
+    # runs at all) so arming below is guaranteed to land BEFORE the real
+    # trigger batch, which is instead pulled in explicitly via _resync --
+    # add_symbol's own startup catch_up would otherwise race the arm
+    # POST below (found live while building this test).
+    fetch = FakeFetch({"AEHL": [[], _entry_bars()]})
+    narrator = _recording_narration_fetcher()
+
+    with _client(fetch, journal_store=store, fetch_narration=narrator) as c:
+        c.post("/api/narration/arm")
+        _resync(c)  # pulls in _entry_bars() -- the real confirmation + entry
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        assert _wait_until(lambda: store.open_position_for("AEHL") is not None)
+        # Both the confirmation (round_number_reclaim) AND the entry it
+        # produced are separately narration-worthy (specs.md section 27)
+        # -- two real calls from this one real tick.
+        assert _wait_until(lambda: len(narrator.calls) == 2)
+
+    kinds_in_log = {entry["kind"] for entry in _narration_log(c)}
+    assert kinds_in_log == {"confirmation", "entry"}
+    assert any("round number reclaim" in p.lower() for p in narrator.calls)
+    assert any("AEHL" in p and "9.1" in p for p in narrator.calls)  # the real entry price
+
+
+def test_narration_does_not_fire_when_disarmed(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": [_entry_bars()]})
+    narrator = _recording_narration_fetcher()
+
+    with _client(fetch, journal_store=store, fetch_narration=narrator) as c:
+        # Deliberately never armed.
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        assert _wait_until(lambda: store.open_position_for("AEHL") is not None)
+        time.sleep(0.2)  # give any (wrongly) fired background task a chance to land
+
+    assert narrator.calls == []
+    assert _narration_log(c) == []
+
+
+def test_narration_fires_on_a_real_exit_with_correct_pnl(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": [[], _entry_bars(), _ratchet_bars(), _sharp_breach_bar()]})
+    narrator = _recording_narration_fetcher()
+
+    with _client(fetch, journal_store=store, fetch_narration=narrator) as c:
+        c.post("/api/narration/arm")
+        _resync(c)  # entry_bars -- confirmation + entry
+        assert _wait_until(lambda: len(narrator.calls) == 2)
+        _resync(c)  # ratchet
+        _resync(c)  # sharp breach -- trailing stop trips, a real exit
+        assert _wait_until(lambda: store.open_position_for("AEHL") is None)
+        assert _wait_until(lambda: len(narrator.calls) == 3)
+
+    exit_prompt = narrator.calls[-1]
+    assert "AEHL" in exit_prompt
+    assert "trailing stop" in exit_prompt.lower()
+    # Real, correctly-signed P&L: entry 9.1 -> exit at the stop level,
+    # a real loss (not a hardcoded/fabricated figure).
+    assert "-" in exit_prompt  # a real negative pct is present somewhere
+
+
+# -- safety gate 1: rate-limit circuit breaker --------------------------
+
+def test_narration_circuit_breaker_trips_at_threshold_and_blocks_further_calls(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": [[], _entry_bars(), _ratchet_bars(), _sharp_breach_bar()]})
+    narrator = _recording_narration_fetcher()
+
+    with _client(fetch, journal_store=store, fetch_narration=narrator,
+                narration_max_calls_per_window=1.0, narration_window_minutes=15.0) as c:
+        c.post("/api/narration/arm")
+        _resync(c)  # entry_bars
+        # The single tick that confirms+enters produces 2 events: the
+        # FIRST is allowed (count becomes 1, not yet over the threshold);
+        # the SECOND both fires (matching "more than N calls TRIP it" --
+        # the call that crosses the threshold still happens) AND trips
+        # the breaker.
+        assert _wait_until(lambda: len(narrator.calls) == 2)
+        assert _wait_until(lambda: _narration_status(c)["breaker_tripped"] is True)
+
+        _resync(c)  # ratchet
+        _resync(c)  # sharp breach -- a real, distinct exit trigger
+        assert _wait_until(lambda: store.open_position_for("AEHL") is None)
+        time.sleep(0.2)  # give the (correctly blocked) exit narration a chance to wrongly land
+
+    # The real exit trigger fired mechanically (the DB shows a real
+    # closed trade)...
+    assert store.recent_closed()[0]["exit_reason"] == "trailing_stop"
+    # ...but narration itself was blocked -- proves the BLOCK, not just
+    # the trip: still exactly 2 calls, never a 3rd for the exit.
+    assert len(narrator.calls) == 2
+
+
+def test_narration_breaker_reset_allows_calls_to_resume(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": [[], _entry_bars(), _ratchet_bars(), _sharp_breach_bar()]})
+    narrator = _recording_narration_fetcher()
+
+    with _client(fetch, journal_store=store, fetch_narration=narrator,
+                narration_max_calls_per_window=1.0, narration_window_minutes=15.0) as c:
+        c.post("/api/narration/arm")
+        _resync(c)  # entry_bars
+        assert _wait_until(lambda: _narration_status(c)["breaker_tripped"] is True)
+        assert len(narrator.calls) == 2
+
+        # Reset while genuinely tripped -- must succeed.
+        r = c.post("/api/narration/reset_breaker")
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+        assert _narration_status(c)["breaker_tripped"] is False
+
+        # A real, distinct exit trigger now reaches narration again.
+        _resync(c)  # ratchet
+        _resync(c)  # sharp breach
+        assert _wait_until(lambda: store.open_position_for("AEHL") is None)
+        assert _wait_until(lambda: len(narrator.calls) == 3)
+
+    assert "trailing stop" in narrator.calls[-1].lower()
+
+
+def test_narration_reset_breaker_rejected_when_not_tripped(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": []})
+    with _client(fetch, journal_store=store) as c:
+        r = c.post("/api/narration/reset_breaker")
+        assert r.status_code == 409
+        assert r.json()["ok"] is False
+
+
+# -- safety gate 2: mandatory hourly re-arm ------------------------------
+
+def test_narration_goes_dormant_after_arm_expiry(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": [[], _entry_bars()]})
+    narrator = _recording_narration_fetcher()
+    clock = _Clock(0.0)
+
+    with _client(fetch, journal_store=store, fetch_narration=narrator,
+                narration_rearm_minutes=1.0, now_fn=clock) as c:
+        c.post("/api/narration/arm")  # armed_until = 0 + 60s = 60.0
+        clock.t = 61.0  # past expiry
+        _resync(c)  # entry_bars -- the real confirmation + entry
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        assert _wait_until(lambda: store.open_position_for("AEHL") is not None)
+        time.sleep(0.2)  # give any (wrongly) fired background task a chance to land
+
+    # The real entry fired mechanically...
+    assert store.open_position_for("AEHL") is not None
+    # ...but narration stayed dormant -- no calls at all.
+    assert narrator.calls == []
+    assert _narration_status(c)["armed"] is False
+
+
+def test_narration_resumes_only_after_an_explicit_rearm(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": [[], _entry_bars(), _ratchet_bars(), _sharp_breach_bar()]})
+    narrator = _recording_narration_fetcher()
+    clock = _Clock(0.0)
+
+    with _client(fetch, journal_store=store, fetch_narration=narrator,
+                narration_rearm_minutes=1.0, now_fn=clock) as c:
+        c.post("/api/narration/arm")  # armed_until = 60.0
+        clock.t = 61.0  # expire it before the confirming tick lands
+        _resync(c)  # entry_bars
+        assert _wait_until(lambda: _sym(c, "AEHL").get("bar_count") == 15)
+        assert _wait_until(lambda: store.open_position_for("AEHL") is not None)
+        time.sleep(0.2)
+        assert narrator.calls == []  # dormant, as proven above
+
+        # Explicit re-arm -- a fresh window from the CURRENT now.
+        c.post("/api/narration/arm")  # armed_until = 61 + 60 = 121.0
+        assert _narration_status(c)["armed"] is True
+
+        _resync(c)  # ratchet
+        _resync(c)  # sharp breach -- a real, distinct exit trigger
+        assert _wait_until(lambda: store.open_position_for("AEHL") is None)
+        assert _wait_until(lambda: len(narrator.calls) == 1)
+
+    assert "trailing stop" in narrator.calls[0].lower()
+
+
+def test_narration_defaults_to_disarmed_after_a_simulated_restart(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    fetch1 = FakeFetch({"AEHL": []})
+    with _client(fetch1, journal_store=store) as c1:
+        c1.post("/api/narration/arm")
+        assert _narration_status(c1)["armed"] is True
+
+    # A fresh Poller/app instance sharing the SAME journal_store -- the
+    # real "restart" shape this project already tests for open-position
+    # resume (see test_restart_resumes_open_position_without_duplicate_
+    # entry below). Narration arm state is in-memory Poller state, never
+    # persisted (specs.md section 27) -- it has nowhere to survive this.
+    fetch2 = FakeFetch({"AEHL": []})
+    with _client(fetch2, journal_store=store) as c2:
+        assert _narration_status(c2)["armed"] is False
+        assert _narration_status(c2)["breaker_tripped"] is False
+
+
+def test_narration_circuit_breaker_defaults_to_not_tripped_after_a_simulated_restart(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    fetch1 = FakeFetch({"AEHL": [[], _entry_bars()]})
+    narrator = _recording_narration_fetcher()
+    with _client(fetch1, journal_store=store, fetch_narration=narrator,
+                narration_max_calls_per_window=1.0) as c1:
+        c1.post("/api/narration/arm")
+        _resync(c1)  # entry_bars
+        assert _wait_until(lambda: _narration_status(c1)["breaker_tripped"] is True)
+
+    fetch2 = FakeFetch({"AEHL": []})
+    with _client(fetch2, journal_store=store) as c2:
+        assert _narration_status(c2)["breaker_tripped"] is False
+
+
+# -- failure surfacing: never silently swallowed -------------------------
+
+def test_narration_failure_is_caught_logged_and_surfaced_not_swallowed(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": [[], _entry_bars()]})
+    # Simulates a real claude -p failure surfacing through claude-
+    # connector as a RuntimeError (main.py's fetch_narration raises this
+    # shape on any non-ok connector response) -- the known, accepted,
+    # untested OAuth-refresh risk (specs.md section 25) gets NO special
+    # "probably fine" treatment here.
+    narrator = _recording_narration_fetcher(responses=[
+        RuntimeError("claude -p exited 1: authentication failed (token refresh unsuccessful)"),
+        RuntimeError("claude -p exited 1: authentication failed (token refresh unsuccessful)"),
+    ])
+
+    with _client(fetch, journal_store=store, fetch_narration=narrator) as c:
+        c.post("/api/narration/arm")
+        _resync(c)  # entry_bars
+        assert _wait_until(lambda: store.open_position_for("AEHL") is not None)
+        assert _wait_until(lambda: len(_narration_log(c)) == 2)
+
+    # The real entry still succeeded mechanically -- a narration failure
+    # must never crash or block the actual journal logic.
+    assert store.open_position_for("AEHL") is not None
+    # And the failure is genuinely visible, not swallowed: every log
+    # entry is explicitly marked ok=False with the real error text.
+    log = _narration_log(c)
+    assert all(entry["ok"] is False for entry in log)
+    assert all("authentication failed" in entry["error"] for entry in log)

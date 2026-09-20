@@ -715,8 +715,12 @@ principle, with no code living loose at repo root:
     push, not removed.
 - **`momentum_monitor/claude-connector/`** — the only container with the
   `claude` CLI's auth mounted in. Shells out to `claude -p` for
-  event-triggered narration. Not built until phase 3 (see roadmap below)
-  — currently a placeholder directory with a README only.
+  event-triggered narration. **Built, phase 3 stage 1, 2026-09-20 — see
+  sections 25 and 27** (a `README`-only placeholder before that). A
+  read-only bind mount of the host's `~/.claude/.credentials.json` (the
+  ONE file the stage-0 investigation proved sufficient) is its only
+  credential; `monitor-app` never shells out to `claude` itself and
+  holds none of this.
 - **`momentum_monitor/monitor-app/`** — the FastAPI web app. Holds no
   credentials. Consumes `schwab-connector`'s pushed bars (`GET /events`,
   poll -> push fixed 2026-09-17 — see section 4), runs them through
@@ -3653,6 +3657,55 @@ false positive from unrelated markup" pitfall this session's own prior
 features already documented for `id="market-backdrop"` and `Closest
 setup:`).
 
+### 25. Phase 3, stage 0 — CLI-auth feasibility investigation (no code built)
+
+**The question, before designing anything else in phase 3.** Section 5's
+`claude-connector` placeholder had assumed "no API key, CLI auth" without
+ever confirming that assumption was viable unattended, inside a
+container, with no browser available to complete an interactive login.
+This stage answered exactly that question, and only that — no narration
+logic, no event-detection design, no service scaffolding was built here.
+
+**Finding: yes, confirmed live, with one important caveat flagged
+honestly rather than assumed away.** Claude Code IS installed on the
+host, authenticated via an OAuth session (`~/.claude/.credentials.json`)
+from a Pro subscription — not an API key. A minimal container matching
+this project's existing service pattern (`python:3.12-slim`, same base
+image as `schwab-connector`/`monitor-app`), with ONLY `~/.claude/
+.credentials.json` bind-mounted read-only (no full `~/.claude`, no
+`~/.claude.json` — tested and found NOT required at all), ran `claude -p
+"..."` non-interactively and got back a real, verified model response
+(a `47 * 89` arithmetic check, not just an echo). The container's
+filesystem was inspected and confirmed to hold ONLY the one mounted
+file — no session history, no other config, nothing left over from an
+interactive login. Confirmed reproducible across multiple independent
+container runs, and the host's real credential file's mtime was
+confirmed unchanged afterward (a read-only mount, verified not just
+assumed).
+
+**What's genuinely still open, not solved, flagged rather than
+assumed:**
+1. **Token refresh was never exercised.** The access token expires in a
+   few hours; the refresh token lasts about 12 days. Forcing an actual
+   expiry to test refresh-in-a-container was judged unsafe to do
+   unprompted against this session's own live, in-use credentials — a
+   real, legitimate test that remains undone. Stage 1 (section 27)
+   treats any invocation failure as this exact risk materializing, by
+   design, with no "probably transient" special-casing.
+2. **This borrows a personal Pro subscription session** for an automated
+   backend process — a usage-pattern question distinct from the
+   technical one, requiring explicit human sign-off before phase 3
+   depends on it long-term, not something to silently normalize.
+3. **The standard production alternative**: `ANTHROPIC_API_KEY` (a
+   dedicated key, usage-based billing) sidesteps both issues above
+   entirely. Not tested (no key available in this environment), named
+   here as the clean fallback if OAuth-in-a-container proves unreliable
+   under real always-on load.
+
+No specs.md/claude-connector/git changes were made in this stage —
+purely investigation, reported back before any of phase 3's actual
+design work began (section 27).
+
 ### 26. Loss monitoring & evaluation view — priority shift away from the portfolio risk cap
 
 **Priority shift, decided explicitly, not silently.** Section 7's
@@ -3814,7 +3867,234 @@ pattern" behavior the sample-size floor exists to enforce, confirmed
 against real rendered output, not just asserted by a unit test in
 isolation.
 
-### 27. Roadmap / phases
+### 27. Phase 3, stage 1 — event-triggered narration (heavy tier only), with required safety gates
+
+**Scope, deliberately narrow.** Following stage 0's confirmed-viable CLI
+auth (section 25), this stage builds the actual narration loop — but
+ONLY the heavy tier, ONLY three trigger events, reusing detection that
+already exists rather than inventing new "was this meaningful" logic:
+1. A setup's `hold_confirmed` transitioning False→True, for one of the
+   four entry-eligible bullish setup types — reuses `journal_logic.
+   advance_journal`'s own already-computed `confirmed_types_after`
+   diffed against the prior tick's `was_confirmed_types`, the SAME
+   bookkeeping `should_enter`'s freshly-confirmed check already relies
+   on. Breakdown-below types (section 22) have no such transition
+   tracking anywhere in this codebase and are deliberately excluded
+   rather than building new tracking for them.
+2. A real entry firing (`advance_journal`'s `tick.opened`).
+3. A real exit firing, with its P&L (`advance_journal`'s `tick.closed`).
+
+Ongoing lighter-tier updates and off-tab push delivery (e.g. a native
+notification when the browser tab isn't focused) are explicitly
+DEFERRED, not forgotten — a separate, later pass once this core loop is
+proven reliable, not bundled in here.
+
+**Architecture: `claude-connector` becomes a real service, matching the
+credential-isolation boundary section 5 already designed for it.** The
+ONLY container with the `claude` CLI's OAuth credentials mounted
+(read-only, the ONE file the stage-0 investigation proved sufficient —
+`~/.claude/.credentials.json`, nothing else). `monitor-app` holds no
+Claude credentials at all and never shells out to `claude` itself — the
+same isolation discipline already applied to Schwab auth
+(`schwab-connector` holds it, `monitor-app` doesn't). `claude-connector`
+does exactly one job: `POST /narrate {"prompt": "..."}` → runs `claude -p
+<prompt>` as a real subprocess (`claude_cli.run_claude_prompt`, its own
+thin module, mirroring `schwab-connector`'s `stream.py`/`price_history.py`
+split) → returns `{"ok": true, "text": "..."}` or `{"ok": false, "error":
+"..."}` (`502`), never an unhandled exception. No trigger-detection,
+prompt-design, or safety-gate logic lives in `claude-connector` at all —
+all of that is `monitor-app`'s job, reusing state that already exists
+there.
+
+**A real bug found and fixed while building `claude_cli.py`'s own test
+suite, not assumed away:** killing a hung subprocess (the timeout path)
+left `proc.wait()` hanging for the FULL original duration regardless of
+the kill, because a grandchild process (e.g. the fake test script's own
+`sleep`, or potentially a real helper `claude` itself spawns) inherits
+the stdout/stderr pipes and keeps them open after the direct child dies.
+Fixed by spawning in a new process group (`start_new_session=True`) and
+killing the WHOLE group (`os.killpg`) on timeout — a genuine correctness
+fix for production use, not a test-only workaround, and locked in by a
+dedicated regression test asserting the timeout path returns promptly
+(under 5s), not after the original ~30s duration.
+
+**Safety gate 1 — rate-limit circuit breaker.** Tracks a rolling window
+of call timestamps (`narration.prune_and_record_call`/`breaker_should_
+trip`, pure functions). More than `narration_max_calls_per_window` calls
+within `narration_window_minutes` trips it — blocking ALL further
+narration calls until an explicit, manual `POST /api/narration/
+reset_breaker` (never an automatic cooldown; a trip means something
+worth a human actually looking at). The call that CROSSES the threshold
+still fires (`"more than N calls ... trip it"` — the tripping call is
+itself allowed, only calls AFTER it are blocked), proven by a dedicated
+test distinguishing "correctly trips" from "correctly blocks further
+calls," not just asserting the trip flag. Defaults, reasoned through
+explicitly (`journal_store.py`'s own `_PARAM_BOUNDS` comment carries the
+full reasoning): **10 calls / 15 minutes.** Expected real volume even at
+4 concurrently watched symbols on a genuinely busy session is low — each
+symbol realistically produces at most a handful of the three trigger
+events in any 15-minute window, so 4-8 total is a busy-but-normal
+ceiling; 10 sits just above that. A real bug (e.g. a debounce failure
+firing on every live 10s bar) would produce dozens of calls per symbol
+in the same window, tripping almost immediately, not after meaningful
+damage. Both values live-tunable via the existing `strategy_params`
+mechanism (section 8).
+
+**Safety gate 2 — mandatory hourly re-arm, independent of gate 1.**
+Narration only fires while "armed" — a bounded, rolling duration
+(default `narration_rearm_minutes` = 60, live-tunable) from the last
+explicit `POST /api/narration/arm`. Once expired, narration goes
+dormant (no calls fire) until a human explicitly re-arms it — expiring
+is NOT a "trip," just a return to the safe default state, and re-arming
+while already armed simply extends the window (the same action, not a
+distinct one). `narration.is_armed(armed_until, now)` is a pure,
+one-line comparison — no flag to actively flip on expiry, "armed" is
+just never true again once `now` passes `armed_until`.
+
+**Both gates default to disarmed/not-tripped on every restart, by
+construction, not by a reset step that could be forgotten.** All
+narration state (`_narration_armed_until`, `_narration_call_timestamps`,
+`_narration_breaker_tripped`, and the narration log itself) lives ONLY
+in-memory on `Poller` — never written to `journal_store`/SQLite. A fresh
+process start means a fresh `Poller`, which means these fields are back
+at their dataclass-level starting values with nowhere they could have
+survived from. Proven by a dedicated test creating a SECOND, fresh
+`Poller`/app instance sharing the SAME `journal_store` as a first
+instance that had armed and tripped — the second instance shows
+disarmed and not-tripped, the same "resumed across a restart" test shape
+this project already uses for open-position resume.
+
+**Failure handling: any invocation failure is caught, logged, and
+surfaced — never silently swallowed, and NEVER given "probably
+transient" special treatment** (per stage 0's explicitly flagged,
+still-untested OAuth-refresh risk — a real failure here gets treated
+exactly like any other, by design). `Poller._fire_narration_call`
+records the call against the rate-limit window BEFORE making it (an
+ATTEMPT counts even if it then fails — a runaway bug producing rapid
+failing attempts must still trip the breaker), then catches literally
+any exception from the real `claude-connector` call (a non-2xx status, a
+connector-reported failure, a network error, a malformed body) and
+records it in the narration log as an explicit `{"ok": false, "error":
+"..."}` entry — visible both in `GET /api/state`'s raw JSON and, styled
+distinctly (`neg`-colored, prefixed "FAILED"), in the rendered page.
+Proven live (below) and by a dedicated test that a narration failure
+never crashes or blocks the real journal logic it's commenting on — the
+real entry/exit still happens correctly regardless of narration's own
+outcome.
+
+**Never awaited inline in the bar-processing path.** A narration call
+(up to `claude-connector`'s own 30s subprocess timeout) fires as a
+detached `asyncio` background task (`Poller._maybe_narrate`, referenced
+in `self._narration_tasks` to prevent premature garbage collection, a
+real asyncio gotcha for a bare unreferenced `create_task()` call) —
+`_update_journal` itself stays fully synchronous, unchanged in shape,
+so a slow or hung `claude -p` call can never delay processing new bars
+or the next poll cycle for any watched symbol. Cancelled at shutdown
+alongside the other background tasks.
+
+**Display: reuses the existing SSE push infrastructure, no second push
+mechanism built.** `narration.status`/`narration.log` join the SAME
+`_state_payload()`/`_broadcast_state()` every other live field on this
+page already flows through (`GET /api/state`, `GET /api/state/stream`).
+A new "Event-triggered narration" section on the live page (not the
+retrospective `/analysis` view — this is live commentary on live events,
+the opposite mode) shows armed/disarmed with time remaining, circuit-
+breaker status, an "Arm / re-arm" button (always enabled) and a "Reset
+circuit breaker" button (disabled client-side unless tripped — the real
+guard is server-side, `POST /api/narration/reset_breaker` itself refuses
+when not tripped, never trusting the client alone, same standard as
+every other guarded action in this app), and the narration log itself,
+most-recent-first, in-memory only (capped at `NARRATION_LOG_MAX_ENTRIES`
+= 50 — no durable history table this stage, a deliberate scope choice:
+narration is commentary on events that are ALREADY durably logged
+elsewhere, so losing the commentary text on a restart loses nothing
+structurally, and both safety gates already reset regardless).
+
+**Tests:** 17 new `narration.py` unit tests (the pure trigger-diff/
+prompt-composition/gate-arithmetic logic). 7 new `claude_cli.py` tests
+against real tiny fake `claude` shell scripts (success, non-zero exit,
+timeout, empty output, missing binary, the prompt reaching the real
+subprocess, and the process-group-kill timing regression). 5 new
+`claude-connector` `app.py` tests (the `/narrate` route's success/
+failure/timeout paths never producing an unhandled 500, `/health`). 4
+new `journal_store.py` tests (the three narration params' live-tunable
+bounds). 11 new `test_journal_wiring.py` tests — REAL bar sequences
+already verified elsewhere in this project's own suite to produce
+genuine `hold_confirmed` transitions/entries/exits, replayed through the
+real `Poller`/`advance_journal` pipeline: both trigger-firing-when-armed
+tests, the not-firing-when-disarmed test, the circuit breaker's trip AND
+block (proven separately), the reset-and-resume proof, the reset-
+rejected-when-not-tripped proof, both re-arm gate tests (dormant after
+expiry, resumes only after explicit re-arm), both restart-defaults
+tests, and the failure-surfacing proof. 8 new `app.py` display tests.
+Full project suite: 607 tests passing (`core` 71, `schwab-connector`
+112, `claude-connector` 12, `monitor-app` 412).
+
+**Verified live (2026-09-20).** `claude-connector`'s actual Dockerfile
+(the native, non-npm `claude` CLI installer, matching the stage-0
+investigation's own finding that the host's install is this same
+standalone binary) was built and run as a real container — `docker build
+-f claude-connector/Dockerfile` succeeded non-interactively (the
+installer needs no interactive input), `docker run ... claude --version`
+confirmed the binary present and runnable, and with ONLY the host's real
+`~/.claude/.credentials.json` bind-mounted read-only, `POST /narrate`
+against the running container returned a real, verified `claude -p`
+response end to end through the actual service — not a stub.
+
+**Then the full trigger pipeline, live, against that same running
+container.** The real `monitor-app` `Poller`/`create_app` (armed via the
+real `POST /api/narration/arm`) was fed two real bar sources: (1) real
+captured historical AIFF market data (`schwab-connector/data/bars/
+AIFF.jsonl`, the same real, previously-captured data this project's own
+phase 3.6 proofs already used — first 3,541 real bars, spanning real
+timestamps `2026-09-17 07:50:00` through `2026-09-18 00:00:20`
+America/New_York) replayed through the
+actual `build_state`/`advance_journal` pipeline unmodified; (2) the
+project's own already-established, verified fixture sequence
+(`test_journal_wiring.py`'s `_entry_bars`/`_ratchet_bars`/
+`_sharp_breach_bar`, proven elsewhere in this exact suite to produce a
+real entry+exit through this same pipeline), used for the entry/exit
+narration proof specifically since a genuine real ENTRY did not occur
+within the real AIFF window scanned (entry needs both a fresh
+confirmation AND a real volume spike, confirmed rare even relative to
+confirmations alone within this window — 14 real confirmation events
+found, 0 real entries).
+
+**7 real `claude -p` calls fired, all seven succeeded, covering all
+three trigger types:**
+- **5 confirmations** — 4 from the REAL AIFF historical data (`vwap_
+  reclaim` at the real 1.24 trigger, `resistance_breakout` at the real
+  1.2699 trigger — confirmed twice as price held — and `round_number_
+  reclaim` at the real 1.30 trigger) plus 1 from the fixture
+  (`round_number_reclaim` at 9.25). Real example output: *"AIFF has
+  reclaimed VWAP and is holding above the 1.24 trigger, with price now
+  essentially right at that level — a bullish signal, but with zero
+  cushion, a trader would want to see it hold above 1.24 rather than
+  immediately slip back below it."*
+- **1 entry** — the fixture's real `round_number_reclaim` entry at
+  $9.10, 43 shares. Real output: *"Long entry logged: SYNTH triggered a
+  'round number reclaim' setup at $9.10 for 43 shares — essentially
+  betting the stock holding above that psychological $9 level confirms
+  bullish continuation."*
+- **1 exit** — the fixture's real stop-out. Real output: *"Your
+  simulated SYNTH position from the 9.1 entry got stopped out at 9.0545
+  when the trailing stop triggered, closing for a small loss of about
+  -0.50% (-$1.96). Basically a minor, controlled exit rather than a
+  significant drawdown."* Independently cross-checked against the real
+  `journal_store` row for this trade, not just trusted: `realized_pnl_
+  pct = -0.5000...`, `realized_pnl_dollars = -1.9565` — the narration's
+  stated `-0.50%` / `-$1.96` match the actual stored record exactly, not
+  just plausibly.
+
+Final `narration_status` after all seven calls: `armed=true` (not yet
+expired), `breaker_tripped=false`, `recent_call_count=7` (well under the
+default 50-call test threshold used for this run) — confirming the
+safety gates stayed correctly out of the way of legitimate, real
+traffic while remaining ready to trip on real overuse (proven separately
+and precisely by the dedicated breaker tests in `test_journal_wiring.py`,
+using a deliberately low threshold).
+
+### 28. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,
@@ -3831,6 +4111,20 @@ isolation.
 3. Event-triggered LLM narration via `claude-connector`, firing only on
    meaningful state changes (level hold-confirmed, volume threshold
    crossed, MACD cross, retest, sharp reversal) — never polled.
+   **Stage 0 (investigated, 2026-09-19) — see section 25:** confirmed
+   live, with a caveat flagged rather than assumed away, that `claude -p`
+   works non-interactively from an unattended container via the host's
+   existing OAuth credentials, before any of the rest of this phase was
+   designed. **Stage 1 (built, 2026-09-20) — see section 27:** the
+   heavy-tier, event-triggered narration loop itself, exactly the three
+   trigger events named above's own real analogues (a setup's
+   `hold_confirmed` transition, a real entry, a real exit — the MACD-
+   cross/retest/sharp-reversal examples in this original roadmap line
+   remain a LATER, lighter-tier pass, not built now), gated behind a
+   rate-limit circuit breaker and a mandatory hourly re-arm, both
+   defaulting to off on every restart. `claude-connector` is now a real
+   service, no longer a placeholder. Ongoing lighter-tier updates and
+   off-tab push delivery remain explicitly deferred.
 3.5. **(built, 2026-09-17) Multi-scenario setup evaluation.** See section
    3 (`core/setup_types.py`) for the four setup types and the
    dollar-distance comparison metric, and section 5 for the grid UI.

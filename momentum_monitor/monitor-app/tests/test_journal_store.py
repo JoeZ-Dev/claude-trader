@@ -491,6 +491,57 @@ def test_set_param_rejects_unknown_key():
         store.set_param("not_a_real_param", 1.0)
 
 
+# -- event-triggered narration's live-tunable thresholds (phase 3 stage
+# 1, specs.md section 27) -- same generic _PARAM_BOUNDS machinery as
+# every other param above, just three new keys.
+
+def test_narration_params_accept_the_documented_defaults():
+    store = JournalStore(":memory:", default_params={
+        "narration_max_calls_per_window": 10.0,
+        "narration_window_minutes": 15.0,
+        "narration_rearm_minutes": 60.0,
+    })
+    params = store.all_params()
+    assert params["narration_max_calls_per_window"]["value"] == 10.0
+    assert params["narration_window_minutes"]["value"] == 15.0
+    assert params["narration_rearm_minutes"]["value"] == 60.0
+
+
+def test_narration_params_are_live_tunable():
+    store = JournalStore(":memory:")
+    store.set_param("narration_max_calls_per_window", 20.0)
+    store.set_param("narration_window_minutes", 30.0)
+    store.set_param("narration_rearm_minutes", 120.0)
+    params = store.all_params()
+    assert params["narration_max_calls_per_window"]["value"] == 20.0
+    assert params["narration_window_minutes"]["value"] == 30.0
+    assert params["narration_rearm_minutes"]["value"] == 120.0
+
+
+def test_narration_params_reject_zero_and_negative():
+    import pytest
+    from journal_store import InvalidParamError
+    store = JournalStore(":memory:")
+    for key in ("narration_max_calls_per_window", "narration_window_minutes",
+               "narration_rearm_minutes"):
+        with pytest.raises(InvalidParamError):
+            store.set_param(key, 0.0)
+        with pytest.raises(InvalidParamError):
+            store.set_param(key, -1.0)
+
+
+def test_narration_params_reject_absurdly_large_values():
+    import pytest
+    from journal_store import InvalidParamError
+    store = JournalStore(":memory:")
+    with pytest.raises(InvalidParamError):
+        store.set_param("narration_max_calls_per_window", 100_000.0)
+    with pytest.raises(InvalidParamError):
+        store.set_param("narration_window_minutes", 100_000.0)
+    with pytest.raises(InvalidParamError):
+        store.set_param("narration_rearm_minutes", 100_000.0)
+
+
 def test_a_rejected_set_param_does_not_change_the_live_value_or_history(tmp_path):
     import pytest
     from journal_store import InvalidParamError

@@ -143,6 +143,7 @@ from journal_store import (MAX_WATCH_NOTE_LENGTH, InvalidEquityOverrideError,
 from state import build_state
 from analysis import (breakdown_by_review_label, breakdown_by_setup_type,
                       losses_section, overall_stats)
+import narration
 
 # Same sys.path setup as state.py's own CORE_PATH -- app.py reaches into
 # core/levels.py directly for confirmed_swing_lows (specs.md section 12's
@@ -235,6 +236,24 @@ DEFAULT_CONTINUATION_THRESHOLD_PCT = 0.5
 # sub-second freshness).
 DEFAULT_MARKET_BACKDROP_SYMBOL = "SPY"
 DEFAULT_MARKET_BACKDROP_REFRESH_SECONDS = 180.0
+# Event-triggered narration (phase 3 stage 1, specs.md section 27) --
+# heavy-tier only, three trigger events (a setup confirming, a real
+# entry, a real exit), gated behind two independent, human-controlled
+# safety mechanisms. Both defaults reasoned through in journal_store.py's
+# own _PARAM_BOUNDS comment -- these three are seed/fallback defaults
+# ONLY, same split as every other DEFAULT_* constant here; live-tuned via
+# strategy_params from then on.
+DEFAULT_NARRATION_MAX_CALLS_PER_WINDOW = 10.0
+DEFAULT_NARRATION_WINDOW_MINUTES = 15.0
+DEFAULT_NARRATION_REARM_MINUTES = 60.0
+# In-memory-only cap on the narration log kept for display (specs.md
+# section 27's explicit scope decision: no durable narration-history
+# table this stage, unlike every trade/review record elsewhere in this
+# project -- narration is commentary on events that ARE already durably
+# logged elsewhere; losing the commentary text itself on a restart loses
+# nothing structurally, and both safety gates already reset to their
+# safe defaults on every restart regardless).
+NARRATION_LOG_MAX_ENTRIES = 50
 MAX_SYMBOLS = 4
 
 # Real ticker symbols are short and plain (letters/digits, occasionally a
@@ -324,6 +343,10 @@ class Poller:
                  fetch_market_backdrop=None,
                  market_backdrop_symbol=DEFAULT_MARKET_BACKDROP_SYMBOL,
                  market_backdrop_refresh_seconds=DEFAULT_MARKET_BACKDROP_REFRESH_SECONDS,
+                 fetch_narration=None,
+                 narration_max_calls_per_window=DEFAULT_NARRATION_MAX_CALLS_PER_WINDOW,
+                 narration_window_minutes=DEFAULT_NARRATION_WINDOW_MINUTES,
+                 narration_rearm_minutes=DEFAULT_NARRATION_REARM_MINUTES,
                  now_fn=time.time, max_symbols=MAX_SYMBOLS):
         self._fetch_bars = fetch_bars
         self._fetch_daily_bars = fetch_daily_bars
@@ -339,6 +362,24 @@ class Poller:
             "current_price": None, "prior_close": None,
             "pct_change": None, "as_of_ts": None,
         }
+        # Event-triggered narration (phase 3 stage 1, specs.md section 27)
+        # -- None disables the feature entirely (same optional-dependency
+        # convention as fetch_daily_bars/fetch_market_backdrop above).
+        # ALL narration state below is in-memory ONLY, never persisted:
+        # both safety gates MUST default to disarmed/not-tripped on every
+        # fresh process start, and the simplest way to guarantee that is
+        # to give them nowhere to survive a restart in the first place,
+        # rather than persisting them and then having to remember to
+        # reset them on every startup path.
+        self._fetch_narration = fetch_narration
+        self._narration_max_calls_per_window = narration_max_calls_per_window
+        self._narration_window_minutes = narration_window_minutes
+        self._narration_rearm_minutes = narration_rearm_minutes
+        self._narration_armed_until: float | None = None
+        self._narration_call_timestamps: list[float] = []
+        self._narration_breaker_tripped: bool = False
+        self._narration_log: list[dict] = []
+        self._narration_tasks: set[asyncio.Task] = set()
         self._initial_symbol = watch_symbol.upper() if watch_symbol else None
         self._announce_watch = announce_watch
         self._announce_unwatch = announce_unwatch
@@ -520,6 +561,161 @@ class Poller:
             await self.refresh_market_backdrop()
             await asyncio.sleep(self._market_backdrop_refresh_seconds)
 
+    # -- event-triggered narration (phase 3 stage 1, specs.md section 27) --
+
+    def _narration_param(self, key: str, default: float) -> float:
+        return (self._journal_store.get_param(key, default)
+                if self._journal_store is not None else default)
+
+    def narration_status(self) -> dict:
+        """Everything the UI needs to show current narration state
+        (specs.md section 27) -- armed/disarmed with time remaining,
+        circuit-breaker tripped/not, and both live-tunable thresholds
+        currently in effect. Purely computed from in-memory state + the
+        current time; never mutates anything (armed-ness is a live
+        comparison against `_narration_armed_until`, not a flag that
+        needs actively flipping when it expires)."""
+        now = self._now_fn()
+        armed_until = self._narration_armed_until
+        armed = narration.is_armed(armed_until, now)
+        return {
+            "armed": armed,
+            "armed_until": armed_until,
+            "seconds_remaining": (armed_until - now) if armed else None,
+            "breaker_tripped": self._narration_breaker_tripped,
+            "recent_call_count": len(self._narration_call_timestamps),
+            "max_calls_per_window": self._narration_param(
+                "narration_max_calls_per_window", self._narration_max_calls_per_window),
+            "window_minutes": self._narration_param(
+                "narration_window_minutes", self._narration_window_minutes),
+            "rearm_minutes": self._narration_param(
+                "narration_rearm_minutes", self._narration_rearm_minutes),
+        }
+
+    def narration_log(self, limit: int = NARRATION_LOG_MAX_ENTRIES) -> list[dict]:
+        """Most recent narration entries first -- in-memory only (specs.md
+        section 27's explicit scope decision: no durable history table
+        this stage)."""
+        return self._narration_log[:limit]
+
+    def arm_narration(self) -> dict:
+        """Explicit human action (specs.md section 27's mandatory hourly
+        re-arm, gate 2) -- sets armed_until to now + the current live
+        narration_rearm_minutes. Always succeeds (arming while already
+        armed just extends it, matching "re-arm" being the same action
+        as the first arm, not a distinct one). Returns the fresh status
+        so the caller/route doesn't need a second read."""
+        rearm_minutes = self._narration_param(
+            "narration_rearm_minutes", self._narration_rearm_minutes)
+        self._narration_armed_until = self._now_fn() + rearm_minutes * 60.0
+        self._broadcast_state()
+        return self.narration_status()
+
+    def reset_narration_breaker(self) -> tuple[bool, str]:
+        """Explicit human action (specs.md section 27's circuit breaker,
+        gate 1) -- (False, reason) if the breaker isn't actually tripped
+        (the UI's own reset button is only enabled when tripped, but the
+        server enforces this too, never trusting the client alone, same
+        as every other guarded action in this app). Clears the recorded
+        call timestamps along with the trip itself -- a fresh start, not
+        just un-flagging while leaving the window primed to re-trip on
+        the very next call."""
+        if not self._narration_breaker_tripped:
+            return False, "circuit breaker is not tripped"
+        self._narration_breaker_tripped = False
+        self._narration_call_timestamps = []
+        self._broadcast_state()
+        return True, ""
+
+    def _narration_gates_clear(self) -> bool:
+        return (narration.is_armed(self._narration_armed_until, self._now_fn())
+                and not self._narration_breaker_tripped)
+
+    def _narration_events_for_tick(self, symbol: str, was_confirmed_types: frozenset[str],
+                                   tick, setups: list[dict]) -> list[tuple[str, str]]:
+        """The (kind, prompt) pairs this tick's real, already-computed
+        journal_logic.JournalTick produced -- reuses tick.confirmed_
+        types_after/tick.opened/tick.closed directly, no new "was this
+        meaningful" detection (specs.md section 27's explicit scope)."""
+        events: list[tuple[str, str]] = []
+        for setup_type in narration.newly_confirmed_types(
+                tick.confirmed_types_after, was_confirmed_types):
+            setup = next((s for s in setups if s["setup_type"] == setup_type), None)
+            if setup is not None:
+                events.append(("confirmation",
+                              narration.confirmation_prompt(symbol, setup_type, setup)))
+        if tick.opened is not None:
+            events.append(("entry", narration.entry_prompt(symbol, tick.opened)))
+        if tick.closed is not None:
+            position, exit_event = tick.closed
+            pnl_pct = ((exit_event.exit_price - position.entry_price)
+                      / position.entry_price * 100.0)
+            pnl_dollars = (position.shares * (exit_event.exit_price - position.entry_price)
+                          if position.shares is not None else None)
+            events.append(("exit", narration.exit_prompt(
+                symbol, position, exit_event, pnl_pct, pnl_dollars)))
+        return events
+
+    async def _fire_narration_call(self, symbol: str, kind: str, prompt: str) -> None:
+        """Records the attempt against the rate-limit window FIRST (an
+        attempt counts even if the call itself then fails -- a runaway
+        bug producing rapid failing attempts must still trip the breaker,
+        specs.md section 27), then makes the real call. Any failure --
+        non-zero exit, timeout, malformed output, a network error
+        reaching claude-connector, anything -- is caught here and
+        recorded in the narration log as a visible failure entry, never
+        swallowed. Given the stage-0 investigation's OAuth-refresh path
+        was never exercised, a failure here gets NO special "probably
+        transient" treatment -- it's surfaced exactly the same as any
+        other failure, by design."""
+        now = self._now_fn()
+        window_minutes = self._narration_param(
+            "narration_window_minutes", self._narration_window_minutes)
+        max_calls = self._narration_param(
+            "narration_max_calls_per_window", self._narration_max_calls_per_window)
+        self._narration_call_timestamps = narration.prune_and_record_call(
+            self._narration_call_timestamps, now, window_minutes)
+        if narration.breaker_should_trip(self._narration_call_timestamps, max_calls):
+            self._narration_breaker_tripped = True
+            logger.warning(
+                "narration circuit breaker TRIPPED: %d calls within %.0f minutes "
+                "(max %d) -- narration blocked until manually reset",
+                len(self._narration_call_timestamps), window_minutes, max_calls,
+            )
+        entry: dict = {"ts": now, "symbol": symbol, "kind": kind, "prompt": prompt}
+        try:
+            text = await self._fetch_narration(prompt)
+            entry["ok"] = True
+            entry["text"] = text
+        except Exception as exc:
+            entry["ok"] = False
+            entry["error"] = str(exc)
+            logger.warning("narration call failed for %s (%s): %s", symbol, kind, exc)
+        self._narration_log.insert(0, entry)
+        del self._narration_log[NARRATION_LOG_MAX_ENTRIES:]
+        self._broadcast_state()
+
+    async def _maybe_narrate(self, symbol: str, was_confirmed_types: frozenset[str],
+                             tick, setups: list[dict]) -> None:
+        """Runs as a detached background task (see _update_journal) --
+        NEVER awaited inline in the bar-processing path, so a slow or
+        hung claude -p call (up to claude-connector's own 30s timeout)
+        can never delay processing new bars or the next poll cycle.
+        Checks both gates freshly before EACH event in this tick, not
+        just once for the whole batch -- if an earlier event trips the
+        breaker, later events in the SAME tick are blocked too, matching
+        "block all further narration calls" literally."""
+        if self._fetch_narration is None:
+            return
+        try:
+            events = self._narration_events_for_tick(symbol, was_confirmed_types, tick, setups)
+            for kind, prompt in events:
+                if not self._narration_gates_clear():
+                    break
+                await self._fire_narration_call(symbol, kind, prompt)
+        except Exception:
+            logger.exception("unexpected error in narration task for %s", symbol)
+
     def reverse_splits_for(self, symbol: str) -> list[dict]:
         """Every recorded reverse split for `symbol`, most recent first --
         [] if journaling is disabled or none were ever recorded. Works for
@@ -640,6 +836,12 @@ class Poller:
                     "value": self._confirmation_freshness_seconds, "updated_at": None},
                 "target_reference_pct": {
                     "value": self._target_reference_pct, "updated_at": None},
+                "narration_max_calls_per_window": {
+                    "value": self._narration_max_calls_per_window, "updated_at": None},
+                "narration_window_minutes": {
+                    "value": self._narration_window_minutes, "updated_at": None},
+                "narration_rearm_minutes": {
+                    "value": self._narration_rearm_minutes, "updated_at": None},
             }
         return self._journal_store.all_params()
 
@@ -1022,6 +1224,10 @@ class Poller:
             "strategy_params": self.strategy_params(),
             "current_equity": self.current_equity(),
             "market_backdrop": self.market_backdrop(),
+            "narration": {
+                "status": self.narration_status(),
+                "log": self.narration_log(),
+            },
         }
 
     def _broadcast_state(self) -> None:
@@ -1131,6 +1337,12 @@ class Poller:
         confirmation_freshness_seconds = self._journal_store.get_param(
             "confirmation_freshness_seconds", self._confirmation_freshness_seconds)
         avg_daily_volume = slot.avg_daily_volume
+        # Captured BEFORE advance_journal/the assignment below overwrite
+        # slot.journal_confirmed_types -- narration's trigger 1 (specs.md
+        # section 27) needs the "before" set to diff against tick.
+        # confirmed_types_after, the exact same bookkeeping should_
+        # enter's own freshly-confirmed check already relies on.
+        was_confirmed_types_before = slot.journal_confirmed_types
         tick = advance_journal(
             position=slot.journal_position, new_bars=new_bars,
             setups=setups, was_confirmed_types=slot.journal_confirmed_types,
@@ -1177,6 +1389,17 @@ class Poller:
             self._journal_store.update_trailing(tick.updated)
             slot.journal_position = tick.updated
         slot.journal_confirmed_types = tick.confirmed_types_after
+        # Fire-and-forget: NEVER awaited inline here (specs.md section
+        # 27) -- a slow/hung claude -p call must not delay processing of
+        # new bars or the next poll cycle. Reference kept in
+        # self._narration_tasks (discarded on completion) so the task
+        # isn't garbage-collected mid-flight, a real asyncio gotcha for
+        # a bare, unreferenced create_task() call.
+        if self._fetch_narration is not None:
+            task = asyncio.create_task(
+                self._maybe_narrate(symbol, was_confirmed_types_before, tick, setups))
+            self._narration_tasks.add(task)
+            task.add_done_callback(self._narration_tasks.discard)
 
 
 # -- rendering helpers shared in spirit (deliberately, minimally
@@ -1760,9 +1983,80 @@ def _market_backdrop_html(backdrop: dict) -> str:
     )
 
 
+def _fmt_minutes_remaining(seconds: float | None) -> str:
+    if seconds is None or seconds <= 0:
+        return "0m"
+    minutes = seconds / 60.0
+    return "<1m" if minutes < 1 else f"{int(minutes)}m"
+
+
+_DEFAULT_NARRATION_STATUS = {
+    "armed": False, "armed_until": None, "seconds_remaining": None,
+    "breaker_tripped": False, "recent_call_count": 0,
+    "max_calls_per_window": DEFAULT_NARRATION_MAX_CALLS_PER_WINDOW,
+    "window_minutes": DEFAULT_NARRATION_WINDOW_MINUTES,
+    "rearm_minutes": DEFAULT_NARRATION_REARM_MINUTES,
+}
+
+
+def _narration_status_html(status: dict) -> str:
+    """Armed/disarmed with time remaining, circuit-breaker tripped/not,
+    and the arm/reset controls (specs.md section 27) -- id='narration-
+    status' so render() can refresh it in place on every push, same
+    pattern as every other live status block on this page. The reset
+    button is disabled client-side when not tripped (a UX nicety); the
+    real guard is server-side (POST /api/narration/reset_breaker itself
+    refuses when not tripped), never trusted to the client alone."""
+    armed = status["armed"]
+    armed_text = (f"ARMED ({_fmt_minutes_remaining(status['seconds_remaining'])} remaining)"
+                 if armed else "DISARMED")
+    armed_cls = "pos" if armed else "muted"
+    tripped = status["breaker_tripped"]
+    breaker_text = "TRIPPED" if tripped else "OK"
+    breaker_cls = "neg" if tripped else "pos"
+    reset_disabled = "" if tripped else " disabled"
+    return (
+        "<div id='narration-status'>"
+        f"<span class='{armed_cls}'>Narration: {armed_text}</span> &middot; "
+        f"<span class='{breaker_cls}'>Circuit breaker: {breaker_text}</span> "
+        f"<span class='muted'>({status['recent_call_count']}/"
+        f"{int(status['max_calls_per_window'])} calls in "
+        f"{int(status['window_minutes'])}m window)</span> "
+        "<button type='button' id='narration-arm-btn'>Arm / re-arm</button> "
+        f"<button type='button' id='narration-reset-breaker-btn'{reset_disabled}>"
+        "Reset circuit breaker</button>"
+        "</div>"
+    )
+
+
+def _narration_log_html(log: list[dict]) -> str:
+    """Most recent first (already the order Poller.narration_log()
+    returns). A failed call is styled distinctly (neg-colored, prefixed
+    'FAILED') so an invocation failure is visibly surfaced here, not
+    just present in the raw JSON (specs.md section 27: 'caught and
+    surfaced clearly ... never silently swallowed')."""
+    if not log:
+        return "<p class='muted'>No narration yet.</p>"
+    rows = []
+    for entry in log:
+        ok = entry.get("ok")
+        cls = "" if ok else "neg"
+        text = (html.escape(entry["text"]) if ok
+               else f"FAILED: {html.escape(entry.get('error') or 'unknown error')}")
+        rows.append(
+            f"<div class='narration-entry {cls}'>"
+            f"<span class='muted'>{_fmt_ts(entry['ts'])}</span> "
+            f"<strong>{html.escape(str(entry['symbol']))}</strong> "
+            f"<span class='muted'>({html.escape(str(entry['kind']))})</span> "
+            f"{text}</div>"
+        )
+    return "".join(rows)
+
+
 def _page(full_states: dict[str, dict], recent_closed: list[dict], poll_enabled: bool,
           max_symbols: int, strategy_params: dict, current_equity: float,
-          market_backdrop: dict | None = None) -> str:
+          market_backdrop: dict | None = None, narration_status: dict | None = None,
+          narration_log: list[dict] | None = None) -> str:
     if full_states:
         cards_html = "".join(_symbol_card_html(sym, st) for sym, st in full_states.items())
     else:
@@ -1771,6 +2065,8 @@ def _page(full_states: dict[str, dict], recent_closed: list[dict], poll_enabled:
 
     backdrop_html = _market_backdrop_html(
         market_backdrop or {"status": "unknown", "symbol": DEFAULT_MARKET_BACKDROP_SYMBOL})
+    narration_status_html = _narration_status_html(narration_status or _DEFAULT_NARRATION_STATUS)
+    narration_log_html_str = _narration_log_html(narration_log or [])
 
     body = f"""
 {backdrop_html}
@@ -1790,6 +2086,13 @@ def _page(full_states: dict[str, dict], recent_closed: list[dict], poll_enabled:
         <th>P&amp;L $</th><th>review</th><th></th></tr>
     <tbody id="journal-closed-tbody">{_journal_closed_rows_html(recent_closed)}</tbody>
   </table>
+</section>
+<section class="card" id="narration-section">
+  <div class="hero">
+    <h2>Event-triggered narration</h2>
+  </div>
+  {narration_status_html}
+  <div id="narration-log">{narration_log_html_str}</div>
 </section>
 """
     return _wrap(body, poll_enabled)
@@ -2211,6 +2514,12 @@ function render(data) {
   if (backdropEl && data.market_backdrop) {
     backdropEl.outerHTML = marketBackdropHtml(data.market_backdrop);
   }
+  if (data.narration) {
+    const statusEl = document.getElementById('narration-status');
+    if (statusEl) statusEl.outerHTML = narrationStatusHtml(data.narration.status);
+    const logEl = document.getElementById('narration-log');
+    if (logEl) logEl.innerHTML = narrationLogHtml(data.narration.log);
+  }
 }
 
 // Mirrors _strategy_params_html (Python side) -- read-only display, kept
@@ -2237,6 +2546,46 @@ function marketBackdropHtml(backdrop) {
   return '<p id="market-backdrop">Market backdrop: ' + symbol + ' <span class="' + cls + '">' +
     sign + pct.toFixed(2) + '%</span> (' + fmt(backdrop.current_price, 2) +
     ', prior close ' + fmt(backdrop.prior_close, 2) + ')</p>';
+}
+
+// Mirrors _fmt_minutes_remaining/_narration_status_html/_narration_log_html
+// (Python side) -- specs.md section 27.
+function fmtMinutesRemaining(seconds) {
+  if (seconds === null || seconds === undefined || seconds <= 0) return '0m';
+  const minutes = seconds / 60.0;
+  return minutes < 1 ? '<1m' : Math.floor(minutes) + 'm';
+}
+function narrationStatusHtml(status) {
+  const armed = status.armed;
+  const armedText = armed
+    ? 'ARMED (' + fmtMinutesRemaining(status.seconds_remaining) + ' remaining)'
+    : 'DISARMED';
+  const armedCls = armed ? 'pos' : 'muted';
+  const tripped = status.breaker_tripped;
+  const breakerText = tripped ? 'TRIPPED' : 'OK';
+  const breakerCls = tripped ? 'neg' : 'pos';
+  const resetDisabled = tripped ? '' : ' disabled';
+  return '<div id="narration-status">' +
+    '<span class="' + armedCls + '">Narration: ' + armedText + '</span> \\u00b7 ' +
+    '<span class="' + breakerCls + '">Circuit breaker: ' + breakerText + '</span> ' +
+    '<span class="muted">(' + status.recent_call_count + '/' +
+    Math.floor(status.max_calls_per_window) + ' calls in ' +
+    Math.floor(status.window_minutes) + 'm window)</span> ' +
+    '<button type="button" id="narration-arm-btn">Arm / re-arm</button> ' +
+    '<button type="button" id="narration-reset-breaker-btn"' + resetDisabled + '>' +
+    'Reset circuit breaker</button></div>';
+}
+function narrationLogHtml(log) {
+  if (!log || !log.length) return '<p class="muted">No narration yet.</p>';
+  return log.map(function (entry) {
+    const ok = entry.ok;
+    const cls = ok ? '' : 'neg';
+    const text = ok ? esc(entry.text) : 'FAILED: ' + esc(entry.error || 'unknown error');
+    return '<div class="narration-entry ' + cls + '">' +
+      '<span class="muted">' + fmtTs(entry.ts) + '</span> ' +
+      '<strong>' + esc(entry.symbol) + '</strong> ' +
+      '<span class="muted">(' + esc(entry.kind) + ')</span> ' + text + '</div>';
+  }).join('');
 }
 
 // Thin wrapper kept for the explicit post-action call sites below
@@ -2442,6 +2791,30 @@ document.getElementById('clear-symbol-switched-btn').addEventListener('click', a
   refresh();
 });
 
+// Narration arm/reset (specs.md section 27) -- delegated on #narration-
+// section (a stable ancestor) rather than bound directly to the buttons,
+// since #narration-status itself gets replaced wholesale (outerHTML) on
+// every push -- direct bindings would be destroyed along with it.
+document.getElementById('narration-section').addEventListener('click', async function (e) {
+  if (e.target.id === 'narration-arm-btn') {
+    e.target.disabled = true;
+    try {
+      await fetch('/api/narration/arm', { method: 'POST' });
+    } catch (err) {
+      // leave the status as-is; the next poll/push reflects actual state either way
+    }
+    refresh();
+  } else if (e.target.id === 'narration-reset-breaker-btn' && !e.target.disabled) {
+    e.target.disabled = true;
+    try {
+      await fetch('/api/narration/reset_breaker', { method: 'POST' });
+    } catch (err) {
+      // leave the status as-is
+    }
+    refresh();
+  }
+});
+
 // Pause/resume (via POST /api/polling) monitor-app's own applying of
 // incoming bar-push events -- the EventSource connection below stays
 // open either way (nothing to start/stop client-side, unlike the old
@@ -2595,6 +2968,14 @@ table.detail th{color:var(--muted);font-weight:500;width:45%}
 .nav-link:hover{text-decoration:underline}
 .elevated-flag{color:var(--neg);font-weight:600}
 .section-gap{margin-top:1.5rem}
+#narration-status{margin:.4rem 0;font-size:.85rem}
+#narration-status button{background:var(--card);color:var(--text);
+  border:1px solid var(--border);border-radius:.4rem;padding:.3rem .7rem;
+  cursor:pointer;font-size:.8rem}
+#narration-status button:disabled{opacity:.5;cursor:default}
+#narration-log{max-height:20rem;overflow-y:auto}
+.narration-entry{padding:.3rem 0;border-bottom:1px solid var(--border);font-size:.85rem}
+.narration-entry.neg{color:var(--neg)}
 """
 
 
@@ -2794,6 +3175,10 @@ def create_app(*, fetch_bars, watch_symbol=None,
                fetch_market_backdrop=None,
                market_backdrop_symbol=DEFAULT_MARKET_BACKDROP_SYMBOL,
                market_backdrop_refresh_seconds=DEFAULT_MARKET_BACKDROP_REFRESH_SECONDS,
+               fetch_narration=None,
+               narration_max_calls_per_window=DEFAULT_NARRATION_MAX_CALLS_PER_WINDOW,
+               narration_window_minutes=DEFAULT_NARRATION_WINDOW_MINUTES,
+               narration_rearm_minutes=DEFAULT_NARRATION_REARM_MINUTES,
                now_fn=time.time, max_symbols=MAX_SYMBOLS) -> FastAPI:
     poller = Poller(fetch_bars=fetch_bars, watch_symbol=watch_symbol,
                     announce_watch=announce_watch,
@@ -2815,6 +3200,10 @@ def create_app(*, fetch_bars, watch_symbol=None,
                     fetch_market_backdrop=fetch_market_backdrop,
                     market_backdrop_symbol=market_backdrop_symbol,
                     market_backdrop_refresh_seconds=market_backdrop_refresh_seconds,
+                    fetch_narration=fetch_narration,
+                    narration_max_calls_per_window=narration_max_calls_per_window,
+                    narration_window_minutes=narration_window_minutes,
+                    narration_rearm_minutes=narration_rearm_minutes,
                     now_fn=now_fn, max_symbols=max_symbols)
 
     @asynccontextmanager
@@ -2839,6 +3228,12 @@ def create_app(*, fetch_bars, watch_symbol=None,
         if stream_task is not None:
             stream_task.cancel()
         backdrop_task.cancel()
+        # Narration calls run as detached background tasks (specs.md
+        # section 27) -- cancel any still in flight at shutdown rather
+        # than leaving a subprocess call dangling past the app's own
+        # lifetime.
+        for narration_task in list(poller._narration_tasks):
+            narration_task.cancel()
 
     app = FastAPI(title="monitor-app", lifespan=lifespan)
     app.state.poller = poller
@@ -2871,7 +3266,8 @@ def create_app(*, fetch_bars, watch_symbol=None,
     async def root():
         return _page(poller.all_full_states(), poller.recent_closed(limit=10),
                     poller.poll_enabled, poller.max_symbols, poller.strategy_params(),
-                    poller.current_equity(), poller.market_backdrop())
+                    poller.current_equity(), poller.market_backdrop(),
+                    poller.narration_status(), poller.narration_log())
 
     @app.get("/analysis", response_class=HTMLResponse)
     async def analysis_page():
@@ -3080,5 +3476,26 @@ def create_app(*, fetch_bars, watch_symbol=None,
                 {"ok": False, "reason": "value must be a number"}, status_code=409)
         ok, reason = poller.override_equity(value)
         return JSONResponse({"ok": ok, "reason": reason}, status_code=200 if ok else 409)
+
+    @app.post("/api/narration/arm")
+    async def api_narration_arm():
+        # Explicit human action (specs.md section 27's mandatory hourly
+        # re-arm) -- always succeeds; arming while already armed just
+        # extends it. No body needed.
+        return JSONResponse({"ok": True, "status": poller.arm_narration()})
+
+    @app.post("/api/narration/reset_breaker")
+    async def api_narration_reset_breaker():
+        # Explicit human action (specs.md section 27's circuit breaker)
+        # -- 409 if the breaker isn't actually tripped, same "the server
+        # enforces this too, never trusts the client alone" standard as
+        # every other guarded action in this app (the UI's own button is
+        # ALSO only enabled when tripped, but that's a UX nicety, not
+        # the real guard).
+        ok, reason = poller.reset_narration_breaker()
+        return JSONResponse(
+            {"ok": ok, "reason": reason, "status": poller.narration_status()},
+            status_code=200 if ok else 409,
+        )
 
     return app

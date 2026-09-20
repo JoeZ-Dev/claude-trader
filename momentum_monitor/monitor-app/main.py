@@ -79,6 +79,23 @@ Environment:
                         re-fetches -- its own independent periodic REST
                         poll, not tied to the 4 watched symbols' push
                         updates                              (default 180)
+  CLAUDE_CONNECTOR_URL  base URL of claude-connector, the only service
+                        with the `claude` CLI's credentials mounted
+                        (specs.md sections 25/27, phase 3 stage 1) --
+                        event-triggered narration                (default
+                                                http://claude-connector:7879)
+  NARRATION_MAX_CALLS_PER_WINDOW / NARRATION_WINDOW_MINUTES  the
+                        rate-limit circuit breaker's threshold -- more
+                        than this many narration calls within this many
+                        minutes trips it, blocking all further calls
+                        until a human manually resets it via POST
+                        /api/narration/reset_breaker (specs.md section
+                        27) -- same seed-only treatment as TRAIL_PCT
+                        above                        (default 10 / 15)
+  NARRATION_REARM_MINUTES  how long narration stays armed after an
+                        explicit POST /api/narration/arm, before going
+                        dormant again -- independent of the circuit
+                        breaker; same seed-only treatment  (default 60)
 
 Run:  uvicorn main:app --host 0.0.0.0 --port 8012
 """
@@ -113,6 +130,16 @@ CONFIRMATION_FRESHNESS_SECONDS = float(os.environ.get("CONFIRMATION_FRESHNESS_SE
 TARGET_REFERENCE_PCT = float(os.environ.get("TARGET_REFERENCE_PCT", "0.10"))
 MARKET_BACKDROP_SYMBOL = os.environ.get("MARKET_BACKDROP_SYMBOL", "SPY")
 MARKET_BACKDROP_REFRESH_SECONDS = float(os.environ.get("MARKET_BACKDROP_REFRESH_SECONDS", "180"))
+CLAUDE_CONNECTOR_URL = os.environ.get("CLAUDE_CONNECTOR_URL", "http://claude-connector:7879").rstrip("/")
+NARRATION_MAX_CALLS_PER_WINDOW = float(os.environ.get("NARRATION_MAX_CALLS_PER_WINDOW", "10"))
+NARRATION_WINDOW_MINUTES = float(os.environ.get("NARRATION_WINDOW_MINUTES", "15"))
+NARRATION_REARM_MINUTES = float(os.environ.get("NARRATION_REARM_MINUTES", "60"))
+# claude-connector's own claude_cli timeout defaults to 30s -- this HTTP
+# call's timeout must be comfortably LONGER than that, so claude-
+# connector's own clean {"ok": false, "error": "...timed out..."} JSON
+# response always wins over this client aborting the connection first
+# with a generic, less informative timeout exception.
+NARRATION_HTTP_TIMEOUT_SECONDS = float(os.environ.get("NARRATION_HTTP_TIMEOUT_SECONDS", "40"))
 
 _client = httpx.AsyncClient(timeout=10.0)
 _journal_store = JournalStore(JOURNAL_DB_PATH, default_params={
@@ -127,6 +154,9 @@ _journal_store = JournalStore(JOURNAL_DB_PATH, default_params={
     "continuation_threshold_pct": CONTINUATION_THRESHOLD_PCT,
     "confirmation_freshness_seconds": CONFIRMATION_FRESHNESS_SECONDS,
     "target_reference_pct": TARGET_REFERENCE_PCT,
+    "narration_max_calls_per_window": NARRATION_MAX_CALLS_PER_WINDOW,
+    "narration_window_minutes": NARRATION_WINDOW_MINUTES,
+    "narration_rearm_minutes": NARRATION_REARM_MINUTES,
 })
 
 
@@ -172,6 +202,25 @@ async def fetch_market_backdrop(symbol: str):
                           params={"lookback_days": 2, "include_today": "true"})
     r.raise_for_status()
     return r.json().get("bars", [])
+
+
+async def fetch_narration(prompt: str) -> str:
+    # Event-triggered narration (specs.md sections 25/27, phase 3 stage
+    # 1) -- claude-connector is the ONLY service with the `claude` CLI's
+    # credentials mounted; this app never shells out to `claude` itself.
+    # Raises on any failure (a non-2xx HTTP status, a connector-reported
+    # {"ok": false, ...}, a network error, a malformed JSON body) --
+    # Poller._fire_narration_call catches this and surfaces it in the
+    # narration log, never silently. Uses a LONGER timeout than this
+    # module's shared 10s _client default (see NARRATION_HTTP_TIMEOUT_
+    # SECONDS above) so claude-connector's own internal timeout handling
+    # gets to fire first.
+    r = await _client.post(f"{CLAUDE_CONNECTOR_URL}/narrate", json={"prompt": prompt},
+                           timeout=NARRATION_HTTP_TIMEOUT_SECONDS)
+    body = r.json()
+    if r.status_code != 200 or not body.get("ok"):
+        raise RuntimeError(body.get("error") or f"HTTP {r.status_code}")
+    return body["text"]
 
 
 async def _consume_events_once(on_bar) -> None:
@@ -227,4 +276,8 @@ app = create_app(fetch_bars=fetch_bars, watch_symbol=WATCH_SYMBOL,
                  fetch_daily_bars=fetch_daily_bars,
                  fetch_market_backdrop=fetch_market_backdrop,
                  market_backdrop_symbol=MARKET_BACKDROP_SYMBOL,
-                 market_backdrop_refresh_seconds=MARKET_BACKDROP_REFRESH_SECONDS)
+                 market_backdrop_refresh_seconds=MARKET_BACKDROP_REFRESH_SECONDS,
+                 fetch_narration=fetch_narration,
+                 narration_max_calls_per_window=NARRATION_MAX_CALLS_PER_WINDOW,
+                 narration_window_minutes=NARRATION_WINDOW_MINUTES,
+                 narration_rearm_minutes=NARRATION_REARM_MINUTES)

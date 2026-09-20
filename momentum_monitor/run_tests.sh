@@ -13,7 +13,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="${PYTHON:-$HERE/.venv/bin/python}"
 
 fail=0
-for suite in core schwab-connector monitor-app; do
+for suite in core schwab-connector claude-connector monitor-app; do
     echo "=== $suite ==="
     "$PY" -m pytest "$HERE/$suite/tests/" -q || fail=1
 done

@@ -322,6 +322,37 @@ _PARAM_BOUNDS = {
     # never an exit trigger. 5.0 (500%) is a generous upper bound; this
     # is display-only so there's no real-risk reason to cap it tighter.
     "target_reference_pct": (0.0, 5.0),
+    # Event-triggered narration's rate-limit circuit breaker (phase 3
+    # stage 1, specs.md section 27) -- more than narration_max_calls_
+    # per_window real `claude -p` calls within a rolling narration_
+    # window_minutes trips the breaker (blocks all further calls until a
+    # human manually resets it). Reasoning behind the defaults (10 calls
+    # / 15 minutes): expected REAL volume is low even at 4 concurrently
+    # watched symbols on a genuinely busy session -- each symbol
+    # realistically produces at most a handful of the three trigger
+    # events (a setup confirming, an entry, an exit) in any 15-minute
+    # window, so 4-8 total calls in that window is a busy-but-normal
+    # ceiling; 10 sits just above that. A real bug (e.g. a debounce
+    # failure firing on every live bar at 10s cadence) would produce
+    # dozens of calls per symbol in the same window -- the threshold
+    # trips almost immediately against that, not after meaningful
+    # damage. 1 (a pathologically tight window that would trip on any
+    # single real trigger) is the floor; 1000 calls / 1440 minutes (a
+    # full day) are generous sanity ceilings, not validated numbers.
+    "narration_max_calls_per_window": (1.0, 1000.0),
+    "narration_window_minutes": (1.0, 1440.0),
+    # Mandatory hourly re-arm (independent of the circuit breaker above)
+    # -- narration only fires while "armed", for a bounded rolling
+    # duration from the last explicit arm/re-arm action; once expired,
+    # narration goes dormant until a human explicitly re-arms it. 60
+    # (the stated default) balances not needing constant babysitting
+    # against never letting narration run unattended, unbounded, for an
+    # entire session -- a deliberate, conservative default for a brand
+    # new, unproven capability, not a validated number. 1440 (a full
+    # day) is a generous sanity ceiling; 1 minute is the floor (a
+    # pathologically short arm window is still a real, valid choice for
+    # someone who wants to watch every single call land).
+    "narration_rearm_minutes": (1.0, 1440.0),
 }
 
 # current_equity's own seed/reset fallback (specs.md section 7) -- "2000

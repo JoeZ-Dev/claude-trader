@@ -1,5 +1,10 @@
-# momentum_monitor phase 1 -- two live services (claude-connector is a
-# phase-3 placeholder, deliberately not a service here).
+# momentum_monitor -- three live services. claude-connector (phase 3,
+# specs.md sections 25/27) is the only container with the `claude` CLI's
+# OAuth credentials mounted in -- a read-only bind mount of
+# CLAUDE_CREDENTIALS_PATH (default the host's own ~/.claude/.credentials.json;
+# override in momentum_monitor/.env if the host layout differs). Nothing
+# else from the host's ~/.claude is mounted -- the stage-0 investigation
+# (specs.md section 25) proved that file alone is sufficient.
 #
 #   Live Schwab data:  set AUTH_HELPER_URL / INTERNAL_AUTH_SECRET / WATCH_SYMBOL
 #                      in momentum_monitor/.env (gitignored -- see RUNBOOK.md
@@ -27,6 +32,37 @@
 # is `expose`-only -- reachable on the docker networks, never on a host port.
 
 services:
+  claude-connector:
+    build:
+      context: .
+      dockerfile: claude-connector/Dockerfile
+    expose:
+      - "7879"
+    environment:
+      CLAUDE_TIMEOUT_SECONDS: "${CLAUDE_TIMEOUT_SECONDS:-30}"
+    volumes:
+      # Read-only, and ONLY this one file -- the stage-0 investigation
+      # (specs.md section 25) proved nothing else from the host's
+      # ~/.claude is needed. compose does NOT shell-expand "~", so this
+      # MUST be set to an absolute path in momentum_monitor/.env (e.g.
+      # CLAUDE_CREDENTIALS_PATH=/home/<user>/.claude/.credentials.json)
+      # -- same "explicit fill-in required, no silent default" treatment
+      # as AUTH_HELPER_URL/INTERNAL_AUTH_SECRET above. An unset value
+      # here bind-mounts nothing usable and every /narrate call fails
+      # loudly (never silently) via claude_cli's own FileNotFoundError
+      # handling.
+      - "${CLAUDE_CREDENTIALS_PATH:?set CLAUDE_CREDENTIALS_PATH in .env to the host's absolute ~/.claude/.credentials.json path}:/root/.claude/.credentials.json:ro"
+    networks:
+      - monitor-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:7879/health', timeout=3)"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
   schwab-connector:
     build:
       context: .
@@ -73,6 +109,7 @@ services:
       - "8012:8012"
     environment:
       SCHWAB_CONNECTOR_URL: http://schwab-connector:7878
+      CLAUDE_CONNECTOR_URL: http://claude-connector:7879
       WATCH_SYMBOL: "${WATCH_SYMBOL:-}"
       JOURNAL_DB_PATH: /data/journal.db
       # Virtual trade journal trailing-stop percent (specs.md section 6) --
@@ -114,11 +151,32 @@ services:
       # real trailing stop; never an exit trigger, same seed-only
       # treatment as the params above.
       TARGET_REFERENCE_PCT: "${TARGET_REFERENCE_PCT:-0.10}"
+      # Event-triggered narration (specs.md sections 25/27, phase 3 stage
+      # 1) -- both safety-gate thresholds, same seed-only treatment as
+      # every other strategy param above; tune live via POST
+      # /api/strategy_params, not by editing these and redeploying. Both
+      # gates default to disarmed/not-tripped on every fresh start
+      # regardless of these values (in-memory state, never persisted) --
+      # these only seed the THRESHOLDS, never the armed/tripped state
+      # itself.
+      NARRATION_MAX_CALLS_PER_WINDOW: "${NARRATION_MAX_CALLS_PER_WINDOW:-10}"
+      NARRATION_WINDOW_MINUTES: "${NARRATION_WINDOW_MINUTES:-15}"
+      NARRATION_REARM_MINUTES: "${NARRATION_REARM_MINUTES:-60}"
     volumes:
       - ./monitor-app/data:/data
     depends_on:
       schwab-connector:
         condition: service_healthy
+      # Deliberately NOT a hard dependency on claude-connector's health:
+      # narration is an optional, human-armed capability (disarmed by
+      # default on every start), never load-bearing for the rest of this
+      # app. If claude-connector is slow/unhealthy/down, monitor-app
+      # still starts and runs the actual live monitoring fine -- a
+      # narration call just fails per-attempt (caught, logged, surfaced
+      # in the UI status), the same graceful-degradation treatment
+      # fetch_daily_bars/fetch_market_backdrop already get.
+      claude-connector:
+        condition: service_started
     networks:
       - monitor-net
     restart: unless-stopped
