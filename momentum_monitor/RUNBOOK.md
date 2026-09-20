@@ -63,6 +63,24 @@ app or client is used; see `specs.md` §4). "Survives a container restart"
 is the achievable, testable claim (checked in DoD check 6 below); "never
 needs re-auth" is not achievable by any client and must not be implied.
 
+**Checking when this was actually last run, not just when `bootstrap.py`
+was last edited.** Every successful run appends a real timestamp to a
+persistent log at `/data/bootstrap_log.jsonl` (`AUTH_HELPER_BOOTSTRAP_
+LOG_PATH`, set in `companion-auth`'s own `Dockerfile` — same mounted
+`./data` volume as `tokens.json`, deliberately, so this survives a
+container recreation the same way the token itself does, not just a
+plain restart). A file's mtime only proves when its source was last
+edited, never when a real login was last performed:
+
+```bash
+docker exec companion-auth python -c \
+  "import json; print(json.loads(open('/data/bootstrap_log.jsonl').readlines()[-1])['ts'])"
+```
+
+An empty or missing log file means bootstrap has never successfully
+completed against this data volume — a real, actionable signal, not an
+error to ignore.
+
 ### The X-Internal-Auth header
 
 Every caller of `companion-auth`'s `GET /access_token` — `schwab-connector`
@@ -134,6 +152,18 @@ Credentials and the watched symbol live in `momentum_monitor/.env`
 (gitignored — see section 1–2 above for `AUTH_HELPER_URL` /
 `INTERNAL_AUTH_SECRET`). Set `WATCH_SYMBOL` there, then:
 
+**`CLAUDE_CREDENTIALS_PATH` is now also required in `.env` (added with
+phase 3 stage 1's narration service, `specs.md` §27) — `docker compose
+up`/`config` fails immediately, for ALL services, not just
+`claude-connector`, if it's unset** (compose evaluates every service's
+required variables before starting anything). Set it to the absolute
+path of the host's own `~/.claude/.credentials.json` (e.g.
+`CLAUDE_CREDENTIALS_PATH=/home/<user>/.claude/.credentials.json`) — this
+is the ONE file event-triggered narration needs (see `specs.md` §25); a
+missing or wrong path doesn't block the rest of the stack from running,
+it just means every `POST /api/narration/arm` call downstream fails
+loudly rather than narrating anything.
+
 ```bash
 cd momentum_monitor
 docker compose up --build         # STREAM_SOURCE defaults to "schwab"
@@ -201,19 +231,26 @@ docker compose exec monitor-app python -c \
 ## 4. Let it run — DoD check 2
 
 Leave it up for **several real minutes** during regular trading hours.
-`http://localhost:8012` updates in place via JS polling `GET /api/state`
-every 4 seconds and patching specific elements directly (price, VWAP,
-EMAs, MACD, levels, the journal section) — not a full-page reload. A
-full-page `<meta http-equiv="refresh">` every 5s was the original,
-unintended behavior here (a bug, not the design — it caused visible
-flicker) and has since been replaced with this in-place update mechanism.
+`http://localhost:8012` updates in place via a native
+`EventSource('/api/state/stream')` connection — genuine server push, not
+polling — patching specific elements directly (price, VWAP, EMAs, MACD,
+levels, the journal section) the instant `monitor-app`'s own state
+changes, not on any timer. This document previously described two
+superseded mechanisms, in order: a full-page `<meta http-equiv="refresh">`
+every 5s (the original, unintended behavior — a bug, not the design, it
+caused visible flicker), then a client-side `setInterval(refresh, 4000)`
+poll of `GET /api/state`. Both are gone; see `specs.md` §4/§5 for the
+full poll→push history if you're comparing against an old build.
 
-A "Pause updates" button in the top bar (next to the ticker box) can stop
-polling entirely — both this client-side display loop and, via
-`POST /api/polling`, `monitor-app`'s own server-side poll loop against
-`schwab-connector` (the one that actually costs anything; the client-side
-loop alone never left localhost/the LAN). Confirm it reads **live**, not
-**paused**, before treating a flat readout as meaningful for this check.
+A "Pause updates" button in the top bar (next to the ticker box) stops
+`monitor-app`'s own applying of incoming bar-push events from
+`schwab-connector` (`POST /api/polling` — the endpoint name and button
+are unchanged from the pre-push design, only what they gate changed).
+The browser's own `EventSource` connection stays open regardless — it
+just goes quiet, since the server stops broadcasting while paused; there
+is no separate client-side timer left to stop. Confirm it reads **live**,
+not **paused**, before treating a flat readout as meaningful for this
+check.
 
 Confirm `bar_count` climbs roughly one per 10 seconds and `last_price`
 tracks the tape.
