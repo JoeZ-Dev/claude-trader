@@ -4710,7 +4710,94 @@ unilaterally.
 `claude-connector`/narration remains the next, separate step — not
 started as part of this work.
 
-### 31. Roadmap / phases
+### 31. Bearish-signals display: investigation, and the framing fix
+
+**Reported live:** `DDC` showing three red "Bearish signals" chips while
+every other indicator (price above VWAP, above both EMAs, positive MACD
+histogram) read clearly bullish — the math wasn't wrong (real levels,
+real distances), but the display read like an overall bearish verdict
+on the stock rather than unrelated structural reference points.
+
+**Investigation, both questions answered with real data, not
+assumption.**
+
+1. **Are DDC's three levels genuinely well-grounded?** Reconstructed the
+   exact reported moment directly via `build_state` on the real captured
+   bar history (`schwab-connector/data/bars/DDC.jsonl`, ts=1790006010,
+   price=0.3614 — confirmed genuinely bullish: vwap=0.2741, ema9=0.3478,
+   ema20=0.3367, macd histogram=+0.001728). Yes: `support_breakdown`
+   (touch_count=6, strength_score=12.16, total_touch_volume=327,463) and
+   `micro_breakdown` (touch_count=11, strength_score=22.05,
+   total_touch_volume=90,369) are both real, substantial, non-spurious
+   detections — not weak or coincidental. They were simply 30-34% below
+   current price with no real touch in over 2 hours.
+2. **Is "at least one bearish chip regardless of trend" structural, or
+   DDC-specific?** Checked directly against every symbol actually
+   watched live at the time (`NCPL`, `GRML`, `LOBO`, `DDC`): ALL FOUR
+   showed all three non-VWAP breakdown chips (`round_number_breakdown`,
+   `micro_breakdown`, `support_breakdown`) simultaneously — including
+   `NCPL`, which was genuinely bullish by every other indicator at that
+   same moment. Confirmed structural, not case-specific:
+   `round_number_breakdown` is ALWAYS present by construction (there's
+   always a next round-number grid point below any price,
+   `requires_prior_touches=False`), and `support_breakdown`/
+   `micro_breakdown` fire for nearly any symbol with enough real bar
+   history, regardless of the current trend.
+
+**The fix, in two halves.** The underlying detection is never hidden —
+every real breakdown candidate is still returned exactly as before.
+
+1. **Data (`core/setup_types.py`):** each breakdown candidate now
+   carries `is_relevant` in its `factors` dict — near (within
+   `BREAKDOWN_NEAR_DISTANCE_PCT`=5% of current price — deliberately a
+   much looser threshold than `VWAP_PULLBACK_THRESHOLD_PCT`'s 0.5%
+   genuine-pullback definition, a different purpose, not reused blindly)
+   OR recently tested (within `BREAKDOWN_RECENT_TOUCH_SECONDS`=1800s of
+   a real `Level.last_touch_ts`) counts as relevant.
+   `round_number_breakdown` has no real touch history to be "recently
+   tested" by, so distance is its only signal; `vwap_breakdown` is
+   always relevant when present, since its own gating (a genuine
+   downtrend AND a shallow VWAP pullback, both already required just to
+   exist) already IS a relevance filter.
+2. **Display (`monitor-app/app.py`, both the Python-rendered and JS
+   live-update paths, kept in sync):** header reworded from "Bearish
+   signals (context only, not a trade opportunity)" to "Downside levels
+   to be aware of (structural context, not a directional signal)",
+   color changed from `--neg` (red/alarming) to `--muted`. Each chip's
+   prominence now scales with `is_relevant`: a distant/stale level gets
+   a new `breakdown-chip-distant` class (muted border/color, reduced
+   opacity) instead of the same alarming styling every candidate got
+   before, regardless of context — still fully rendered and expandable,
+   just visually de-emphasized rather than hidden or removed.
+
+**Structural entry-safety guarantee reconfirmed, not just assumed
+unaffected** — same standard as the original breakdown-variant
+guarantee (specs.md section 22): re-ran the existing break-then-fix
+structural proof (`test_breakdown_type_allowlist_break_then_fix`,
+`_ENTRY_ELIGIBLE_SETUP_TYPES` deliberately widened then restored) and
+the full parametrized non-entry test across all four breakdown types.
+Both pass unchanged — this fix touches none of `_ENTRY_ELIGIBLE_SETUP_
+TYPES`/`should_enter`/`advance_journal`.
+
+**Fix confirmed working, on the exact real reported case** — the
+requested real-evidence check, not just a new unit test: re-ran
+`build_state` on the identical real DDC bar slice used in the
+investigation (same ts=1790006010 moment, same genuinely-bullish
+overall readout) through the NOW-FIXED code. All three chips correctly
+flip to `is_relevant: False` (`round_number_breakdown` 16.99% away;
+`support_breakdown` 30.55% away, last real touch 7,950s/~2.2h earlier;
+`micro_breakdown` 34.2% away, last real touch 9,570s/~2.66h earlier),
+and the rendered HTML confirms both halves of the fix land together on
+this real case: the header reads "Downside levels to be aware of..."
+(not "Bearish signals"), and all three chips carry the
+`breakdown-chip-distant` class.
+
+Full suite: 94 core tests (+5 for `is_relevant`) and 428 monitor-app
+tests (+3 for the display de-emphasis), all pass, zero regressions.
+Not deployed as part of this work — production still runs the pre-fix
+display; deploying it is a separate step if/when requested.
+
+### 32. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,
