@@ -4103,7 +4103,164 @@ traffic while remaining ready to trip on real overuse (proven separately
 and precisely by the dedicated breaker tests in `test_journal_wiring.py`,
 using a deliberately low threshold).
 
-### 28. Roadmap / phases
+### 28. `build_state` performance incident — O(n) per-call recompute compounding to O(n^3) session cost
+
+**Process gap this section exists to close.** A smoke test and a profiling
+pass were both run in prior sessions, correctly instructed to leave no
+temporary investigation code committed — but "don't commit the
+investigation code" was never separately paired with "but DO commit the
+findings," so the diagnosis itself never made it into this document and
+was at real risk of being lost/re-derived from scratch by a future
+session. Recorded here in full, verified against the actual current code
+(not re-derived) before being relied on, per AGENT_PROTOCOL.md's
+equivalence-first discipline.
+
+**The original smoke-test finding.** `monitor-app/app.py`'s
+`_apply_new_bars` calls `state.py`'s `build_state(slot.bars, ...)`
+synchronously on every single incoming bar — both from `catch_up()`'s
+REST backfill and from `apply_bar_push()`'s one-bar-at-a-time push path
+(confirmed directly at `app.py:1148`, `app.py:1178`, `app.py:1202`).
+`build_state` recomputes VWAP, cumulative volume, EMA/MACD, relative
+volume, and level/swing-point detection from the ENTIRE accumulated bar
+history on every call — no incremental caching, no cooperative yield
+points. This is a known, deliberate tradeoff from phase 3.6 itself
+(`state.py`'s own module docstring: "Takes the full list of bars held so
+far and runs a COMPLETE recompute through momentum_monitor/core on every
+call... the core is cheap and full recompute keeps the app trivially
+correct," and further down: "ema/macd/relative_volume/hold-confirmation
+now all see the FULL backfilled+live series" — replacing the earlier
+bounded `live_cadence_tail` optimization, section 19) — chosen
+deliberately for time-aware-indicator correctness, at the cost of
+per-bar computation growing with total accumulated history. No
+backpressure exists between `schwab-connector` and `monitor-app`:
+confirmed directly in the original incident, `schwab-connector` had
+independently produced 3,940 bars while `monitor-app` was stuck at 1,254
+and never recovered after 5+ minutes.
+
+Three precise measurements from that incident (12 consecutive 10s
+timeouts, zero recovery, each reproduced on a repeat run of the same
+fixture):
+
+- Real AIFF capture (bars 0-12500), mixed cadence: locked at
+  `bar_count=1,254` — 12,530s (3h28m50s) of real session time processed.
+- Real AEMD capture (bars 0-7200), 60s cadence (never reached the 10s
+  portion): locked at `bar_count=923` — 18,700s (5h11m40s) of real
+  session time. Notably a LOWER bar count despite slower cadence,
+  because this segment's price action was choppier.
+- Real AIFF capture, isolated pure-10s stretch (bars 1761-5000 of the
+  same file), continuous 10s cadence, zero backfill: locked at
+  `bar_count=1,426` — 14,250s (3h57m30s) of continuous live-cadence
+  trading. The direct answer to "worst-case real-time-to-lockup under
+  continuous 10s cadence from market open."
+
+This 1,426-bar/~4-hour figure is data-volatility-dependent, not a
+universal floor — a sufficiently choppy stock under continuous 10s
+cadence could plausibly lock up meaningfully faster, per the AEMD
+comparison above.
+
+**The profiling diagnosis.** Measured on two independent real datasets
+(AIFF, AEMD) at 100/300/600/900/1200 bars, wrapping the actual
+production functions with wall-clock timers, no logic changed. Ranking
+of what actually dominates, at 1200 bars:
+
+- `relative_volume_time_aware`: AIFF 109.19ms (70.3% of total), AEMD
+  104.97ms (87.9% of total). Scaling from 100->1200 bars: AIFF 128x time
+  over 12x bars (~n^2.1), AEMD 109x time over 12x bars (~n^1.9) —
+  quadratic, the only component that is.
+- `detect_levels` (incl. `swing_points_time_aware`): AIFF 42.48ms
+  (27.4%), AEMD 11.08ms (9.3%). Scaling: AIFF ~n^1.24, AEMD ~n^0.55
+  (sub-linear).
+- `swing_points_time_aware` alone: AIFF 18.44ms (11.9%), AEMD 7.99ms
+  (6.7%). Scaling: AIFF ~n^0.98, AEMD sub-linear.
+- Everything else combined (`evaluate_hold_time_aware`,
+  `macd_time_aware`, `ema_time_aware`, `session_vwap`): AIFF 2.72ms
+  (1.7%), AEMD 2.54ms (2.0%) — roughly linear/flat throughout the tested
+  range.
+
+`relative_volume_time_aware`'s SHARE of total cost grows with bar count
+on both datasets (25.5%->70.3% on AIFF, 20.0%->87.9% on AEMD) — it's not
+just large, it's increasingly dominant. The pre-measurement hypothesis
+("swing-point detection is the main cost") is refuted by this data:
+`detect_levels`/`swing_points_time_aware` shrink as a SHARE of total
+cost as bar count grows on both datasets; they only looked dominant at
+low bar counts because `relative_volume_time_aware` hadn't yet grown
+large enough to overtake them. (`swing_points_time_aware`/`detect_
+levels` are otherwise explicitly OUT of scope for the fix that follows —
+proven not currently contributing to the wall, and a genuinely harder
+problem, since a bar's status can depend on later bars, deserving its
+own separate, later pass.)
+
+**Root cause, precise code trace** (`core/indicators.py`,
+`relative_volume_time_aware`, lines 184-204 as of this writing —
+verified to match exactly, re-read directly before recording this):
+
+```
+out = []
+for i, b in enumerate(bars):                              # outer: O(n)
+    if b["ts"] - bars[0]["ts"] < lookback_seconds:
+        out.append(1.0)
+        continue
+    window_idxs = [j for j in range(i)                     # inner: O(i) rescan from index 0
+                   if b["ts"] - lookback_seconds <= bars[j]["ts"] < b["ts"]]
+    ...
+return out
+```
+
+For every bar `i`, it rescans ALL `i` prior bars from index 0 to find
+which fall in the trailing `lookback_seconds` window, instead of a
+sliding two-pointer advance. One call with n bars costs O(n^2) by
+itself.
+
+**The O(n^2) -> O(n^3) correction.** The function computes a value for
+EVERY index in `bars` on ONE call, not just the last one — but
+`state.py`'s only call site is `relative_volume_time_aware(bars,
+...)[-1]` (`state.py:138`), invoked once per incoming bar, over the FULL
+growing history each time. So across a session of N bars, total cost is
+O(1^2) + O(2^2) + ... + O(N^2) — the sum of squares, which is O(N^3),
+not O(N^2). This means fixing ONLY the inner O(i) rescan (making a
+single call genuinely O(n) instead of O(n^2)) would reduce cumulative
+session cost from O(N^3) to O(N^2) — real progress, but the SAME
+underlying wall, just reached later, not actually fixed. The real fix
+must eliminate "recompute the whole history from scratch on every
+incoming bar" entirely: persistent, cross-call state (a window-start
+pointer, running sums) that survives BETWEEN calls, giving genuinely
+O(1) amortized cost per bar and O(N) total session cost.
+
+**Verification performed before recording this section** (not taking
+any of the above as ground truth without confirming it against the
+actual current code first):
+
+- `relative_volume_time_aware`'s code trace above matches
+  `core/indicators.py:184-204` exactly, unchanged since the original
+  diagnosis.
+- `state.py:138` confirmed as the only call site, `[-1]`-indexed, fed
+  `bars` (the full accumulated per-symbol history, not a bounded tail —
+  `build_state`'s own docstring and the `closes`/`timestamps` lists
+  built from the full `bars` parameter confirm this).
+- `app.py:1134-1202` confirmed: `_apply_new_bars` calls `build_state`
+  unconditionally on every call, and `apply_bar_push` calls
+  `_apply_new_bars` with a single-bar list for every pushed bar — no
+  batching, no dropped/coalesced ticks, no backpressure of any kind
+  between the arrival rate and `build_state`'s cost.
+- A fresh, independent profiling run (same method: wall-clock around the
+  real production functions, real AIFF/AEMD data, same 100/300/600/900/
+  1200 checkpoints, this session, different hardware than the original
+  measurements) reproduces the same SHAPE of result: `relative_volume_
+  time_aware` dominant and growing in share (61%->93% AIFF, 52%->97%
+  AEMD in this run), scaling close to quadratic (~n^2.06 AIFF, ~n^2.10
+  AEMD, 100->1200 bars), `detect_levels` shrinking as a share as n
+  grows, everything else small and roughly linear. Absolute millisecond
+  values differ from the original run (different machine), but the
+  qualitative diagnosis — which function dominates, that it's the only
+  quadratic one, that its dominance grows with n — holds exactly.
+
+Stage 1 (auditing whether `session_vwap`/`ema_time_aware`/`macd_time_
+aware`/`evaluate_hold_time_aware` are already genuinely incremental, or
+just cheap enough to look flat in the tested range) and the redesign
+that follows are recorded in the section(s) that follow this one as that
+work completes.
+
+### 29. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,
@@ -4287,6 +4444,27 @@ using a deliberately low threshold).
    review against the user's own judgment. See section 6 for the full
    design — notably, no fixed target: a trailing stop only, by deliberate
    choice, not the "entry/stop/target" originally sketched here.
+3.7. **`build_state` incremental architecture (in progress).** Not a new
+   feature — a fix for a real production performance defect found via a
+   smoke test and profiling pass, both run against real captured data
+   (AIFF, AEMD). `build_state` recomputes the full per-symbol indicator
+   set from the ENTIRE accumulated bar history on every incoming bar,
+   with `relative_volume_time_aware`'s inner-loop rescan making that
+   ONE dominant, quadratic-per-call cost that compounds to O(n^3) total
+   session cost — a real lockup reproduced directly (session stalls
+   after roughly 1,200-1,400 bars of continuous 10s-cadence trading).
+   Full incident, root-cause trace, and the O(n^3) correction: section
+   28 (stage 0, documented 2026-09-21). Stage 1 (audit whether
+   `session_vwap`/`ema_time_aware`/`macd_time_aware`/`evaluate_hold_
+   time_aware` are already genuinely incremental or just cheap enough to
+   look flat at the tested bar counts), stage 2 (incremental redesign,
+   equivalence-proven), and stage 3 (re-run the original lockup replay
+   to prove the wall is actually gone, with real timing evidence) are
+   explicitly OUT of scope for `swing_points_time_aware`/`detect_
+   levels` — proven not currently contributing to the wall, and
+   deserving their own later, separate pass (a bar's status there can
+   depend on later bars, a harder problem). Recorded here as work
+   progresses.
 5. Anything beyond this point (more autonomy, live execution) requires
    its own explicit design discussion and is not assumed by this roadmap.
 
