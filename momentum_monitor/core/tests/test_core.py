@@ -11,6 +11,7 @@ from indicators import (
 from levels import (
     confirmed_swing_lows, detect_levels, evaluate_hold,
     evaluate_hold_time_aware, swing_points_time_aware, _swing_points,
+    EvaluateHoldTimeAwareState,
 )
 
 
@@ -159,6 +160,104 @@ def test_macd_time_aware_state_from_series_matches_stepping_from_empty():
     assert rebuilt.fast.value == stepped.fast.value
     assert rebuilt.slow.value == stepped.slow.value
     assert rebuilt.signal.value == stepped.signal.value
+
+
+# -- EvaluateHoldTimeAwareState (specs.md section 28/29, build_state
+# incremental architecture, stage 2, function 3 of 5) --------------------
+#
+# evaluate_hold_time_aware's own bar_end_ts computation peeks at the NEXT
+# bar's ts when one exists (bars[i+1]["ts"]), falling back to an assumed
+# reference-width estimate ONLY for whichever bar is currently last in
+# the list -- the same "duration isn't knowable until the next bar
+# arrives" problem relative_volume_time_aware's own durations have. The
+# incremental version below handles it with a one-bar-delayed commit: the
+# most recently processed bar stays "pending" (its own elapsed_seconds/
+# confirmed check uses the estimate, exactly matching what a fresh full
+# recompute over the bars seen so far would also do for its own last
+# bar) until the ACTUAL next bar arrives, at which point it's committed
+# using that bar's real ts as its bar_end_ts -- also exactly matching
+# what a fresh full recompute over the now-longer bars list would do,
+# since old code always has real lookahead available for every bar
+# except its own last one.
+
+def test_evaluate_hold_time_aware_state_matches_full_recompute_above():
+    # Real AIFF data, direction="above", a level price (1.15) chosen from
+    # the real close range (0.926-1.439 over this session) to produce
+    # genuine on-side/off-side transitions, not a level so extreme it
+    # never triggers anything.
+    bars = _load_real_bars("AIFF", limit=3538)
+    level_price = 1.15
+    state = EvaluateHoldTimeAwareState.from_bars([], level_price, direction="above")
+    for i in range(len(bars)):
+        got = state.update(bars[i])
+        want = evaluate_hold_time_aware(bars[:i + 1], level_price, direction="above")
+        assert got.confirmed == want.confirmed, f"confirmed mismatch at real bar {i}"
+        assert got.confirmed_at_ts == want.confirmed_at_ts, f"confirmed_at_ts mismatch at real bar {i}"
+        assert got.elapsed_seconds == want.elapsed_seconds, f"elapsed_seconds mismatch at real bar {i}"
+        assert got.failed_attempts == want.failed_attempts, f"failed_attempts mismatch at real bar {i}"
+
+
+def test_evaluate_hold_time_aware_state_matches_full_recompute_below():
+    # Same real data, direction="below", a different level (1.30) so the
+    # on-side condition (close < level) also produces real transitions.
+    bars = _load_real_bars("AIFF", limit=3538)
+    level_price = 1.30
+    state = EvaluateHoldTimeAwareState.from_bars([], level_price, direction="below")
+    for i in range(len(bars)):
+        got = state.update(bars[i])
+        want = evaluate_hold_time_aware(bars[:i + 1], level_price, direction="below")
+        assert got.confirmed == want.confirmed, f"confirmed mismatch at real bar {i}"
+        assert got.confirmed_at_ts == want.confirmed_at_ts, f"confirmed_at_ts mismatch at real bar {i}"
+        assert got.elapsed_seconds == want.elapsed_seconds, f"elapsed_seconds mismatch at real bar {i}"
+        assert got.failed_attempts == want.failed_attempts, f"failed_attempts mismatch at real bar {i}"
+
+
+def test_evaluate_hold_time_aware_state_matches_full_recompute_with_watch_added_ts():
+    # Real AIFF data with a real watch_added_ts set partway through the
+    # session (specs.md section 19/20's confirmation-freshness guard) --
+    # must produce the same False-until-watch, then-eligible transition
+    # as the bar-count version, not just match when the guard is inert.
+    bars = _load_real_bars("AIFF", limit=3538)
+    level_price = 1.15
+    watch_added_ts = bars[1800]["ts"]
+    state = EvaluateHoldTimeAwareState.from_bars([], level_price, direction="above",
+                                                 watch_added_ts=watch_added_ts)
+    for i in range(len(bars)):
+        got = state.update(bars[i])
+        want = evaluate_hold_time_aware(bars[:i + 1], level_price, direction="above",
+                                        watch_added_ts=watch_added_ts)
+        assert got.confirmed == want.confirmed, f"confirmed mismatch at real bar {i}"
+        assert got.confirmed_at_ts == want.confirmed_at_ts, f"confirmed_at_ts mismatch at real bar {i}"
+
+
+def test_evaluate_hold_time_aware_state_from_bars_matches_stepping_from_empty():
+    # The one-time rebuild path must land in the exact same state as
+    # stepping incrementally from empty would -- including the
+    # one-bar-delayed pending/committed split (from_bars must commit
+    # every bar except the last using REAL lookahead, matching what
+    # continuous update() calls would eventually settle into).
+    bars = _load_real_bars("AIFF", limit=3538)
+    level_price = 1.15
+    stepped = EvaluateHoldTimeAwareState.from_bars([], level_price, direction="above")
+    for b in bars:
+        stepped.update(b)
+    rebuilt = EvaluateHoldTimeAwareState.from_bars(bars, level_price, direction="above")
+    assert rebuilt.confirmed == stepped.confirmed
+    assert rebuilt.confirmed_at_ts == stepped.confirmed_at_ts
+    assert rebuilt.elapsed_seconds == stepped.elapsed_seconds
+    assert rebuilt.failed_attempts == stepped.failed_attempts
+    assert rebuilt.streak_start_ts == stepped.streak_start_ts
+    assert rebuilt.was_attempting == stepped.was_attempting
+    assert rebuilt.pending_bar == stepped.pending_bar
+
+
+def test_evaluate_hold_time_aware_state_fresh_instance_starts_empty():
+    state = EvaluateHoldTimeAwareState.from_bars([], 1.0, direction="above")
+    assert state.confirmed is False
+    assert state.confirmed_at_ts is None
+    assert state.failed_attempts == 0
+    assert state.streak_start_ts is None
+    assert state.pending_bar is None
 
 
 def test_ema_converges_toward_flat_input():

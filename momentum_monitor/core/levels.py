@@ -513,3 +513,140 @@ def evaluate_hold_time_aware(
         elapsed_seconds=elapsed_seconds, confirmed=confirmed,
         failed_attempts=failed_attempts, confirmed_at_ts=confirmed_at_ts,
     )
+
+
+def _hold_step(streak_start_ts, failed_attempts, confirmed, confirmed_at_ts,
+               was_attempting, bar, bar_end_ts, level_price, direction,
+               required_seconds, watch_added_ts):
+    """One iteration of `evaluate_hold_time_aware`'s loop body, factored
+    out so it can be reused for both a real-lookahead COMMIT (bar_end_ts
+    = the actual next bar's ts) and an estimated-lookahead PROVISIONAL
+    evaluation (bar_end_ts = this bar's own ts + reference_interval_
+    seconds, the same fallback the bar-count version uses for whichever
+    bar is currently last) -- see `EvaluateHoldTimeAwareState` below.
+    Identical logic to the loop body, just parameterized on bar_end_ts
+    instead of computing it inline from a `bars` list index."""
+    on_side = bar["close"] > level_price if direction == "above" else bar["close"] < level_price
+    elapsed_seconds = 0.0
+    if on_side:
+        if streak_start_ts is None:
+            streak_start_ts = bar["ts"]
+        was_attempting = True
+        elapsed_seconds = bar_end_ts - streak_start_ts
+        if elapsed_seconds >= required_seconds and (
+                watch_added_ts is None or bar["ts"] >= watch_added_ts):
+            confirmed = True
+            confirmed_at_ts = bar["ts"]
+    else:
+        if was_attempting and streak_start_ts is not None and not confirmed:
+            failed_attempts += 1
+        streak_start_ts = None
+        elapsed_seconds = 0.0
+        was_attempting = False
+    return streak_start_ts, failed_attempts, confirmed, confirmed_at_ts, was_attempting, elapsed_seconds
+
+
+@dataclass
+class EvaluateHoldTimeAwareState:
+    """Persistent, incremental sibling of `evaluate_hold_time_aware`
+    (specs.md section 28/29, build_state incremental architecture):
+    `update()` is fed ONE new bar at a time, instead of the caller
+    rebuilding the entire streak/confirmation state machine from `bars[0]`
+    on every call.
+
+    Bound to a SPECIFIC `level_price`/`direction` pair, same as the
+    bar-count version's own arguments -- if the caller (monitor-app/
+    state.py's level selection, which reruns `detect_levels` every call
+    and can pick a DIFFERENT level over time) needs to track a different
+    level, that's a NEW `EvaluateHoldTimeAwareState` (via `from_bars`),
+    not something this class detects or handles itself -- the same
+    "caller owns the boundary decision" split `SessionVwapState` uses for
+    session rollover.
+
+    One-bar-delayed commit (the real complication here, absent from the
+    other four functions): `bar_end_ts` for a given bar is the actual
+    NEXT bar's ts when one exists, or an estimate
+    (`bar["ts"] + reference_interval_seconds`) ONLY for whichever bar is
+    currently last -- so a bar's own contribution to the streak can't be
+    fully, correctly finalized until the bar AFTER it has arrived. This
+    class holds the most recently processed bar as `pending_bar`: its
+    own elapsed_seconds/confirmed check uses the ESTIMATE (matching what
+    a fresh full recompute over the bars seen so far would ALSO do for
+    its own last bar) until `update()` is next called, at which point
+    `pending_bar` is committed using the new bar's real ts as its
+    bar_end_ts (matching what a fresh full recompute over the
+    now-longer list would do, since real lookahead is always available
+    for every bar except the list's own last one)."""
+    level_price: float
+    direction: str = "above"
+    required_seconds: float = 30.0
+    reference_interval_seconds: float = 10.0
+    watch_added_ts: float | None = None
+    streak_start_ts: float | None = None
+    failed_attempts: int = 0
+    confirmed: bool = False
+    confirmed_at_ts: float | None = None
+    was_attempting: bool = False
+    elapsed_seconds: float = 0.0
+    pending_bar: dict | None = None
+
+    def update(self, bar: dict) -> HoldStateTimeAware:
+        if self.pending_bar is not None:
+            # The bar that was pending now has a real next bar -- commit
+            # it with its REAL bar_end_ts, exactly as a fresh recompute
+            # over the now-longer bars list would for that same index.
+            (self.streak_start_ts, self.failed_attempts, self.confirmed,
+             self.confirmed_at_ts, self.was_attempting, _) = _hold_step(
+                self.streak_start_ts, self.failed_attempts, self.confirmed,
+                self.confirmed_at_ts, self.was_attempting, self.pending_bar,
+                bar["ts"], self.level_price, self.direction,
+                self.required_seconds, self.watch_added_ts,
+            )
+        self.pending_bar = bar
+        # Provisional: this bar is now the newest, so its OWN bar_end_ts
+        # uses the same estimate the bar-count version's fallback does --
+        # NOT committed into streak_start_ts/failed_attempts/was_attempting
+        # above, since it's subject to revision once the real next bar
+        # arrives.
+        (_, provisional_failed_attempts, provisional_confirmed,
+         provisional_confirmed_at_ts, _, provisional_elapsed_seconds) = _hold_step(
+            self.streak_start_ts, self.failed_attempts, self.confirmed,
+            self.confirmed_at_ts, self.was_attempting, bar,
+            bar["ts"] + self.reference_interval_seconds, self.level_price,
+            self.direction, self.required_seconds, self.watch_added_ts,
+        )
+        self.elapsed_seconds = provisional_elapsed_seconds
+        return HoldStateTimeAware(
+            level_price=self.level_price, direction=self.direction,
+            elapsed_seconds=provisional_elapsed_seconds,
+            confirmed=provisional_confirmed,
+            failed_attempts=provisional_failed_attempts,
+            confirmed_at_ts=provisional_confirmed_at_ts,
+        )
+
+    @classmethod
+    def from_bars(cls, bars: list[dict], level_price: float, direction: str = "above",
+                  required_seconds: float = 30.0, reference_interval_seconds: float = 10.0,
+                  watch_added_ts: float | None = None) -> "EvaluateHoldTimeAwareState":
+        """One-time rebuild from a full bar history -- same use (a fresh
+        watch's first backfill batch, or a restart reconstruction) as
+        `SessionVwapState.from_bars`. Commits every bar except the last
+        using REAL lookahead (available since the full list is given up
+        front), leaving only the actual last bar pending -- landing in
+        exactly the state continuous `update()` calls from empty would
+        have produced."""
+        state = cls(level_price=level_price, direction=direction,
+                    required_seconds=required_seconds,
+                    reference_interval_seconds=reference_interval_seconds,
+                    watch_added_ts=watch_added_ts)
+        for i in range(len(bars) - 1):
+            (state.streak_start_ts, state.failed_attempts, state.confirmed,
+             state.confirmed_at_ts, state.was_attempting, _) = _hold_step(
+                state.streak_start_ts, state.failed_attempts, state.confirmed,
+                state.confirmed_at_ts, state.was_attempting, bars[i],
+                bars[i + 1]["ts"], level_price, direction, required_seconds,
+                watch_added_ts,
+            )
+        if bars:
+            state.update(bars[-1])  # sets pending_bar, computes the provisional result
+        return state
