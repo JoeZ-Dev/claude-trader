@@ -10,7 +10,8 @@ A "bar" is a plain dict: {"ts": <unix seconds>, "open": float, "high": float,
 "low": float, "close": float, "volume": float, "is_extended": bool}
 """
 from __future__ import annotations
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 
 
 def session_vwap(bars: list[dict]) -> list[float]:
@@ -339,6 +340,123 @@ def relative_volume_time_aware(bars: list[dict], lookback_seconds: float = 200.0
             cur_rate = b["volume"] / _bar_duration(bars, i, reference_interval_seconds)
         out.append(cur_rate / avg if avg > 0 else 1.0)
     return out
+
+
+@dataclass(frozen=True)
+class _RelvolWindowEntry:
+    ts: float
+    volume: float
+    duration: float
+
+
+@dataclass
+class RelativeVolumeState:
+    """Persistent, incremental sibling of `relative_volume_time_aware`
+    (specs.md section 28/29, build_state incremental architecture -- the
+    ORIGINAL dominant, quadratic-per-call cost the whole incident started
+    from): `update()` is fed ONE new bar at a time, maintaining a sliding
+    window (a `deque` plus running sums) instead of the caller rescanning
+    ALL prior bars from index 0 on every call.
+
+    Same one-bar-delayed lookahead problem as `EvaluateHoldTimeAwareState`
+    (a bar's own duration, `_bar_duration`, depends on the NEXT bar's ts):
+    the most recently processed bar stays `pending_bar` -- its own rate
+    is computed using the reference-width ESTIMATE (matching the
+    bar-count version's fallback for whichever bar is currently last)
+    until `update()` is next called, at which point it's folded into the
+    window with its REAL finalized duration (new_bar.ts - pending_bar.ts)
+    -- exactly matching what a fresh full recompute over the now-longer
+    bars list would produce, since real lookahead is always available for
+    every window element (window bars are always j < i, so bars[j+1]
+    always exists by the time index i is being computed) except the
+    list's own last bar.
+
+    The uniform-vs-mixed-duration branch (specs.md section 16) is
+    tracked via a running `nonuniform_count` (incremented/decremented as
+    a duration != `reference_interval_seconds` entry enters/leaves the
+    window) instead of rechecking every window element's duration on
+    every call."""
+    lookback_seconds: float = 200.0
+    reference_interval_seconds: float = 10.0
+    first_ts: float | None = None
+    pending_bar: dict | None = None
+    window: deque = field(default_factory=deque)  # _RelvolWindowEntry, chronological
+    sum_vol: float = 0.0
+    sum_dur: float = 0.0
+    nonuniform_count: int = 0
+
+    def _evict_before(self, cutoff_ts: float) -> None:
+        while self.window and self.window[0].ts < cutoff_ts:
+            entry = self.window.popleft()
+            self.sum_vol -= entry.volume
+            self.sum_dur -= entry.duration
+            if entry.duration != self.reference_interval_seconds:
+                self.nonuniform_count -= 1
+
+    def update(self, bar: dict) -> float:
+        if self.first_ts is None:
+            self.first_ts = bar["ts"]
+        if self.pending_bar is not None:
+            # The pending bar now has a real next bar -- fold it into the
+            # window with its REAL finalized duration, same as a fresh
+            # recompute over the now-longer bars list would for that
+            # same index (window elements always have real lookahead).
+            duration = bar["ts"] - self.pending_bar["ts"]
+            entry = _RelvolWindowEntry(ts=self.pending_bar["ts"],
+                                       volume=self.pending_bar["volume"],
+                                       duration=duration)
+            self.window.append(entry)
+            self.sum_vol += entry.volume
+            self.sum_dur += entry.duration
+            if entry.duration != self.reference_interval_seconds:
+                self.nonuniform_count += 1
+        self.pending_bar = bar
+        self._evict_before(bar["ts"] - self.lookback_seconds)
+
+        if bar["ts"] - self.first_ts < self.lookback_seconds:
+            return 1.0
+        if not self.window:
+            return 1.0
+        if self.nonuniform_count == 0:
+            avg = self.sum_vol / len(self.window)
+            cur_rate = bar["volume"]
+        else:
+            avg = self.sum_vol / self.sum_dur
+            # This bar is now the newest, so its own duration isn't
+            # known yet -- the same reference-width estimate the
+            # bar-count version's `_bar_duration` fallback uses.
+            cur_rate = bar["volume"] / self.reference_interval_seconds
+        return cur_rate / avg if avg > 0 else 1.0
+
+    @classmethod
+    def from_bars(cls, bars: list[dict], lookback_seconds: float = 200.0,
+                  reference_interval_seconds: float = 10.0) -> "RelativeVolumeState":
+        """One-time rebuild from a full bar history -- same use (a fresh
+        watch's first backfill batch, or a restart reconstruction) as
+        `SessionVwapState.from_bars`/`EvaluateHoldTimeAwareState.
+        from_bars`. Builds the final window directly from the real,
+        finalized durations of whichever bars fall in the LAST bar's own
+        lookback window (every one of them has real lookahead available,
+        since the full list is given up front) -- landing in exactly the
+        state continuous `update()` calls from empty would have produced."""
+        state = cls(lookback_seconds=lookback_seconds,
+                    reference_interval_seconds=reference_interval_seconds)
+        if not bars:
+            return state
+        state.first_ts = bars[0]["ts"]
+        last = bars[-1]
+        for j in range(len(bars) - 1):
+            bj = bars[j]
+            if last["ts"] - lookback_seconds <= bj["ts"] < last["ts"]:
+                duration = _bar_duration(bars, j, reference_interval_seconds)
+                entry = _RelvolWindowEntry(ts=bj["ts"], volume=bj["volume"], duration=duration)
+                state.window.append(entry)
+                state.sum_vol += entry.volume
+                state.sum_dur += entry.duration
+                if entry.duration != reference_interval_seconds:
+                    state.nonuniform_count += 1
+        state.pending_bar = last
+        return state
 
 
 def continuation_days(daily_bars: list[dict], *, lookback_days: int,

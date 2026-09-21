@@ -7,6 +7,7 @@ from indicators import (
     continuation_days, session_vwap, ema, macd, relative_volume,
     ema_time_aware, relative_volume_time_aware, macd_time_aware,
     SessionVwapState, EmaTimeAwareState, MacdTimeAwareState,
+    RelativeVolumeState,
 )
 from levels import (
     confirmed_swing_lows, detect_levels, evaluate_hold,
@@ -258,6 +259,101 @@ def test_evaluate_hold_time_aware_state_fresh_instance_starts_empty():
     assert state.failed_attempts == 0
     assert state.streak_start_ts is None
     assert state.pending_bar is None
+
+
+# -- RelativeVolumeState (specs.md section 28/29, build_state
+# incremental architecture, stage 2, function 4 of 5 -- the ORIGINAL
+# dominant, quadratic-per-call cost the whole incident started from) ----
+#
+# Same one-bar-delayed lookahead problem as EvaluateHoldTimeAwareState
+# (a window bar's own duration depends on the NEXT bar's ts), but with a
+# sliding window instead of a single streak: bars enter the window as
+# "pending" (self-rate computed with the reference-width estimate, same
+# fallback the bar-count version uses for whichever bar is currently
+# last) and get folded into the window's running sums, with a REAL
+# finalized duration, only once the actual next bar arrives. Eviction
+# (bars aging out of `lookback_seconds`) and the uniform-vs-mixed-
+# duration branch (tracked via a running `nonuniform_count` instead of
+# rechecking every window element every call) are both maintained
+# incrementally as bars enter and leave.
+#
+# The exhaustive real-data comparisons below call the ACTUAL bar-count
+# relative_volume_time_aware(bars[:i+1])[-1] at each step, not a
+# hand-duplicated copy of its logic -- genuine end-to-end proof against
+# the real function, not against a reimplementation that could carry the
+# same bug both ways. This is deliberately capped at a few hundred bars
+# exhaustively (that function's OWN O(n^2)-per-call cost makes a full
+# cumulative walk cost O(n^3) -- the exact defect this whole redesign
+# exists to fix) with sparse full-session checkpoints beyond that.
+
+def test_relative_volume_state_matches_full_recompute_exhaustively_on_real_aiff_data():
+    # Real AIFF data, first 900 bars -- matches one of the original
+    # profiling checkpoints (100/300/600/900/1200), spans the real
+    # premarket-backfill (60s) to live (10s) cadence transition, so both
+    # the uniform and mixed-duration branches get exercised, not just one.
+    bars = _load_real_bars("AIFF", limit=900)
+    state = RelativeVolumeState()
+    for i in range(len(bars)):
+        got = state.update(bars[i])
+        want = relative_volume_time_aware(bars[:i + 1])[-1]
+        assert got == want, f"mismatch at real bar {i}"
+
+
+def test_relative_volume_state_matches_full_recompute_exhaustively_on_real_aemd_data():
+    # Real AEMD data, first 600 bars -- uniform 60s cadence throughout
+    # (confirmed directly: every gap in this range is exactly 60s), which
+    # is a DIFFERENT real shape than AIFF's mixed transition: since 60s
+    # != the 10s reference_interval_seconds default, every window here
+    # takes the rate-based branch, never the raw-volume uniform fast path.
+    bars = _load_real_bars("AEMD", limit=600)
+    state = RelativeVolumeState()
+    for i in range(len(bars)):
+        got = state.update(bars[i])
+        want = relative_volume_time_aware(bars[:i + 1])[-1]
+        assert got == want, f"mismatch at real bar {i}"
+
+
+def test_relative_volume_state_matches_full_recompute_at_sparse_real_aiff_checkpoints():
+    # Beyond the exhaustive range: a single incremental pass through the
+    # REAL AIFF fixture's entire first session (3,538 bars, spanning all
+    # 4 real backfill/live transitions in that session), checked against
+    # a full recompute at sparse checkpoints -- exhaustive at this length
+    # would cost O(n^3) via the reference implementation itself (the
+    # exact defect being fixed), so this instead proves the incremental
+    # walk stays correct far past the exhaustively-checked range without
+    # paying that cost.
+    bars = _load_real_bars("AIFF", limit=3538)
+    state = RelativeVolumeState()
+    checkpoints = set(range(899, len(bars), 250)) | {len(bars) - 1}
+    for i in range(len(bars)):
+        got = state.update(bars[i])
+        if i in checkpoints:
+            want = relative_volume_time_aware(bars[:i + 1])[-1]
+            assert got == want, f"mismatch at real bar {i}"
+
+
+def test_relative_volume_state_from_bars_matches_stepping_from_empty():
+    bars = _load_real_bars("AIFF", limit=900)
+    stepped = RelativeVolumeState()
+    for b in bars:
+        stepped.update(b)
+    rebuilt = RelativeVolumeState.from_bars(bars)
+    assert rebuilt.sum_vol == stepped.sum_vol
+    assert rebuilt.sum_dur == stepped.sum_dur
+    assert rebuilt.nonuniform_count == stepped.nonuniform_count
+    assert list(rebuilt.window) == list(stepped.window)
+    assert rebuilt.pending_bar == stepped.pending_bar
+    assert rebuilt.first_ts == stepped.first_ts
+
+
+def test_relative_volume_state_fresh_instance_starts_empty():
+    state = RelativeVolumeState()
+    assert state.first_ts is None
+    assert state.pending_bar is None
+    assert len(state.window) == 0
+    assert state.sum_vol == 0.0
+    assert state.sum_dur == 0.0
+    assert state.nonuniform_count == 0
 
 
 def test_ema_converges_toward_flat_input():
