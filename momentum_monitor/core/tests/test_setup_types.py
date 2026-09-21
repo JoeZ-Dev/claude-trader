@@ -360,6 +360,113 @@ def test_breakdown_candidates_sorted_ascending_by_dollar_distance():
     assert distances == sorted(distances)
 
 
+# -- breakdown relevance (specs.md section 31): a real level far below
+# price with no recent action reads very differently from one close by
+# or recently retested -- these candidates carry an explicit "is_relevant"
+# factor for the display layer to act on, WITHOUT hiding the underlying
+# detection (still returned either way) or touching entry logic at all --
+
+def _monotonic_drift_bars(trough=6.90):
+    """One early touch of `trough` (a real swing low, bracketed for
+    detect_levels the same way _double_bottom_bars is), then 60 bars of
+    STRICTLY monotonic upward drift -- no repeated local lows, so no
+    competing support level forms in the drift itself (a real risk with
+    an oscillating drift, confirmed while building this fixture)."""
+    bars = []
+    ts = 0
+    for p in [8.6, 8.2, 7.6, trough, 7.5, 8.1, 8.6]:
+        bars.append(bar(ts, p, p + 0.05, p - 0.05, p, 50_000)); ts += 60
+    p = 8.6
+    for _ in range(60):
+        p += 0.01
+        bars.append(bar(ts, p, p + 0.03, p - 0.03, p, 40_000)); ts += 60
+    return bars
+
+
+def _stale_touch_bars(trough=6.90):
+    return _monotonic_drift_bars(trough)
+
+
+def _fresh_retouch_bars(trough=6.90):
+    """Same base as `_stale_touch_bars`, plus a SECOND, recent touch of
+    the exact same level (bracketed the same way as the first), then a
+    couple more bars -- real elapsed gap to `bars[-1]` is 300s either
+    way this fixture is used, well under BREAKDOWN_RECENT_TOUCH_SECONDS."""
+    bars = _monotonic_drift_bars(trough)
+    ts = bars[-1]["ts"] + 60
+    for p in [7.4, 7.0, trough, 7.5, 8.1, 8.6]:
+        bars.append(bar(ts, p, p + 0.05, p - 0.05, p, 50_000)); ts += 60
+    for p in [9.0, 9.2]:
+        bars.append(bar(ts, p, p + 0.05, p - 0.05, p, 40_000)); ts += 60
+    return bars
+
+
+def test_support_breakdown_not_relevant_when_far_and_stale():
+    # Direct real-data mirror of the DDC finding: a genuine, well-formed
+    # level (real touch, real strength) that's both far from current
+    # price and hasn't been touched in a long time.
+    bars = _stale_touch_bars()
+    current_price = 9.2  # ~26% above the level -- far by distance
+    candidates = evaluate_breakdown_setups(bars, current_price, vwap=None)
+    support = next(c for c in candidates if c.setup_type == "support_breakdown")
+    assert support.factors["is_relevant"] is False
+    # Still fully present and real -- never hidden.
+    assert support.factors["touch_count"] == 1
+    assert support.trigger_price == 6.85
+
+
+def test_support_breakdown_relevant_when_recently_retouched_even_if_far():
+    bars = _fresh_retouch_bars()
+    current_price = 9.2  # same far distance as the stale case above
+    candidates = evaluate_breakdown_setups(bars, current_price, vwap=None)
+    support = next(c for c in candidates if c.setup_type == "support_breakdown")
+    assert support.factors["is_relevant"] is True
+    assert support.factors["touch_count"] == 2
+    assert support.factors["seconds_since_last_touch"] == 300
+
+
+def test_support_breakdown_relevant_when_near_even_if_stale():
+    bars = _stale_touch_bars()
+    current_price = 7.0  # ~2.1% above the level -- near, despite the old touch
+    candidates = evaluate_breakdown_setups(bars, current_price, vwap=None)
+    support = next(c for c in candidates if c.setup_type == "support_breakdown")
+    assert support.factors["is_relevant"] is True
+
+
+def test_round_number_breakdown_relevant_only_when_near():
+    # The round-number GRID scales with price (specs.md section 6's
+    # tiering, _round_number_increment): a fixed $0.10-$0.50 increment is
+    # a small % of a higher price but a LARGE % of a low one -- 0.19 is
+    # 47% above its nearest $0.10 grid point below, genuinely far by any
+    # reasonable relevance standard, unlike 24.6's 0.4% gap to $24.50.
+    live_bars = [bar(0, 24.5, 24.55, 24.45, 24.5, 10_000)]
+    near = evaluate_breakdown_setups(live_bars, current_price=24.6, vwap=None)
+    far = evaluate_breakdown_setups(live_bars, current_price=0.19, vwap=None)
+    near_rn = next(c for c in near if c.setup_type == "round_number_breakdown")
+    far_rn = next(c for c in far if c.setup_type == "round_number_breakdown")
+    assert near_rn.factors["is_relevant"] is True
+    # A round-number level has no real touch history to be "recently
+    # tested" by -- distance is the ONLY signal for it, unlike a real
+    # detected support/resistance level.
+    assert far_rn.factors["is_relevant"] is False
+
+
+def test_vwap_breakdown_is_always_relevant_when_present():
+    # Its own gating (a genuine downtrend + a shallow pullback, both
+    # already required just to appear at all) already IS a relevance
+    # filter -- it never shows up as a stale/far candidate in the first
+    # place, so it's always relevant when present.
+    vwap = 10.0
+    live_bars = [
+        bar(0, 10.1, 10.15, 9.95, 9.98, 20_000),
+        bar(60, 9.98, 10.05, 9.85, 9.92, 25_000),
+        bar(120, 9.92, 10.0, 9.8, 9.85, 22_000),
+    ]
+    candidates = evaluate_breakdown_setups(live_bars, current_price=9.97, vwap=vwap)
+    breakdown = next(c for c in candidates if c.setup_type == "vwap_breakdown")
+    assert breakdown.factors["is_relevant"] is True
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

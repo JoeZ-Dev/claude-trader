@@ -67,6 +67,41 @@ MICRO_SWING_WINDOW = 1
 # any old visit near it at some point in the session.
 VWAP_PULLBACK_THRESHOLD_PCT = 0.005
 
+# Breakdown-candidate RELEVANCE (specs.md section 31 -- the "bearish
+# signals reads as an overall verdict" framing fix): a real detected
+# level is always returned (never hidden -- the underlying detection
+# stays legitimate information), but round_number_breakdown is
+# structurally ALWAYS present (there is always a next round-number grid
+# point below any price) and support_breakdown/micro_breakdown are
+# present for nearly any symbol with enough bar history, REGARDLESS of
+# whether the level has anything to do with the CURRENT trend -- so
+# "is_relevant" below is a separate signal the display layer uses to
+# de-emphasize a level that's neither close by nor recently in play,
+# rather than showing every breakdown candidate with identical visual
+# weight no matter the context.
+#
+# BREAKDOWN_NEAR_DISTANCE_PCT: how close a level's trigger price has to
+# be to current price, as a fraction of current price, to count as
+# structurally "near" on its own. Deliberately a much LOOSER threshold
+# than VWAP_PULLBACK_THRESHOLD_PCT above (0.5%) -- that constant defines
+# a genuine, tight pullback CONDITION for a setup to exist at all; this
+# one is a broader "close enough to plausibly matter soon" cutoff for a
+# level that already exists, a different purpose, not reused blindly.
+BREAKDOWN_NEAR_DISTANCE_PCT = 0.05
+
+# BREAKDOWN_RECENT_TOUCH_SECONDS: how recently (real elapsed seconds) a
+# level's last REAL touch has to have been to count as "recently
+# tested," regardless of current distance -- a level price is actively
+# drifting toward and testing reads very differently from one nobody's
+# come near in hours. 30 minutes is long enough to not flag "touched
+# once, ages ago, at the very start of the session" as still relevant,
+# short enough to still mean "this is part of what's actually happening
+# right now," not just theoretical structure. Only meaningful for a
+# level with REAL touch history (support_breakdown/micro_breakdown) --
+# round_number_breakdown has no such history by construction
+# (requires_prior_touches=False), so distance is its only signal.
+BREAKDOWN_RECENT_TOUCH_SECONDS = 1800.0
+
 
 @dataclass
 class SetupCandidate:
@@ -268,16 +303,24 @@ def _breakdown_candidate(setup_type: str, bars: list[dict],
     hold = evaluate_hold_time_aware(bars, level.price, direction="below",
                                     required_seconds=REQUIRED_HOLD_SECONDS,
                                     watch_added_ts=watch_added_ts)
+    distance = round(current_price - level.price, 4)
+    distance_pct = abs(distance) / current_price if current_price > 0 else 0.0
+    seconds_since_touch = bars[-1]["ts"] - level.last_touch_ts
+    is_relevant = (distance_pct <= BREAKDOWN_NEAR_DISTANCE_PCT
+                  or seconds_since_touch <= BREAKDOWN_RECENT_TOUCH_SECONDS)
     return SetupCandidate(
         setup_type=setup_type,
         trigger_price=round(level.price, 4),
-        distance=round(current_price - level.price, 4),
+        distance=distance,
         hold=_hold_dict(hold),
         factors={
             "strength_score": round(level.strength_score, 4),
             "touch_count": level.touch_count,
             "total_touch_volume": level.total_touch_volume,
             "round_number_bonus": round(level.round_number_bonus, 4),
+            "distance_pct": round(distance_pct * 100.0, 2),
+            "seconds_since_last_touch": seconds_since_touch,
+            "is_relevant": is_relevant,
         },
     )
 
@@ -309,6 +352,12 @@ def _vwap_breakdown_candidate(bars: list[dict], current_price: float,
             "vwap": round(vwap, 4),
             "distance_from_vwap_pct": round(distance_pct * 100.0, 4),
             "trend_is_below_vwap": is_downtrend,
+            # This setup's own gating (a genuine downtrend AND a shallow
+            # pullback within VWAP_PULLBACK_THRESHOLD_PCT, both already
+            # required above just to exist) already IS a relevance
+            # filter -- it never appears as a stale/far candidate in the
+            # first place, so it's always relevant when present.
+            "is_relevant": True,
         },
     )
 
@@ -323,6 +372,7 @@ def _round_number_breakdown_candidate(bars: list[dict], current_price: float,
     hold = evaluate_hold_time_aware(bars, trigger, direction="below",
                                     required_seconds=REQUIRED_HOLD_SECONDS,
                                     watch_added_ts=watch_added_ts)
+    distance_pct = abs(current_price - trigger) / current_price if current_price > 0 else 0.0
     return SetupCandidate(
         setup_type="round_number_breakdown",
         trigger_price=round(trigger, 4),
@@ -331,6 +381,11 @@ def _round_number_breakdown_candidate(bars: list[dict], current_price: float,
         factors={
             "nearest_round_price": round(trigger, 4),
             "requires_prior_touches": False,
+            "distance_pct": round(distance_pct * 100.0, 2),
+            # No real touch history to be "recently tested" by (a round
+            # number is a grid point, not a detected level) -- distance
+            # is the ONLY relevance signal available for this type.
+            "is_relevant": distance_pct <= BREAKDOWN_NEAR_DISTANCE_PCT,
         },
     )
 
