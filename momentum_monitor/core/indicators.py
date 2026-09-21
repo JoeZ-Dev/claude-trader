@@ -31,6 +31,43 @@ def session_vwap(bars: list[dict]) -> list[float]:
     return out
 
 
+@dataclass
+class SessionVwapState:
+    """Persistent, incremental sibling of `session_vwap` (specs.md
+    section 28/29, build_state incremental architecture): identical
+    cumulative-VWAP math, but `update()` is fed ONE new bar at a time and
+    keeps running totals across calls, instead of the caller recomputing
+    the full session's bars from scratch on every call. Carries no
+    notion of a session BOUNDARY itself, same as `session_vwap` ("this
+    function doesn't know what a session boundary is, on purpose") --
+    resetting at a new session (a fresh `SessionVwapState()`) is the
+    CALLER's responsibility, exactly as it already is for the full-
+    recompute version via `session_bars_for_vwap`."""
+    cum_pv: float = 0.0
+    cum_vol: float = 0.0
+
+    def update(self, bar: dict) -> float:
+        """Fold in ONE new bar, return the current session VWAP -- same
+        formula, same order of operations, as one iteration of
+        `session_vwap`'s loop body, so results are bit-identical."""
+        typical = (bar["high"] + bar["low"] + bar["close"]) / 3.0
+        self.cum_pv += typical * bar["volume"]
+        self.cum_vol += bar["volume"]
+        return self.cum_pv / self.cum_vol if self.cum_vol > 0 else bar["close"]
+
+    @classmethod
+    def from_bars(cls, bars: list[dict]) -> "SessionVwapState":
+        """One-time rebuild from a full bar history -- used once per
+        session start (a fresh watch's initial backfill batch, or a
+        restart's one-time reconstruction from existing history), never
+        per-bar thereafter. Lands in exactly the state continuous
+        `update()` calls from empty would have produced."""
+        state = cls()
+        for b in bars:
+            state.update(b)
+        return state
+
+
 def ema(values: list[float], period: int) -> list[float]:
     """Standard exponential moving average. First value seeds on itself."""
     if not values:

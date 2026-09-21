@@ -1,4 +1,4 @@
-import sys, os
+import sys, os, json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
@@ -6,6 +6,7 @@ import pytest
 from indicators import (
     continuation_days, session_vwap, ema, macd, relative_volume,
     ema_time_aware, relative_volume_time_aware, macd_time_aware,
+    SessionVwapState,
 )
 from levels import (
     confirmed_swing_lows, detect_levels, evaluate_hold,
@@ -17,6 +18,30 @@ def bar(ts, o, h, l, c, v):
     return {"ts": ts, "open": o, "high": h, "low": l, "close": c, "volume": v}
 
 
+_FIXTURE_BARS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "schwab-connector", "data", "bars",
+)
+
+
+def _load_real_bars(symbol: str, limit: int | None = None) -> list[dict]:
+    """Real captured bars (specs.md section 28/29, build_state incremental
+    architecture) -- the SAME schwab-connector/data/bars/*.jsonl files
+    used throughout phase 3.6's real-data proofs, read directly here
+    (deterministic, local, no network/wall-clock dependency -- AGENT_
+    PROTOCOL.md's reproducibility rule) rather than re-typed as literals,
+    since these equivalence proofs need to walk thousands of real bars
+    bar-by-bar, not check a few hand-picked values."""
+    path = os.path.join(_FIXTURE_BARS_DIR, f"{symbol}.jsonl")
+    bars = []
+    with open(path) as f:
+        for i, line in enumerate(f):
+            if limit is not None and i >= limit:
+                break
+            bars.append(json.loads(line))
+    return bars
+
+
 def test_session_vwap_hand_computed():
     # Bar 1: typical=(10+8+9)/3=9, vol=100 -> pv=900, cum_vol=100 -> vwap=9.0
     # Bar 2: typical=(12+10+11)/3=11, vol=100 -> pv=1100, cum_pv=2000, cum_vol=200 -> vwap=10.0
@@ -24,6 +49,46 @@ def test_session_vwap_hand_computed():
     result = session_vwap(bars)
     assert result[0] == 9.0
     assert result[1] == 10.0
+
+
+# -- SessionVwapState (specs.md section 28/29, build_state incremental
+# architecture, stage 2, function 1 of 5) --------------------------------
+
+def test_session_vwap_state_matches_full_recompute_on_real_aiff_data():
+    # Real AIFF data, the first real session (2026-09-17) in full --
+    # 3,538 bars, the exact boundary before the next real session starts
+    # (found by scanning the real fixture for NY calendar date changes).
+    # Every SINGLE incremental step must equal what a full recompute over
+    # bars[:i+1] would produce at that same point -- bit-for-bit, not
+    # just the final value, since a real regression could easily only
+    # show up mid-session.
+    bars = _load_real_bars("AIFF", limit=3538)
+    full = session_vwap(bars)
+    state = SessionVwapState()
+    for i, b in enumerate(bars):
+        assert state.update(b) == full[i], f"mismatch at real bar {i}"
+
+
+def test_session_vwap_state_from_bars_matches_stepping_from_empty():
+    # The one-time rebuild path (a fresh watch's first backfill batch, or
+    # a restart's one-time reconstruction) must land in EXACTLY the same
+    # state as if every bar had been stepped through incrementally from
+    # empty -- proven directly on the same real AIFF session.
+    bars = _load_real_bars("AIFF", limit=3538)
+    stepped = SessionVwapState()
+    for b in bars:
+        stepped.update(b)
+    rebuilt = SessionVwapState.from_bars(bars)
+    assert rebuilt.cum_pv == stepped.cum_pv
+    assert rebuilt.cum_vol == stepped.cum_vol
+
+
+def test_session_vwap_state_fresh_instance_starts_empty():
+    # Lifecycle: a newly-watched symbol (or one removed then re-added)
+    # must start with genuinely empty state, not inherit anything.
+    state = SessionVwapState()
+    assert state.cum_pv == 0.0
+    assert state.cum_vol == 0.0
 
 
 def test_ema_converges_toward_flat_input():
