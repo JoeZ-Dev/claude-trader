@@ -1325,12 +1325,18 @@ def test_breakdown_setups_html_empty_when_none_present():
 
 
 def test_breakdown_setups_html_renders_a_clearly_labeled_separate_section():
+    # Reworded (specs.md section 31): "Bearish signals" read as an
+    # overall directional verdict on the stock, when these are really
+    # just structural reference points that exist somewhere below price
+    # -- confirmed structurally true for nearly every symbol regardless
+    # of trend, not a DDC-specific quirk. New wording makes explicit
+    # these are levels to be AWARE of, not a call on the stock right now.
     setups = [_setup_dict("support_breakdown", trigger_price=9.0, distance=0.5,
-                          strength_score=6.0, touch_count=2)]
+                          strength_score=6.0, touch_count=2, is_relevant=True)]
     html_out = _breakdown_setups_html("AEHL", setups)
-    assert "Bearish signals" in html_out
-    assert "context only" in html_out
-    assert "not a trade opportunity" in html_out
+    assert "Bearish signals" not in html_out
+    assert "Downside levels to be aware of" in html_out
+    assert "not a directional" in html_out
     assert "Support breakdown" in html_out
     assert "breakdown-setups" in html_out  # its own section, not setup-chips alone
 
@@ -1346,11 +1352,40 @@ def test_breakdown_setups_html_never_uses_the_closest_setup_wording():
 
 def test_breakdown_setups_html_renders_all_four_types_with_distinct_labels():
     types = ["support_breakdown", "micro_breakdown", "vwap_breakdown", "round_number_breakdown"]
-    setups = [_setup_dict(t) for t in types]
+    setups = [_setup_dict(t, is_relevant=True) for t in types]
     html_out = _breakdown_setups_html("AEHL", setups)
     for expected_label in ("Support breakdown", "Micro-breakdown",
                           "VWAP breakdown", "Round-number breakdown"):
         assert expected_label in html_out
+
+
+def test_breakdown_setups_html_relevant_chip_keeps_the_normal_breakdown_style():
+    setups = [_setup_dict("support_breakdown", is_relevant=True)]
+    html_out = _breakdown_setups_html("AEHL", setups)
+    assert "breakdown-chip-distant" not in html_out
+    assert "breakdown-chip" in html_out
+
+
+def test_breakdown_setups_html_distant_chip_gets_a_de_emphasized_class():
+    # specs.md section 31: prominence scales with actual relevance --
+    # a level that's neither close by nor recently tested (core/
+    # setup_types.py's is_relevant=False) reads very differently from
+    # one that is, so it gets a visually distinct, de-emphasized class
+    # rather than identical alarming styling regardless of context. The
+    # underlying chip/data is still rendered -- never hidden.
+    setups = [_setup_dict("support_breakdown", is_relevant=False)]
+    html_out = _breakdown_setups_html("AEHL", setups)
+    assert "breakdown-chip-distant" in html_out
+    assert "Support breakdown" in html_out  # still shown, just de-emphasized
+
+
+def test_breakdown_setups_html_missing_is_relevant_defaults_to_normal_styling():
+    # Defensive: a setup dict without the new factor (shouldn't happen in
+    # practice, since core/setup_types.py always sets it now) must not
+    # crash and must not be silently treated as "distant."
+    setups = [_setup_dict("support_breakdown", strength_score=5.0, touch_count=2)]
+    html_out = _breakdown_setups_html("AEHL", setups)
+    assert "breakdown-chip-distant" not in html_out
 
 
 def test_root_page_shows_bearish_signals_section_for_a_real_breakdown_scenario():
@@ -1365,8 +1400,9 @@ def test_root_page_shows_bearish_signals_section_for_a_real_breakdown_scenario()
         assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
         state = _sym_state(c, "AEHL")
         assert len(state["breakdown_setups"]) >= 1
+        assert "is_relevant" in state["breakdown_setups"][0]["factors"]
         page = c.get("/").text
-        assert "Bearish signals" in page
+        assert "Downside levels to be aware of" in page
         assert "breakdown-chip" in page
 
 

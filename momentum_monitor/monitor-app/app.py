@@ -1637,13 +1637,23 @@ def _breakdown_setups_html(symbol: str, breakdown_setups: list[dict]) -> str:
         return ""
     parts = [
         "<div class='breakdown-setups'>"
-        "<h3>&#9888; Bearish signals (context only, not a trade opportunity)</h3>"
+        "<h3>Downside levels to be aware of (structural context, not a directional signal)</h3>"
     ]
     for setup in breakdown_setups:
         label = _BREAKDOWN_TYPE_LABELS.get(setup["setup_type"], setup["setup_type"])
         key = html.escape(f"{symbol}:breakdown:{setup['setup_type']}")
+        # Prominence scales with actual relevance (specs.md section 31):
+        # is_relevant=False (core/setup_types.py -- neither close by nor
+        # recently tested) gets a visually de-emphasized class instead of
+        # the same alarming styling every candidate got before, regardless
+        # of context. Missing the key entirely (shouldn't happen -- every
+        # real candidate sets it now) defaults to the NORMAL style, never
+        # silently treated as distant.
+        chip_class = "setup-chip breakdown-chip"
+        if setup.get("factors", {}).get("is_relevant") is False:
+            chip_class += " breakdown-chip-distant"
         parts.append(
-            f"<button type='button' class='setup-chip breakdown-chip' data-key='{key}'>"
+            f"<button type='button' class='{chip_class}' data-key='{key}'>"
             f"{html.escape(label)} @ {_fmt(setup['trigger_price'], 2)} "
             f"&middot; ${_fmt(setup['distance'], 2)} away</button>"
             "<div class='setup-detail' hidden><table class='detail'>"
@@ -2401,11 +2411,17 @@ function breakdownSetupsHtml(symbol, breakdownSetups) {
   // display (specs.md section 22).
   if (!breakdownSetups || !breakdownSetups.length) return '';
   let out = '<div class="breakdown-setups">' +
-    '<h3>\\u26a0 Bearish signals (context only, not a trade opportunity)</h3>';
+    '<h3>Downside levels to be aware of (structural context, not a directional signal)</h3>';
   breakdownSetups.forEach(function (setup) {
     const label = BREAKDOWN_TYPE_LABELS[setup.setup_type] || setup.setup_type;
     const key = esc(symbol + ':breakdown:' + setup.setup_type);
-    out += '<button type="button" class="setup-chip breakdown-chip" data-key="' + key + '">' +
+    // Mirrors the Python side's chip_class logic exactly -- prominence
+    // scales with is_relevant, missing the key defaults to normal styling.
+    let chipClass = 'setup-chip breakdown-chip';
+    if (setup.factors && setup.factors.is_relevant === false) {
+      chipClass += ' breakdown-chip-distant';
+    }
+    out += '<button type="button" class="' + chipClass + '" data-key="' + key + '">' +
       esc(label) + ' @ ' + fmt(setup.trigger_price, 2) +
       ' &middot; $' + fmt(setup.distance, 2) + ' away</button>' +
       '<div class="setup-detail" hidden><table class="detail">' +
@@ -3009,8 +3025,9 @@ table.detail th{color:var(--muted);font-weight:500;width:45%}
 .setup-detail{margin:.25rem 0 .5rem;padding:.4rem .5rem;
   background:var(--bg);border:1px solid var(--border);border-radius:.4rem}
 .breakdown-setups{margin:.3rem 0 .5rem}
-.breakdown-setups h3{color:var(--neg);font-size:.85rem;margin:.3rem 0 .3rem}
+.breakdown-setups h3{color:var(--muted);font-size:.85rem;margin:.3rem 0 .3rem}
 .breakdown-chip{border-color:var(--neg)}
+.breakdown-chip-distant{border-color:var(--border);color:var(--muted);opacity:.7}
 .row-housekeeping td{color:var(--muted)}
 .journal-delete-btn{padding:.15rem .45rem;font-size:.68rem}
 .journal-review-btn{padding:.15rem .45rem;font-size:.68rem}
