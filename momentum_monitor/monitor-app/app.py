@@ -140,7 +140,7 @@ from journal_logic import ExitEvent, OpenPosition, advance_journal
 from journal_store import (MAX_WATCH_NOTE_LENGTH, InvalidEquityOverrideError,
                            InvalidParamError, InvalidReverseSplitError,
                            InvalidReviewError, InvalidWatchNoteError)
-from state import build_state
+from state import build_state, IncrementalState
 from analysis import (breakdown_by_review_label, breakdown_by_setup_type,
                       losses_section, overall_stats)
 import narration
@@ -320,6 +320,14 @@ class _SymbolSlot:
     # nothing -- same "unknown, not silently zero" meaning as
     # avg_daily_volume being None (see _continuation_status_for).
     daily_bars: list[dict] = field(default_factory=list)
+    # Persistent, incremental cross-call state for build_state's five
+    # incrementalized functions (specs.md section 28/29, build_state
+    # incremental architecture). A fresh _SymbolSlot (every add_symbol()
+    # call constructs one) gets a fresh, empty IncrementalState for
+    # free via this default_factory -- a newly-watched symbol, and a
+    # symbol removed then re-added, both start with genuinely empty
+    # state, never inheriting anything from a previous watch period.
+    incremental: IncrementalState = field(default_factory=IncrementalState)
 
 
 class Poller:
@@ -1145,7 +1153,8 @@ class Poller:
                 new_bars.append(bar)
         if new_bars:
             slot.last_ts = slot.bars[-1]["ts"]
-        slot.state = build_state(slot.bars, symbol, watch_added_ts=slot.added_ts)
+        slot.state = build_state(slot.bars, symbol, watch_added_ts=slot.added_ts,
+                                 incremental=slot.incremental)
         slot.poll_ok = True
         self._update_journal(symbol, slot, new_bars)
         self._broadcast_state()

@@ -43,9 +43,17 @@ class SessionVwapState:
     function doesn't know what a session boundary is, on purpose") --
     resetting at a new session (a fresh `SessionVwapState()`) is the
     CALLER's responsibility, exactly as it already is for the full-
-    recompute version via `session_bars_for_vwap`."""
+    recompute version via `session_bars_for_vwap`.
+
+    `last_value` caches the most recent `update()` result (added for
+    build_state's wiring, specs.md section 28/29): `build_state` can be
+    called with zero genuinely new bars (a duplicate push, an empty
+    catch_up batch), in which case the caller needs the current value
+    WITHOUT calling `update()` again (that would double-count a bar
+    that's already been folded in)."""
     cum_pv: float = 0.0
     cum_vol: float = 0.0
+    last_value: float | None = None
 
     def update(self, bar: dict) -> float:
         """Fold in ONE new bar, return the current session VWAP -- same
@@ -54,7 +62,8 @@ class SessionVwapState:
         typical = (bar["high"] + bar["low"] + bar["close"]) / 3.0
         self.cum_pv += typical * bar["volume"]
         self.cum_vol += bar["volume"]
-        return self.cum_pv / self.cum_vol if self.cum_vol > 0 else bar["close"]
+        self.last_value = self.cum_pv / self.cum_vol if self.cum_vol > 0 else bar["close"]
+        return self.last_value
 
     @classmethod
     def from_bars(cls, bars: list[dict]) -> "SessionVwapState":
@@ -375,7 +384,14 @@ class RelativeVolumeState:
     tracked via a running `nonuniform_count` (incremented/decremented as
     a duration != `reference_interval_seconds` entry enters/leaves the
     window) instead of rechecking every window element's duration on
-    every call."""
+    every call.
+
+    `last_value` caches the most recent `update()` result (added for
+    build_state's wiring, specs.md section 28/29): `build_state` can be
+    called with zero genuinely new bars (a duplicate push, an empty
+    catch_up batch), in which case the caller needs the current value
+    WITHOUT calling `update()` again (that would treat an already-seen
+    bar as a new one, double-folding it into the window)."""
     lookback_seconds: float = 200.0
     reference_interval_seconds: float = 10.0
     first_ts: float | None = None
@@ -384,6 +400,7 @@ class RelativeVolumeState:
     sum_vol: float = 0.0
     sum_dur: float = 0.0
     nonuniform_count: int = 0
+    last_value: float | None = None
 
     def _evict_before(self, cutoff_ts: float) -> None:
         while self.window and self.window[0].ts < cutoff_ts:
@@ -392,6 +409,26 @@ class RelativeVolumeState:
             self.sum_dur -= entry.duration
             if entry.duration != self.reference_interval_seconds:
                 self.nonuniform_count -= 1
+
+    def _current_value(self, bar: dict) -> float:
+        """The relative-volume reading for `bar` (already `pending_bar`
+        and already evicted-to), assuming `bar["ts"] - self.first_ts >=
+        self.lookback_seconds` is checked by the caller. Split out of
+        `update()` so `from_bars` can compute the same value without
+        re-triggering the pending/commit dance for a bar that's already
+        the correctly-built window's own pending bar."""
+        if not self.window:
+            return 1.0
+        if self.nonuniform_count == 0:
+            avg = self.sum_vol / len(self.window)
+            cur_rate = bar["volume"]
+        else:
+            avg = self.sum_vol / self.sum_dur
+            # This bar is now the newest, so its own duration isn't
+            # known yet -- the same reference-width estimate the
+            # bar-count version's `_bar_duration` fallback uses.
+            cur_rate = bar["volume"] / self.reference_interval_seconds
+        return cur_rate / avg if avg > 0 else 1.0
 
     def update(self, bar: dict) -> float:
         if self.first_ts is None:
@@ -414,19 +451,10 @@ class RelativeVolumeState:
         self._evict_before(bar["ts"] - self.lookback_seconds)
 
         if bar["ts"] - self.first_ts < self.lookback_seconds:
-            return 1.0
-        if not self.window:
-            return 1.0
-        if self.nonuniform_count == 0:
-            avg = self.sum_vol / len(self.window)
-            cur_rate = bar["volume"]
+            self.last_value = 1.0
         else:
-            avg = self.sum_vol / self.sum_dur
-            # This bar is now the newest, so its own duration isn't
-            # known yet -- the same reference-width estimate the
-            # bar-count version's `_bar_duration` fallback uses.
-            cur_rate = bar["volume"] / self.reference_interval_seconds
-        return cur_rate / avg if avg > 0 else 1.0
+            self.last_value = self._current_value(bar)
+        return self.last_value
 
     @classmethod
     def from_bars(cls, bars: list[dict], lookback_seconds: float = 200.0,
@@ -456,6 +484,10 @@ class RelativeVolumeState:
                 if entry.duration != reference_interval_seconds:
                     state.nonuniform_count += 1
         state.pending_bar = last
+        if last["ts"] - state.first_ts < lookback_seconds:
+            state.last_value = 1.0
+        else:
+            state.last_value = state._current_value(last)
         return state
 
 

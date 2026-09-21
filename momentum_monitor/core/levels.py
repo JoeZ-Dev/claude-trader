@@ -576,7 +576,14 @@ class EvaluateHoldTimeAwareState:
     `pending_bar` is committed using the new bar's real ts as its
     bar_end_ts (matching what a fresh full recompute over the
     now-longer list would do, since real lookahead is always available
-    for every bar except the list's own last one)."""
+    for every bar except the list's own last one).
+
+    `last_result` caches the most recent `update()` return value (added
+    for build_state's wiring, specs.md section 28/29): `build_state` can
+    be called with zero genuinely new bars (a duplicate push, an empty
+    catch_up batch), in which case the caller needs the current result
+    WITHOUT calling `update()` again (that would treat an already-seen
+    bar as a new one, incorrectly re-triggering the commit step)."""
     level_price: float
     direction: str = "above"
     required_seconds: float = 30.0
@@ -589,6 +596,7 @@ class EvaluateHoldTimeAwareState:
     was_attempting: bool = False
     elapsed_seconds: float = 0.0
     pending_bar: dict | None = None
+    last_result: "HoldStateTimeAware | None" = None
 
     def update(self, bar: dict) -> HoldStateTimeAware:
         if self.pending_bar is not None:
@@ -616,13 +624,14 @@ class EvaluateHoldTimeAwareState:
             self.direction, self.required_seconds, self.watch_added_ts,
         )
         self.elapsed_seconds = provisional_elapsed_seconds
-        return HoldStateTimeAware(
+        self.last_result = HoldStateTimeAware(
             level_price=self.level_price, direction=self.direction,
             elapsed_seconds=provisional_elapsed_seconds,
             confirmed=provisional_confirmed,
             failed_attempts=provisional_failed_attempts,
             confirmed_at_ts=provisional_confirmed_at_ts,
         )
+        return self.last_result
 
     @classmethod
     def from_bars(cls, bars: list[dict], level_price: float, direction: str = "above",

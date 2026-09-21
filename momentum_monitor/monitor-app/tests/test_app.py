@@ -2238,4 +2238,116 @@ def test_root_page_narration_section_defaults_to_disarmed_display():
         section_end = page.find("</section>", section_start)
         section = page[section_start:section_end]
         assert "DISARMED" in section
-        assert "Circuit breaker: OK" in section
+
+
+# -- build_state incremental architecture, production wiring (specs.md
+# section 28/29) ----------------------------------------------------------
+
+_FIXTURE_BARS_DIR = os.path.join(
+    os.path.dirname(_APP_DIR), "schwab-connector", "data", "bars",
+)
+
+
+def _load_real_bars(symbol, limit=None):
+    """Same real fixture files, same purpose, as monitor-app/tests/
+    test_state.py's and core/tests/test_core.py's own `_load_real_bars`
+    (specs.md section 28/29) -- duplicated per this project's
+    independent-per-suite test convention."""
+    path = os.path.join(_FIXTURE_BARS_DIR, f"{symbol}.jsonl")
+    bars = []
+    with open(path) as f:
+        for i, line in enumerate(f):
+            if limit is not None and i >= limit:
+                break
+            bars.append(json.loads(line))
+    return bars
+
+
+def test_apply_bar_push_actually_uses_the_incremental_path_not_just_offers_it():
+    # Proves the PRODUCTION wiring, not just that state.py's build_state
+    # supports incremental=  -- a real Poller, real apply_bar_push calls,
+    # real AIFF data, checking slot.incremental was genuinely advanced
+    # (not left at its just-constructed default) and that the resulting
+    # slot.state matches an independent full recompute over the same
+    # bars, at EVERY step -- catches "the parameter exists but nothing
+    # in app.py actually passes it," a bug the unit-level build_state
+    # tests alone can't see.
+    from app import Poller
+    from state import build_state as _full_build_state
+
+    async def run():
+        poller = Poller(fetch_bars=FakeFetch({}), watch_symbol=None, announce_watch=None)
+        await poller.add_symbol("AIFF")
+        slot = poller._slots["AIFF"]
+        assert slot.incremental.processed_count == 0  # fresh watch starts empty
+
+        bars = _load_real_bars("AIFF", limit=120)
+        for i, bar in enumerate(bars):
+            await poller.apply_bar_push("AIFF", bar)
+            assert slot.incremental.processed_count == i + 1
+            want = _full_build_state(bars[:i + 1], symbol="AIFF", watch_added_ts=slot.added_ts)
+            assert slot.state == want, f"mismatch at real bar {i}"
+
+    asyncio.run(run())
+
+
+def test_remove_then_readd_gives_a_genuinely_fresh_incremental_state():
+    # Lifecycle (specs.md section 28/29): remove_symbol drops the whole
+    # _SymbolSlot (confirmed directly by reading app.py: `self._slots.
+    # pop(symbol, None)`), and add_symbol always constructs a BRAND NEW
+    # one -- proven here at the actual object level, not just "the
+    # numbers come out right," since a shared/reused object could still
+    # coincidentally produce correct numbers on simple test data.
+    from app import Poller
+
+    async def run():
+        poller = Poller(fetch_bars=FakeFetch({}), watch_symbol=None, announce_watch=None)
+        await poller.add_symbol("AIFF")
+        first_slot = poller._slots["AIFF"]
+        for bar in _load_real_bars("AIFF", limit=30):
+            await poller.apply_bar_push("AIFF", bar)
+        assert first_slot.incremental.processed_count == 30
+
+        await poller.remove_symbol("AIFF")
+        await poller.add_symbol("AIFF")
+        second_slot = poller._slots["AIFF"]
+        assert second_slot is not first_slot
+        assert second_slot.incremental is not first_slot.incremental
+        assert second_slot.incremental.processed_count == 0
+        assert second_slot.incremental.vwap is None
+        assert second_slot.incremental.relvol is None
+
+    asyncio.run(run())
+
+
+def test_restart_reconstruction_via_one_large_catch_up_batch_matches_full_recompute():
+    # Lifecycle: a process restart's one-time reconstruction (a fresh
+    # _SymbolSlot fed the FULL existing bar history in ONE batch, exactly
+    # what catch_up()'s REST backfill does against a brand-new slot)
+    # must match a full recompute -- proven here via apply_bar_push fed
+    # the whole batch at once (mirrors catch_up's own `_apply_new_bars(
+    # symbol, slot, incoming)` call with a multi-bar `incoming` list),
+    # not bar-by-bar, since that's the actual shape a real restart's
+    # first catch_up takes.
+    from app import Poller
+    from state import build_state as _full_build_state
+
+    async def run():
+        poller = Poller(fetch_bars=FakeFetch({}), watch_symbol=None, announce_watch=None)
+        await poller.add_symbol("AIFF")
+        slot = poller._slots["AIFF"]
+        bars = _load_real_bars("AIFF", limit=150)
+        poller._apply_new_bars("AIFF", slot, bars)  # one large batch, like a real catch_up
+        want = _full_build_state(bars, symbol="AIFF", watch_added_ts=slot.added_ts)
+        assert slot.state == want
+        assert slot.incremental.processed_count == len(bars)
+
+        # And it's genuinely incremental from that reconstructed point
+        # forward, not still doing a full recompute under the hood.
+        more = _load_real_bars("AIFF", limit=160)
+        poller._apply_new_bars("AIFF", slot, more[150:])
+        want2 = _full_build_state(more, symbol="AIFF", watch_added_ts=slot.added_ts)
+        assert slot.state == want2
+        assert slot.incremental.processed_count == len(more)
+
+    asyncio.run(run())

@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import sys
 
@@ -12,10 +13,32 @@ from levels import Level, detect_levels, evaluate_hold_time_aware  # from core
 from state import (
     RELVOL_LOOKBACK_SECONDS,
     REQUIRED_HOLD_SECONDS,
+    IncrementalState,
     build_state,
     select_levels,
     session_bars_for_vwap,
 )
+
+_FIXTURE_BARS_DIR = os.path.join(
+    os.path.dirname(_APP_DIR), "schwab-connector", "data", "bars",
+)
+
+
+def _load_real_bars(symbol: str, limit: int | None = None) -> list[dict]:
+    """Real captured bars (specs.md section 28/29, build_state incremental
+    architecture) -- same fixture files and same purpose as core/tests/
+    test_core.py's own `_load_real_bars`, duplicated here rather than
+    shared since this project's test suites are deliberately independent
+    per-container (run_tests.sh's own comment: hyphenated directory names
+    can't be Python packages, so each suite is its own pytest process)."""
+    path = os.path.join(_FIXTURE_BARS_DIR, f"{symbol}.jsonl")
+    bars = []
+    with open(path) as f:
+        for i, line in enumerate(f):
+            if limit is not None and i >= limit:
+                break
+            bars.append(json.loads(line))
+    return bars
 
 
 def _load_demo_session():
@@ -353,3 +376,132 @@ def test_build_state_watch_added_ts_reaches_setups_and_level_blocks():
     restricted = build_state(bars, symbol="X", watch_added_ts=1_000_000)
     reclaim_restricted = next(s for s in restricted["setups"] if s["setup_type"] == "round_number_reclaim")
     assert reclaim_restricted["hold"]["confirmed"] is False
+
+
+# -- build_state incremental wiring (specs.md section 28/29) -------------
+#
+# All five functions stage 1's audit found need incrementalizing
+# (SessionVwapState, EmaTimeAwareState, MacdTimeAwareState,
+# EvaluateHoldTimeAwareState, RelativeVolumeState -- each already proven
+# bit-identical to its bar-count sibling in core/tests/test_core.py) are
+# wired in here, together, via an `IncrementalState` container build_state
+# accepts as an optional `incremental=` argument. `incremental=None` (the
+# default) is the OLD, unchanged full-recompute path -- every existing
+# test above this line calls build_state with no `incremental` argument
+# and still exercises that exact path, proving the wiring is additive,
+# not a replacement that could silently change existing behavior.
+
+def test_build_state_incremental_matches_full_recompute_on_real_aiff_data():
+    # Real AIFF data, first 300 bars (mixed real backfill-to-live
+    # cadence) -- a single IncrementalState carried forward across calls,
+    # exactly how monitor-app/app.py's _apply_new_bars reuses slot.
+    # incremental across every incoming bar, compared at EVERY step
+    # against a full recompute over the same growing bars list. Capped at
+    # 300 (not the full 3,538-bar session) because the OLD full-recompute
+    # path itself costs O(n^2) per call via relative_volume_time_aware,
+    # so a step-by-step comparison against it costs O(n^3) overall -- the
+    # exact defect this redesign exists to eliminate, so proving it
+    # exhaustively at greater length this way isn't representative of
+    # anything meaningful; stage 3's dedicated replay proves the actual
+    # long-run behavior instead.
+    bars = _load_real_bars("AIFF", limit=300)
+    incremental = IncrementalState()
+    for i in range(len(bars)):
+        prefix = bars[:i + 1]
+        old = build_state(prefix, symbol="AIFF", watch_added_ts=None)
+        new = build_state(prefix, symbol="AIFF", watch_added_ts=None, incremental=incremental)
+        assert new == old, f"mismatch at real bar {i}"
+
+
+def test_build_state_incremental_matches_full_recompute_across_a_real_session_rollover():
+    # The one boundary SessionVwapState's own core-level proof couldn't
+    # cover (it has no session-boundary concept by design -- that's
+    # build_state's job): a real NY-calendar-date rollover, found by
+    # scanning the real AIFF fixture directly (bar 3538 is the first bar
+    # of 2026-09-18, immediately after 2026-09-17's last bar). Only a
+    # short window either side of the boundary -- proving the rollover
+    # itself resets session_vwap's incremental state correctly, not a
+    # full second exhaustive session.
+    bars = _load_real_bars("AIFF", limit=3550)[3520:3550]
+    incremental = IncrementalState()
+    # Prime both paths with the FULL history before the tested window so
+    # the incremental side isn't starting cold exactly at the boundary
+    # (that would trivially "work" without proving the reset fires).
+    # Primed via ONE rebuild call, not a bar-by-bar loop -- already
+    # proven equivalent to stepping incrementally from empty by the
+    # restart-reconstruction test below, and avoids re-paying an
+    # unrelated O(n^2) cost here just to get to the boundary.
+    all_before = _load_real_bars("AIFF", limit=3550)[:3520]
+    build_state(all_before, symbol="AIFF", watch_added_ts=None, incremental=incremental)
+    for i in range(len(bars)):
+        prefix = all_before + bars[:i + 1]
+        old = build_state(prefix, symbol="AIFF", watch_added_ts=None)
+        new = build_state(prefix, symbol="AIFF", watch_added_ts=None, incremental=incremental)
+        assert new == old, f"mismatch at real bar {3520 + i}"
+
+
+def test_build_state_incremental_with_no_incremental_state_is_unchanged():
+    # incremental=None (the default) must be BYTE-IDENTICAL to calling
+    # build_state with no incremental argument at all -- the wiring is
+    # additive, never a behavior change for any existing caller.
+    bars = _load_real_bars("AIFF", limit=50)
+    assert build_state(bars, symbol="AIFF") == build_state(bars, symbol="AIFF", incremental=None)
+
+
+def test_build_state_incremental_state_fresh_instance_starts_empty():
+    # Lifecycle (specs.md section 28/29): a newly-watched symbol must
+    # start with genuinely empty incremental state.
+    state = IncrementalState()
+    assert state.processed_count == 0
+    assert state.vwap is None
+    assert state.ema9 is None
+    assert state.ema20 is None
+    assert state.macd is None
+    assert state.hold_above is None
+    assert state.hold_below is None
+    assert state.relvol is None
+
+
+def test_build_state_incremental_remove_then_readd_does_not_inherit_stale_state():
+    # Lifecycle: a symbol removed then re-added gets a genuinely fresh
+    # IncrementalState (the same object a fresh watch would), not
+    # whatever was left over from its previous watch period -- proven
+    # directly by running one symbol's incremental state forward on real
+    # data, then starting a SECOND, separate IncrementalState (what a
+    # real remove+readd via a brand new _SymbolSlot produces) and
+    # confirming it reproduces the FULL recompute from scratch, not
+    # something influenced by the first instance.
+    bars = _load_real_bars("AIFF", limit=60)
+    first_watch = IncrementalState()
+    for i in range(len(bars)):
+        build_state(bars[:i + 1], symbol="AIFF", watch_added_ts=None, incremental=first_watch)
+    assert first_watch.processed_count == len(bars)
+
+    second_watch = IncrementalState()  # a fresh watch, as remove+readd produces
+    assert second_watch.processed_count == 0
+    assert second_watch.vwap is None
+    got = build_state(bars, symbol="AIFF", watch_added_ts=None, incremental=second_watch)
+    want = build_state(bars, symbol="AIFF", watch_added_ts=None)
+    assert got == want
+
+
+def test_build_state_incremental_restart_reconstruction_from_existing_history():
+    # Lifecycle: a restart's one-time reconstruction from existing bar
+    # history (a fresh IncrementalState fed the FULL accumulated history
+    # in ONE call, exactly what catch_up()'s REST backfill does against a
+    # brand-new _SymbolSlot after a process restart) must match a full
+    # recompute exactly -- proving the from_bars()/from_series() rebuild
+    # paths all fire correctly together on the first real call, not just
+    # in their individual core-level tests.
+    bars = _load_real_bars("AIFF", limit=300)
+    incremental = IncrementalState()
+    got = build_state(bars, symbol="AIFF", watch_added_ts=None, incremental=incremental)
+    want = build_state(bars, symbol="AIFF", watch_added_ts=None)
+    assert got == want
+    assert incremental.processed_count == len(bars)
+    # And it stays correct incrementally from that reconstructed point
+    # forward -- not just correct once, at the rebuild itself.
+    more_bars = _load_real_bars("AIFF", limit=310)
+    got2 = build_state(more_bars, symbol="AIFF", watch_added_ts=None, incremental=incremental)
+    want2 = build_state(more_bars, symbol="AIFF", watch_added_ts=None)
+    assert got2 == want2
