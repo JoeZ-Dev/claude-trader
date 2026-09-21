@@ -6,7 +6,7 @@ import pytest
 from indicators import (
     continuation_days, session_vwap, ema, macd, relative_volume,
     ema_time_aware, relative_volume_time_aware, macd_time_aware,
-    SessionVwapState,
+    SessionVwapState, EmaTimeAwareState, MacdTimeAwareState,
 )
 from levels import (
     confirmed_swing_lows, detect_levels, evaluate_hold,
@@ -89,6 +89,76 @@ def test_session_vwap_state_fresh_instance_starts_empty():
     state = SessionVwapState()
     assert state.cum_pv == 0.0
     assert state.cum_vol == 0.0
+
+
+# -- EmaTimeAwareState / MacdTimeAwareState (specs.md section 28/29,
+# build_state incremental architecture, stage 2, function 2 of 5) --------
+
+def test_ema_time_aware_state_matches_full_recompute_on_real_aiff_data():
+    # Real AIFF data, the same first real session (3,538 bars) used for
+    # SessionVwapState above -- mixed real cadence (backfilled 60s bars
+    # into live 10s bars), exactly the case ema_time_aware's own
+    # time-aware weighting exists for (specs.md section 15/16), so this
+    # equivalence proof actually exercises the dt-based k_eff branch, not
+    # just the uniform-cadence fast path.
+    bars = _load_real_bars("AIFF", limit=3538)
+    closes = [b["close"] for b in bars]
+    timestamps = [b["ts"] for b in bars]
+    period = 9
+    full = ema_time_aware(closes, timestamps, period)
+    state = EmaTimeAwareState(period=period)
+    for i in range(len(bars)):
+        got = state.update(closes[i], timestamps[i])
+        assert got == full[i], f"mismatch at real bar {i}"
+
+
+def test_ema_time_aware_state_from_series_matches_stepping_from_empty():
+    bars = _load_real_bars("AIFF", limit=3538)
+    closes = [b["close"] for b in bars]
+    timestamps = [b["ts"] for b in bars]
+    period = 20
+    stepped = EmaTimeAwareState(period=period)
+    for i in range(len(bars)):
+        stepped.update(closes[i], timestamps[i])
+    rebuilt = EmaTimeAwareState.from_series(closes, timestamps, period)
+    assert rebuilt.value == stepped.value
+    assert rebuilt.last_ts == stepped.last_ts
+
+
+def test_ema_time_aware_state_fresh_instance_starts_empty():
+    state = EmaTimeAwareState(period=9)
+    assert state.value is None
+    assert state.last_ts is None
+
+
+def test_macd_time_aware_state_matches_full_recompute_on_real_aiff_data():
+    # Same real first-session AIFF data, default fast/slow/signal periods
+    # -- exercises all three internal EmaTimeAwareState legs together,
+    # including the signal leg's EMA-of-a-derived-series (macd_line, not
+    # raw closes).
+    bars = _load_real_bars("AIFF", limit=3538)
+    closes = [b["close"] for b in bars]
+    timestamps = [b["ts"] for b in bars]
+    full = macd_time_aware(closes, timestamps)
+    state = MacdTimeAwareState.new()
+    for i in range(len(bars)):
+        got = state.update(closes[i], timestamps[i])
+        assert got["macd"] == full["macd"][i], f"macd mismatch at real bar {i}"
+        assert got["signal"] == full["signal"][i], f"signal mismatch at real bar {i}"
+        assert got["histogram"] == full["histogram"][i], f"histogram mismatch at real bar {i}"
+
+
+def test_macd_time_aware_state_from_series_matches_stepping_from_empty():
+    bars = _load_real_bars("AIFF", limit=3538)
+    closes = [b["close"] for b in bars]
+    timestamps = [b["ts"] for b in bars]
+    stepped = MacdTimeAwareState.new()
+    for i in range(len(bars)):
+        stepped.update(closes[i], timestamps[i])
+    rebuilt = MacdTimeAwareState.from_series(closes, timestamps)
+    assert rebuilt.fast.value == stepped.fast.value
+    assert rebuilt.slow.value == stepped.slow.value
+    assert rebuilt.signal.value == stepped.signal.value
 
 
 def test_ema_converges_toward_flat_input():

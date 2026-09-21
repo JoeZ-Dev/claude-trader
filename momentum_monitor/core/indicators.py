@@ -120,6 +120,52 @@ def ema_time_aware(values: list[float], timestamps: list[float], period: int,
     return out
 
 
+@dataclass
+class EmaTimeAwareState:
+    """Persistent, incremental sibling of `ema_time_aware` (specs.md
+    section 28/29, build_state incremental architecture): `update()` is
+    fed ONE new (value, ts) pair at a time and keeps only the last EMA
+    value and its timestamp across calls, instead of the caller
+    recomputing the full series from scratch (and discarding everything
+    but `[-1]`) on every call. `value`/`last_ts` are `None` only before
+    the first `update()` -- the exact same "first value seeds on itself"
+    rule `ema_time_aware` uses for `out[0]`."""
+    value: float | None = None
+    last_ts: float | None = None
+    period: int = 9
+    reference_interval_seconds: float = 10.0
+
+    def update(self, value: float, ts: float) -> float:
+        """Same k_eff derivation, same operation order, as one iteration
+        of `ema_time_aware`'s loop body -- bit-identical results."""
+        if self.value is None:
+            self.value = value
+            self.last_ts = ts
+            return self.value
+        k = 2.0 / (self.period + 1)
+        dt = ts - self.last_ts
+        if dt == self.reference_interval_seconds:
+            k_eff = k
+        else:
+            k_eff = 1 - (1 - k) ** (dt / self.reference_interval_seconds)
+        self.value = value * k_eff + self.value * (1 - k_eff)
+        self.last_ts = ts
+        return self.value
+
+    @classmethod
+    def from_series(cls, values: list[float], timestamps: list[float], period: int,
+                    reference_interval_seconds: float = 10.0) -> "EmaTimeAwareState":
+        """One-time rebuild from a full series -- same use (a fresh
+        watch's first backfill batch, or a restart reconstruction) as
+        `SessionVwapState.from_bars`."""
+        full = ema_time_aware(values, timestamps, period, reference_interval_seconds)
+        return cls(
+            value=full[-1] if full else None,
+            last_ts=timestamps[-1] if timestamps else None,
+            period=period, reference_interval_seconds=reference_interval_seconds,
+        )
+
+
 def macd(closes: list[float], fast: int = 12, slow: int = 26, signal: int = 9) -> dict:
     """Returns {'macd': [...], 'signal': [...], 'histogram': [...]}, one value
     per input close, using EMA seeded on the first value (matches common
@@ -153,6 +199,60 @@ def macd_time_aware(closes: list[float], timestamps: list[float], fast: int = 12
     signal_line = ema_time_aware(macd_line, timestamps, signal, reference_interval_seconds)
     histogram = [m - s for m, s in zip(macd_line, signal_line)]
     return {"macd": macd_line, "signal": signal_line, "histogram": histogram}
+
+
+@dataclass
+class MacdTimeAwareState:
+    """Persistent, incremental sibling of `macd_time_aware` (specs.md
+    section 28/29, build_state incremental architecture): composed
+    directly from three `EmaTimeAwareState` legs (fast/slow/signal),
+    exactly mirroring how `macd_time_aware` itself composes three
+    `ema_time_aware` calls -- the signal leg is fed the DERIVED macd
+    line (fast - slow), not raw closes, same as the full-recompute
+    version."""
+    fast: EmaTimeAwareState
+    slow: EmaTimeAwareState
+    signal: EmaTimeAwareState
+
+    @classmethod
+    def new(cls, fast: int = 12, slow: int = 26, signal: int = 9,
+           reference_interval_seconds: float = 10.0) -> "MacdTimeAwareState":
+        return cls(
+            fast=EmaTimeAwareState(period=fast, reference_interval_seconds=reference_interval_seconds),
+            slow=EmaTimeAwareState(period=slow, reference_interval_seconds=reference_interval_seconds),
+            signal=EmaTimeAwareState(period=signal, reference_interval_seconds=reference_interval_seconds),
+        )
+
+    def update(self, close: float, ts: float) -> dict:
+        fast_val = self.fast.update(close, ts)
+        slow_val = self.slow.update(close, ts)
+        macd_val = fast_val - slow_val
+        signal_val = self.signal.update(macd_val, ts)
+        histogram = macd_val - signal_val
+        return {"macd": macd_val, "signal": signal_val, "histogram": histogram}
+
+    @classmethod
+    def from_series(cls, closes: list[float], timestamps: list[float], fast: int = 12,
+                    slow: int = 26, signal: int = 9,
+                    reference_interval_seconds: float = 10.0) -> "MacdTimeAwareState":
+        """One-time rebuild from a full series, same use as
+        `EmaTimeAwareState.from_series`. Recomputes the same three
+        `ema_time_aware` legs `macd_time_aware` itself would, so each
+        leg's seeded `value`/`last_ts` matches exactly what continuous
+        `update()` calls from empty would have produced."""
+        fast_full = ema_time_aware(closes, timestamps, fast, reference_interval_seconds)
+        slow_full = ema_time_aware(closes, timestamps, slow, reference_interval_seconds)
+        macd_line = [f - s for f, s in zip(fast_full, slow_full)]
+        signal_full = ema_time_aware(macd_line, timestamps, signal, reference_interval_seconds)
+        last_ts = timestamps[-1] if timestamps else None
+        return cls(
+            fast=EmaTimeAwareState(value=fast_full[-1] if fast_full else None, last_ts=last_ts,
+                                   period=fast, reference_interval_seconds=reference_interval_seconds),
+            slow=EmaTimeAwareState(value=slow_full[-1] if slow_full else None, last_ts=last_ts,
+                                   period=slow, reference_interval_seconds=reference_interval_seconds),
+            signal=EmaTimeAwareState(value=signal_full[-1] if signal_full else None, last_ts=last_ts,
+                                     period=signal, reference_interval_seconds=reference_interval_seconds),
+        )
 
 
 def relative_volume(bars: list[dict], lookback: int = 20) -> list[float]:
