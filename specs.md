@@ -4597,7 +4597,120 @@ deployment) production system** — see section 28's deployment log for
 the real before/after evidence (LOBO's position closed, entry/exit/P&L
 confirmed, both deployment preconditions re-verified clean afterward).
 
-### 30. Roadmap / phases
+### 30. Core system deployment — `schwab-connector` + `monitor-app` live cutover (2026-09-21)
+
+**Scope, deliberately narrow.** `claude-connector`/narration explicitly
+NOT part of this deployment — a separate, later step once this holds up,
+per the standing plan of never landing two new things at once when
+something going wrong needs to be attributable to one cause.
+
+**Preconditions, checked fresh against live production, not assumed
+from any prior report.** First check (15:24 UTC-ish, before this
+section's work began) found a real open position on `LOBO` — deployment
+correctly held per the stop-and-report rule. Market-open/stream-live
+confirmed directly both times via real bar recency (5-15s old), not the
+calendar.
+
+**True rollback target, confirmed by hashing actual running-container
+files against git blobs (not assumed from git log alone) — and
+confirmed to be much further behind than previously assumed:**
+`monitor-app` was running **`c388a3d`** (2026-09-18 00:28:39 EDT — before
+the ENTIRE phase 3.6 time-aware migration and everything since, also
+confirmed independently by the live `/api/state` response still showing
+the old bar-count schema, `required_bars`/`consecutive_bars`, before
+redeploy); `schwab-connector` was running **`1ca21bb`** (2026-09-17
+18:41:24 EDT). Real file diffs confirmed both genuinely needed
+rebuilding (`git diff --stat 1ca21bb..HEAD -- schwab-connector/` showed
+real changes to `app.py`/`main.py`/`price_history.py`).
+
+**Fresh whole-suite run against HEAD, immediately before deploying**
+(explicitly requested, given the size of the `c388a3d`→HEAD gap): all
+634 tests, all four suites (core/schwab-connector/claude-connector/
+monitor-app), exit code 0 — nothing had silently drifted.
+
+**Manual position close, built and applied (specs.md section 29).**
+Before the close was actually needed, `LOBO`'s position resolved
+naturally via a real `trailing_stop` exit (+0.51% pnl) while the feature
+was being built — the new endpoint was committed and proven regardless,
+but wasn't the mechanism that actually cleared this specific position.
+
+**Deploy.** `docker compose down schwab-connector monitor-app` (clean
+stop+remove, confirmed by name), then `docker compose up -d --build
+schwab-connector monitor-app`. **Real incident, corrected within
+seconds:** this ALSO built and started `claude-connector`, because
+`monitor-app` has a real `depends_on: claude-connector: condition:
+service_started` in `docker-compose.yml` — Compose starts declared
+dependencies regardless of the service list passed to `up`, a real
+operational gap in the original plan (should have used `--no-deps`).
+Caught immediately (before `POST /api/narration/arm` was ever called,
+so no narration call could have fired), `claude-connector` stopped and
+removed via `docker compose stop`/`rm -f`. `CLAUDE_CREDENTIALS_PATH`
+also had to be added to `.env` (gitignored, not a secret itself — just
+the host path to one) purely because Compose refuses to parse the file
+at all without it (RUNBOOK.md's own documented requirement), regardless
+of which services are targeted.
+
+**New code confirmed genuinely running, not just "process didn't
+crash"** — same hashing method as the rollback-target check: every file
+inside both freshly-rebuilt containers matches `git show HEAD:<path> |
+sha256sum` exactly, HEAD = `7888b35` at deploy time. The five
+incrementalized classes (`IncrementalState`, `RelativeVolumeState`,
+`SessionVwapState`, `EmaTimeAwareState`, `MacdTimeAwareState`,
+`EvaluateHoldTimeAwareState`) confirmed directly importable inside the
+running `monitor-app` container. A restart resets the in-memory
+watchlist to `WATCH_SYMBOL` only (documented, expected behavior, not a
+regression) — `LOBO` was re-watched to resume its DB state, which is
+when its already-natural close was discovered.
+
+**Extended live observation, ~20 minutes, 4 checkpoints ~5 minutes
+apart (15:24-15:45 UTC), against genuine live market data — the first
+time this fix has run against real live-speed data rather than replay:**
+
+- Bar cadence stayed real and bounded throughout, no growing lag:
+  checkpoint bar-age readings 15.4s, 25.6s, 5.6s, 6.8s — noisy but
+  flat, not a monotonic trend toward the original ~10s-repeated-timeout
+  failure signature. Every watched symbol advanced ~30-36 bars per
+  5-minute checkpoint, matching real ~9-10s live cadence exactly (i.e.,
+  no backlog ever formed).
+- `docker stats`: both containers stayed low and flat across all four
+  checkpoints (`monitor-app` 0.10-0.14% CPU, `schwab-connector`
+  0.14-8.4%, the one higher reading coinciding with new symbols being
+  added, not sustained) — no CPU-spike signature of the O(n^2) wall
+  recurring.
+- Watched symbols changed several times mid-observation (`SPCX` →
+  `NCPL`/`GRML` → `+DDC`) — a real, independent user actively managing
+  their own watchlist concurrently with this observation, not a
+  deployment side effect.
+- **One real entry fired and closed entirely under the new code**
+  (`GRML`, trade id 71, `journal.db`, verified by direct query, not the
+  API alone): `setup_type=resistance_breakout` (correct attribution);
+  volume gate passed (`relative_volume=2.0687` >= `volume_threshold_
+  used=1.5`); `exit_phase=swing_low`, `stop_level=9.7907005` — checked
+  against real data: `entry_price(9.8399) * (1 - swing_low_buffer_pct_
+  used(0.005)) = 9.7907005`, an EXACT match, and `exit_price` equals
+  that same `stop_level` exactly — a genuinely, correctly anchored
+  early-phase stop-out, not a coincidence. `realized_pnl_dollars
+  = -1.2299875`, and `current_equity` moved from `2000.0` to
+  `1998.7700125` — exact match, real equity compounding confirmed
+  end-to-end on live data.
+- SSE push (`GET /api/state/stream`) confirmed delivering real,
+  fresh live data directly (not inferred from the browser).
+
+**One real, pre-existing item surfaced, not touched, flagged instead of
+acted on unilaterally:** `VEEE` (journal.db id 69, entry_ts=1790003190,
+opened before this redeploy under the OLD code) still has a genuinely
+OPEN position, but `VEEE` isn't currently watched, so it isn't being
+live-tracked right now — the exact same situation `LOBO` was in before
+being re-watched. Left as-is for the user's own decision (re-watch it to
+resume live tracking, or close it via section 29's new manual-close
+endpoint) — not something this deployment's scope authorized touching
+unilaterally.
+
+**Deployment declared stable, 2026-09-21 ~15:45 UTC.**
+`claude-connector`/narration remains the next, separate step — not
+started as part of this work.
+
+### 31. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,
