@@ -535,6 +535,99 @@ def test_post_watch_eviction_force_closes_the_evicted_symbols_open_position():
         assert store.closed == [("AEHL", "symbol_switched")]
 
 
+# -- manual position close: POST /api/positions/{symbol}/close (specs.md
+# section 30) --------------------------------------------------------------
+
+def test_post_close_position_closes_at_real_current_price_and_compounds_equity(tmp_path):
+    # A REAL JournalStore (not a fake) -- this must prove the actual
+    # equity-compounding write, the same real behavior a genuine
+    # trailing_stop exit produces, not just that an HTTP call returns ok.
+    from journal_logic import OpenPosition
+
+    bars = _bars(5, base=10.0)  # closes: 10.0, 10.1, 10.2, 10.3, 10.4
+    fetch = FakeFetch({"AEHL": [bars]})
+    c, store = _client_with_real_store(fetch, tmp_path, symbol="AEHL")
+    with c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        starting_equity = store.current_equity()
+
+        poller = c.app.state.poller
+        slot = poller._slots["AEHL"]
+        position = store.create(OpenPosition(
+            id=None, symbol="AEHL", entry_ts=bars[0]["ts"], entry_price=9.0,
+            high_water_mark=9.0, stop_level=8.5, shares=10.0,
+        ))
+        slot.journal_position = position
+
+        real_current_price = slot.bars[-1]["close"]
+        r = c.post(f"/api/positions/AEHL/close")
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+
+        # Position genuinely closed -- gone from the live slot, symbol
+        # STILL watched (unlike remove_symbol's force-close).
+        assert poller._slots["AEHL"].journal_position is None
+        assert "AEHL" in poller.symbols
+
+        closed = store.recent_closed()
+        assert len(closed) == 1
+        row = closed[0]
+        assert row["exit_reason"] == "manual_close"  # distinct from trailing_stop/symbol_switched
+        assert row["exit_price"] == real_current_price  # the REAL current market price, not stale
+        assert row["realized_pnl_dollars"] == pytest.approx(10.0 * (real_current_price - 9.0))
+
+        # Real equity compounding -- the same path a real trailing_stop
+        # exit uses (app.py's _update_journal, tick.closed branch), NOT
+        # the symbol_switched housekeeping force-close, which never
+        # touches current_equity at all.
+        assert store.current_equity() == pytest.approx(
+            starting_equity + 10.0 * (real_current_price - 9.0))
+
+
+def test_post_close_position_no_open_position_is_a_clean_409(tmp_path):
+    c, store = _client_with_real_store(FakeFetch({"AEHL": [_bars(3)]}), tmp_path, symbol="AEHL")
+    with c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        r = c.post("/api/positions/AEHL/close")
+        assert r.status_code == 409
+        assert r.json()["ok"] is False
+
+
+def test_post_close_position_unwatched_symbol_is_a_clean_409(tmp_path):
+    c, store = _client_with_real_store(FakeFetch({}), tmp_path, symbol=None)
+    with c:
+        r = c.post("/api/positions/NOPE/close")
+        assert r.status_code == 409
+        assert r.json()["ok"] is False
+
+
+def test_manual_close_is_excluded_from_real_trades_performance_stats(tmp_path):
+    # The actual requirement this feature must not silently violate: a
+    # manual_close row must never be counted as a real trading outcome
+    # in the loss-evaluation view, same as symbol_switched already isn't
+    # -- proven directly against analysis.py's real real_trades() filter,
+    # not just inspected by reading the code.
+    from journal_logic import OpenPosition
+    from analysis import real_trades
+
+    bars = _bars(3, base=10.0)
+    fetch = FakeFetch({"AEHL": [bars]})
+    c, store = _client_with_real_store(fetch, tmp_path, symbol="AEHL")
+    with c:
+        assert _wait_until(lambda: (_sym_state(c, "AEHL") or {}).get("status") == "ok")
+        poller = c.app.state.poller
+        position = store.create(OpenPosition(
+            id=None, symbol="AEHL", entry_ts=bars[0]["ts"], entry_price=9.0,
+            high_water_mark=9.0, stop_level=8.5, shares=10.0,
+        ))
+        poller._slots["AEHL"].journal_position = position
+        c.post("/api/positions/AEHL/close")
+
+        closed = store.recent_closed()
+        assert closed[0]["exit_reason"] == "manual_close"  # sanity
+        assert real_trades(closed) == []  # excluded, by the allowlist's construction
+
+
 # -- deleting journal rows: /api/journal/delete, /api/journal/clear_symbol_switched --
 
 def _seed_closed_trades(store):

@@ -4533,7 +4533,71 @@ from the original defect, which never completed at all (12 consecutive
 live bars, has three-to-four orders of magnitude more real time than it
 needs at every one of these checkpoints.
 
-### 29. Roadmap / phases
+### 29. Manual position close — `POST /api/positions/{symbol}/close`
+
+**Why this exists.** Before the core-system deployment (sections 28's
+build_state incremental architecture work, cutting over production from
+`c388a3d`/`1ca21bb`), a real open position (`LOBO`) needed to close
+before the deploy's own precondition check ("no open virtual positions
+on any watched symbol") could pass. Rather than manipulate the database
+directly, or force a housekeeping-style close, this is a real, permanent
+feature: a genuine, deliberate manual close, callable any time a human
+wants to exit a position early for a reason the strategy's own automatic
+rules (trailing stop, hold-confirmation reversal) don't cover.
+
+**Distinct from both existing exit paths, on purpose.**
+`Poller.close_position_manually(symbol)` (`app.py`) reuses the SAME
+`journal_store.close_position()`/`apply_realized_pnl()` mechanism a real
+`trailing_stop` exit uses (`_update_journal`'s `tick.closed` branch) —
+closes at the real current price (`slot.bars[-1]["close"]`), records the
+exit, and compounds `current_equity` — because a deliberate human
+decision to exit early is a real trading outcome with a real P&L, unlike
+`remove_symbol`'s `symbol_switched` housekeeping force-close (which
+never touches `current_equity`, and which also stops watching the
+symbol entirely). Manual close does neither of those: the symbol stays
+watched, only the open position clears.
+
+`exit_reason="manual_close"` — a third, distinct value alongside
+`trailing_stop` and `symbol_switched`, so a retrospective read of the
+journal can always tell which of the three actually happened, never
+misrepresenting an artificial, deployment-motivated (or any other
+manually-chosen) close as a genuine strategy outcome.
+
+**Excluded from performance stats by construction, verified not
+assumed.** `analysis.py`'s `real_trades()` (section 26) is an
+ALLOWLIST — `REAL_TRADE_EXIT_REASONS = frozenset({"trailing_stop"})` —
+not a denylist naming `symbol_switched`. This means `manual_close` is
+excluded from every loss-evaluation stat the moment it's introduced,
+with NO code change needed in `analysis.py` at all — confirmed by
+reading the filter directly (per this feature's own instruction to
+check, not assume) and by a dedicated test
+(`test_manual_close_is_excluded_from_real_trades_performance_stats`)
+that closes a real position via the real endpoint and asserts
+`real_trades()` on the resulting row returns empty.
+
+**Endpoint.** `POST /api/positions/{symbol}/close`, no body — `200
+{"ok": true, "reason": ""}` on success, `409 {"ok": false, "reason":
+"..."}` for an unwatched symbol, a symbol with no open position, or (a
+real edge case, not just defensive padding) a watched symbol with no
+bars yet to price the close at. Thin route handler
+(`api_close_position`), all real logic in `Poller.close_position_
+manually`, matching this codebase's established route-handler-stays-thin
+convention.
+
+**Tests** (`monitor-app/tests/test_app.py`): closes at the real current
+price and compounds equity by the real, correctly-computed dollar amount
+(a REAL `JournalStore`, not a fake — proving the actual write, not just
+an HTTP 200); a clean 409 for no-open-position and for an unwatched
+symbol; the `real_trades()` exclusion proof above. All four new tests
+pass; the full suite (638 tests across all four suites, up from 634)
+passes with zero regressions.
+
+**Applied for real, 2026-09-21, against the actually-running (pre-
+deployment) production system** — see section 28's deployment log for
+the real before/after evidence (LOBO's position closed, entry/exit/P&L
+confirmed, both deployment preconditions re-verified clean afterward).
+
+### 30. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,

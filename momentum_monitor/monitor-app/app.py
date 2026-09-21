@@ -1092,6 +1092,54 @@ class Poller:
         self._broadcast_state()
         return True
 
+    def close_position_manually(self, symbol: str) -> tuple[bool, str]:
+        """Closes SYMBOL's open virtual position right now, at the real
+        current market price (specs.md section 30) -- a genuine, real
+        close a human deliberately chose to make, NOT `remove_symbol`'s
+        `symbol_switched` housekeeping force-close: the symbol stays
+        watched (this method never touches `self._slots`, unlike
+        `remove_symbol`'s `pop`), and it DOES compound `current_equity`,
+        exactly like a real `trailing_stop` exit (`_update_journal`'s
+        `tick.closed` branch) -- because closing early by deliberate
+        human choice is a real trading decision with a real P&L outcome,
+        never a symbol_switched-style non-event.
+
+        `exit_reason="manual_close"` -- distinct from both
+        `"trailing_stop"` (a real strategy exit) and `"symbol_switched"`
+        (housekeeping), so a retrospective read of the journal can always
+        tell which of the three actually happened. `analysis.py`'s
+        `real_trades()` ALLOWLISTs `"trailing_stop"` only, so this is
+        excluded from performance stats BY CONSTRUCTION -- no separate
+        filter to keep in sync.
+
+        Returns (False, reason) if the symbol isn't watched, has no open
+        position, or has no bars yet to price the close at -- all real,
+        expected outcomes, never a crash."""
+        symbol = symbol.strip().upper()
+        if self._journal_store is None:
+            return False, "journaling is disabled"
+        slot = self._slots.get(symbol)
+        if slot is None:
+            return False, f"{symbol} is not currently watched"
+        if slot.journal_position is None:
+            return False, f"{symbol} has no open position to close"
+        if not slot.bars:
+            return False, f"{symbol} has no bars yet -- no current price to close at"
+        position = slot.journal_position
+        last_bar = slot.bars[-1]
+        exit_event = ExitEvent(exit_ts=last_bar["ts"], exit_price=last_bar["close"],
+                               exit_reason="manual_close")
+        pnl_dollars = self._journal_store.close_position(position, exit_event)
+        # Same real-exit compounding app.py's own tick.closed branch uses
+        # (specs.md section 7) -- pnl_dollars is None only for a
+        # pre-migration position whose shares were never computed, in
+        # which case there's nothing well-defined to compound.
+        if pnl_dollars is not None:
+            self._journal_store.apply_realized_pnl(position.id, pnl_dollars)
+        slot.journal_position = None
+        self._broadcast_state()
+        return True, ""
+
     def update_watch_note(self, symbol: str, note: str) -> tuple[bool, str]:
         """Updates the note for an ALREADY-watched symbol without
         removing/re-adding it (specs.md section 7) -- context often
@@ -3403,6 +3451,15 @@ def create_app(*, fetch_bars, watch_symbol=None,
                 )
         ok, reason = poller.review_trade(trade_id, review_label, review_note,
                                          ideal_entry_price)
+        return JSONResponse({"ok": ok, "reason": reason}, status_code=200 if ok else 409)
+
+    @app.post("/api/positions/{symbol}/close")
+    async def api_close_position(symbol: str):
+        # Manual position close (specs.md section 30) -- closes at the
+        # real current price via poller.close_position_manually, which
+        # reuses the SAME close_position/apply_realized_pnl mechanism a
+        # real trailing_stop exit uses, exit_reason="manual_close".
+        ok, reason = poller.close_position_manually(symbol)
         return JSONResponse({"ok": ok, "reason": reason}, status_code=200 if ok else 409)
 
     @app.post("/api/journal/clear_symbol_switched")
