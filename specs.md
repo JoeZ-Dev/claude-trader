@@ -4328,10 +4328,143 @@ apparent flatness.
 scope for this fix, unchanged from the reasoning above and the original
 task scope — not touched by this audit.
 
-Stage 2 (incremental redesign, equivalence-proven per function) and
-stage 3 (re-run the original lockup replay, real before/after timing)
-are recorded in the section(s) that follow this one as that work
-completes.
+**Stage 2 — incremental redesign, all five functions, equivalence-proven
+individually against real data (built 2026-09-21).** Sequenced simplest
+to most complex, per the agreed plan (prove the shared persistent-state
+pattern on the lowest-risk function first): `SessionVwapState`, then
+`EmaTimeAwareState`/`MacdTimeAwareState`, then
+`EvaluateHoldTimeAwareState`, then `RelativeVolumeState` last (the
+original defect). Each lives in `core/` next to its bar-count sibling
+function, as a small class holding persistent cross-call state plus
+`update()` (fold in ONE new bar/value, O(1) amortized) and a
+`from_bars`/`from_series` classmethod (one-time O(n) rebuild from a full
+history — a fresh watch's first backfill batch, or a restart
+reconstruction).
+
+Two real complications, both solved with the same pattern (a
+one-bar-delayed commit): `evaluate_hold_time_aware`'s `bar_end_ts` and
+`relative_volume_time_aware`'s `_bar_duration` both depend on the ACTUAL
+next bar's ts, unknowable until that bar arrives — each class holds the
+most-recently-processed bar as `pending`, evaluated with the same
+reference-width ESTIMATE the bar-count versions use as their own
+fallback for whichever bar is currently last, and only commits it (with
+the real, now-known duration) once the next `update()` call arrives —
+exactly matching what a fresh full recompute over the growing bars list
+would produce at each point, not just eventually.
+
+Each function proven bit-identical to its bar-count sibling on real
+AIFF/AEMD data (`core/tests/test_core.py`): `SessionVwapState`/
+`EmaTimeAwareState`/`MacdTimeAwareState`/`EvaluateHoldTimeAwareState`
+exhaustively over AIFF's entire real first session (3,538 bars, every
+single step checked, not just the end state);
+`RelativeVolumeState` exhaustively over 900 real AIFF bars and 600 real
+AEMD bars (capped — the REFERENCE implementation's own O(n^2)-per-call
+cost makes a full exhaustive walk cost O(n^3), the exact defect being
+fixed), plus sparse checkpoints across the full 3,538-bar AIFF session
+against the real function. Lifecycle (fresh-watch starts empty,
+remove-then-readd doesn't inherit stale state, restart reconstructs
+correctly from one large batch) proven at both the core level and,
+after wiring, at the production `Poller`/`_SymbolSlot` level.
+
+**Wiring (`monitor-app/state.py`/`app.py`).** `build_state` gained an
+optional `incremental: IncrementalState | None = None` parameter —
+`None` (the default) is the ORIGINAL, byte-identical full-recompute
+path; every pre-existing test still calls it that way. Given an
+`IncrementalState` (a new field on `_SymbolSlot`, `default_factory`, so
+a fresh watch or a remove-then-readd both get one for free via normal
+object construction — confirmed directly: `add_symbol` always
+constructs a brand new `_SymbolSlot`, `remove_symbol` does
+`self._slots.pop(symbol, None)`, dropping the old one entirely), only
+`bars[incremental.processed_count:]` — the genuinely NEW bars since the
+last call — get folded into each sub-state. Two boundary decisions
+stayed the CALLER's job, not the core classes': session-VWAP reset on a
+real NY-calendar-date rollover (detected by comparing the latest bar's
+date to `incremental.vwap_session_date`), and a one-time rebuild for
+`hold_above`/`hold_below` whenever `detect_levels` (still fully
+recomputed every call, out of scope) picks a DIFFERENT level than the
+one currently being tracked.
+
+`_apply_new_bars` (`app.py`) now passes `slot.incremental` through.
+Proven at the actual production call path, not just the state.py unit
+level: a real `Poller`/`apply_bar_push` sequence against real AIFF data,
+confirming `slot.incremental.processed_count` genuinely advances (catches
+"the parameter exists but nothing calls it" — a bug unit tests on
+`build_state` alone couldn't see) and that `slot.state` matches an
+independent full recompute at every step. All 634 tests across all four
+suites (core, schwab-connector, claude-connector, monitor-app) pass,
+zero regressions. Commits: `core: SessionVwapState...(1/5)` through
+`core: RelativeVolumeState...(5/5)`, then
+`monitor-app+core: wire all five incremental functions into build_state`.
+
+**Targeted follow-up check — does `detect_levels`/`swing_points_
+time_aware`'s exclusion still hold at much larger bar counts than
+originally profiled?** The original stage-1 scoping decision (excluded:
+"proven not currently contributing to the wall") was based on profiling
+only up to 1,200 bars. Before running stage 3's full replay, a first
+attempt (all 12,500 real AIFF bars fed through the actual production
+`Poller.apply_bar_push` path in a tight loop, no real inter-bar delay)
+ran far longer than expected — over 6 minutes of continuous CPU time
+before being stopped, well past what the now-fixed five functions alone
+would explain. This prompted a targeted single-function check rather
+than continuing to wait out that run.
+
+Real measurements, `detect_levels` (which internally calls
+`swing_points_time_aware`), single calls, real AIFF/AEMD data, wall-clock
+timers, best of 3, at 100/1,200/3,000/5,000/8,000 bars:
+
+| n | AIFF `detect_levels` | AEMD `detect_levels` |
+|---|---|---|
+| 100 | 0.39ms | 0.61ms |
+| 1,200 | 8.16ms | 2.40ms |
+| 3,000 | 10.34ms | 14.68ms |
+| 5,000 | 11.40ms | 20.39ms |
+| 8,000 | 18.72ms | 38.80ms |
+
+Overall scaling from 100 to 8,000 bars (80x more bars): AIFF's cost grew
+48x (~n^0.88), AEMD's grew 64x (~n^0.95) — sub-quadratic, but
+GENUINELY growing, not flat. This confirms `detect_levels`/
+`swing_points_time_aware` shares the exact same architectural pattern
+the other five functions had BEFORE stage 2's fix: fully recomputed from
+the entire bar history on every single incoming bar, no cross-call state
+at all — it is not, and was never claimed to be, an O(1)-per-bar
+function. (The scaling isn't perfectly smooth either — AIFF's segment
+exponent dropped to ~0.19-0.26 between 1,200 and 5,000 bars before
+re-accelerating to ~1.06 by 8,000, most plausibly data-dependent — how
+many real swing points/levels exist in a given stretch — rather than a
+clean power law; recorded honestly, not smoothed over.)
+
+The reason exclusion still holds: the ORIGINAL incident's actual failure
+criterion was a SINGLE bar's processing time exceeding the real ~10s
+live-cadence gap, repeatedly, with no recovery — not cumulative test
+runtime. At n=8,000, a single `detect_levels` call costs under 40ms,
+roughly 250-1,000x below that 10-second threshold. Extrapolating each
+dataset's own observed trend (the steeper, ~n^0.95 AEMD trend, which
+reaches the threshold FIRST), a single call would not approach 10,000ms
+until roughly **2.5-2.8 million accumulated bars** — at live 10s cadence,
+upward of 270 days of continuous bars for one symbol. `_SymbolSlot.bars`
+is confirmed unbounded across an entire multi-day watch period (stage
+1's audit), so this isn't literally impossible in principle, but it is
+never reached within any realistic single watch period, and nowhere
+close to the ~1,200-1,400 bar range (a few hours) where the ORIGINAL,
+now-fixed defect actually locked the system up.
+
+**Conclusion: the original stage-1 scoping decision to exclude
+`swing_points_time_aware`/`detect_levels` from this fix is CONFIRMED
+correct, not merely assumed — a deliberate, evidence-backed deferral for
+a future, separate pass (matching its own original characterization: "a
+genuinely harder problem... deserves its own separate, later pass"), not
+an oversight this incident's fix needed to also cover.** The slow first
+replay attempt is explained as a test-harness artifact: running 8,000+
+back-to-back calls with no real inter-bar delay sums `detect_levels`'
+modest-but-nonzero per-call cost into real minutes of wall-clock,
+compressing what would be many real hours of live cadence into a tight
+loop — not evidence of a production lockup risk from this component.
+Stage 3's replay (below) reports real per-bar cost at checkpoints
+instead of waiting out a full serial run's total wall-clock, for exactly
+this reason.
+
+Stage 3 (re-run the original lockup replay, real before/after timing) is
+recorded in the section that follows this one as that work completes.
 
 ### 29. Roadmap / phases
 
