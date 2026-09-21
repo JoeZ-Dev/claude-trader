@@ -4254,11 +4254,84 @@ actual current code first):
   qualitative diagnosis — which function dominates, that it's the only
   quadratic one, that its dominance grows with n — holds exactly.
 
-Stage 1 (auditing whether `session_vwap`/`ema_time_aware`/`macd_time_
-aware`/`evaluate_hold_time_aware` are already genuinely incremental, or
-just cheap enough to look flat in the tested range) and the redesign
-that follows are recorded in the section(s) that follow this one as that
-work completes.
+**Stage 1 — audit of `session_vwap`/`ema_time_aware`/`macd_time_aware`/
+`evaluate_hold_time_aware`.** Confirmed directly by reading each
+implementation (not assumed from the profiling numbers alone, which only
+show wall-clock cost within 100-1200 bars, not architecture): **none of
+the four maintain genuine O(1)-per-bar incremental state.** All four are
+recomputed from scratch, over the FULL accumulated history, on every
+single `build_state` call — exactly the same architectural defect as
+`relative_volume_time_aware`, just with a linear (not quadratic)
+per-call cost, which is why they profiled as small/flat in the tested
+range rather than because they're already correctly incremental.
+
+- `session_vwap` (`core/indicators.py:16-31`): a single forward pass
+  with no persisted state between calls — `cum_pv`/`cum_vol` are local
+  variables reset to `0.0` at the top of every call, discarded when the
+  function returns. Its caller, `session_bars_for_vwap`
+  (`state.py:61-66`), is a SEPARATE full-history cost paid on every
+  `build_state` call regardless: it filters the ENTIRE accumulated
+  `bars` list by NY calendar date to find today's slice
+  (`[b for b in bars if _ny_date(b["ts"]) == latest]`) before
+  `session_vwap` ever runs — O(total accumulated bars), not O(today's
+  bar count), even though `session_vwap`'s own body only processes the
+  smaller session slice once filtered.
+- `ema_time_aware` (`core/indicators.py:45-83`): a single forward pass
+  building the ENTIRE `out` list from `values[0]` every call, then only
+  `[-1]` is ever kept (`state.py:170-171`'s `ema9`/`ema20`, computed
+  directly on `closes`/`timestamps` rebuilt from the full `bars` on
+  every call, `state.py:134-135`). Called 5 times per `build_state`
+  call in total: twice directly (ema9, ema20) plus 3 more times
+  indirectly through `macd_time_aware` below — each one an independent
+  full-history recompute.
+- `macd_time_aware` (`core/indicators.py:99-118`): has no loop of its
+  own — pure composition of 3 `ema_time_aware` calls (fast/slow/signal)
+  — so it inherits the same full-history-per-call cost transitively,
+  three times per `build_state` call (`state.py:137`).
+- `evaluate_hold_time_aware` (`core/levels.py:415-515`): a single
+  forward pass rebuilding the ENTIRE streak/confirmation state machine
+  (`streak_start_ts`, `failed_attempts`, `confirmed`, `confirmed_at_ts`)
+  from `bars[0]` every call — nothing survives between calls. Called
+  twice per `build_state` call, once per level direction (`_level_block`
+  for resistance and support, `state.py:181-182`).
+
+Also confirmed: `_SymbolSlot.bars` (`app.py:294`) is append-only — grep
+of every `.bars` reference in `app.py` found no trim, reset, or
+reassignment anywhere except the single `slot.bars.append(bar)`
+(`app.py:1144`). A continuously-watched symbol's history, and therefore
+every one of these five functions' per-call cost, grows without bound
+across the ENTIRE watch period, not just within a single session.
+
+**Consequence for stage 2's scope, precisely why this had to be checked
+before designing anything:** each of these four functions is O(n) per
+call, not O(n^2) like unfixed `relative_volume_time_aware` — so calling
+an O(n) function once per incoming bar, across a session of N bars,
+already costs O(1)+O(2)+...+O(N) = O(N^2) in total, the SAME order
+`relative_volume_time_aware` would drop to if ONLY its inner O(i) rescan
+were fixed (O(n) per call instead of O(n^2)). In other words: fixing
+`relative_volume_time_aware`'s inner loop alone would not leave it as
+the sole remaining bottleneck — it would leave FIVE functions
+(`relative_volume_time_aware` included) all contributing the same O(N^2)
+architectural cost, just with `relative_volume_time_aware` no longer
+dominant by a wide margin. Reaching the actual goal (O(1) amortized per
+bar, O(N) total session cost) requires persistent cross-call state in
+**all five** — `relative_volume_time_aware`, `session_vwap` (plus its
+`session_bars_for_vwap` full-history filter), `ema_time_aware`,
+`macd_time_aware` (via `ema_time_aware`), and `evaluate_hold_time_aware`
+— not `relative_volume_time_aware` alone. This is a real scope
+expansion from "certainly `relative_volume_time_aware`, possibly
+others" to "confirmed: all five," found only by reading each
+implementation directly rather than trusting the profiling numbers'
+apparent flatness.
+
+`swing_points_time_aware`/`detect_levels` remain explicitly OUT of
+scope for this fix, unchanged from the reasoning above and the original
+task scope — not touched by this audit.
+
+Stage 2 (incremental redesign, equivalence-proven per function) and
+stage 3 (re-run the original lockup replay, real before/after timing)
+are recorded in the section(s) that follow this one as that work
+completes.
 
 ### 29. Roadmap / phases
 
