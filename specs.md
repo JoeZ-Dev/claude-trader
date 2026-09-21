@@ -4463,8 +4463,75 @@ Stage 3's replay (below) reports real per-bar cost at checkpoints
 instead of waiting out a full serial run's total wall-clock, for exactly
 this reason.
 
-Stage 3 (re-run the original lockup replay, real before/after timing) is
-recorded in the section that follows this one as that work completes.
+**Stage 3 — re-run the original lockup replay, real before/after timing
+(2026-09-21).** Methodology corrected from the first attempt: rather
+than running the full 12,500-bar (AIFF) / 7,200-bar (AEMD) sequence
+through `apply_bar_push` one bar at a time start to finish (which pays
+`detect_levels`/`evaluate_setups`'s real, out-of-scope, sub-quadratic
+per-call cost on every one of thousands of back-to-back calls, taking
+real minutes of test-harness wall-clock that reflects zero real
+inter-bar delay — a test-harness compression artifact, not a production
+signal), each checkpoint is measured directly: a real `Poller` is warmed
+up to `n-1` bars via ONE batched call (`_apply_new_bars`, mirroring a
+real `catch_up()` REST backfill — exercises the exact one-time
+`from_bars`/`from_series` rebuild paths stage 2 proved, O(n) once), then
+the SINGLE next real bar is pushed via the actual production
+`apply_bar_push` path and timed alone. That one number — cost of ONE
+new incoming bar, at `n-1` bars of already-accumulated real history — is
+exactly what the original incident's own failure criterion (a single
+bar's processing time exceeding the real ~10s live-cadence gap,
+repeatedly, with no recovery) measures.
+
+Real measurements, both real fixtures, same checkpoints as the original
+diagnosis (100/300/600/900/1200) plus further out to the original
+replay's own scope (2,000-12,500 AIFF; AEMD capped at 6,000, the most
+real bars available beyond 1,200 in that fixture at check time):
+
+| n | AIFF one-bar-push cost | AEMD one-bar-push cost |
+|---|---|---|
+| 100 | 2.35ms | 3.14ms |
+| 300 | 7.67ms | 9.91ms |
+| 600 | 21.06ms | 12.08ms |
+| 900 | 39.01ms | 12.40ms |
+| 1,200 | 45.71ms | 13.05ms |
+| 2,000 | 55.89ms | 40.79ms |
+| 3,000 | 61.60ms | 91.77ms |
+| 4,000 | 64.60ms | 130.42ms |
+| 6,000 | 85.44ms | 153.72ms |
+| 8,000 | 127.21ms | — |
+| 10,000 | 142.70ms | — |
+| 12,500 | 168.97ms | — |
+
+**No lockup: confirmed, not assumed.** Worst observed single-bar cost in
+either sweep: **168.97ms at AIFF n=12,500** — roughly **59x below** the
+real ~10,000ms failure threshold that defined the original incident (at
+the SAME bar count where the original smoke test had ALREADY locked up
+around bar_count=1,254-1,426, hours earlier in accumulated history). At
+the ORIGINAL lockup's own bar range (1,200-1,426), current cost is
+13-46ms — three orders of magnitude below where the system used to stop
+recovering entirely.
+
+Cost is NOT flat (2.3ms→169ms AIFF, 3.1ms→154ms AEMD across these
+ranges) — this residual, sub-quadratic growth is now entirely
+attributable to `detect_levels`/`evaluate_setups`/`evaluate_breakdown_
+setups`, the components correctly left out of this fix's scope (this
+section's own targeted check above already confirmed `detect_levels`
+alone scales ~n^0.88-0.95, far short of the 10s threshold even
+extrapolated to millions of bars). The five incrementalized functions'
+OWN contribution to this per-bar cost is, by stage 2's direct equivalence
+proofs, genuinely O(1) amortized regardless of n — they are not what's
+producing this residual growth.
+
+For scale, a rough trapezoidal estimate (from these same sparse
+checkpoints, NOT a direct measurement — deliberately not run for real,
+per the corrected methodology above) puts a full CONTINUOUS 12,500-bar
+AIFF run at roughly 20 real minutes of test-harness wall-clock if run
+serially with no inter-bar delay — finite and bounded, a world apart
+from the original defect, which never completed at all (12 consecutive
+10s timeouts, zero recovery, permanently stuck at a few hundred to
+~1,400 bars). The real production system, with genuine ~10s gaps between
+live bars, has three-to-four orders of magnitude more real time than it
+needs at every one of these checkpoints.
 
 ### 29. Roadmap / phases
 
@@ -4650,27 +4717,45 @@ recorded in the section that follows this one as that work completes.
    review against the user's own judgment. See section 6 for the full
    design — notably, no fixed target: a trailing stop only, by deliberate
    choice, not the "entry/stop/target" originally sketched here.
-3.7. **`build_state` incremental architecture (in progress).** Not a new
-   feature — a fix for a real production performance defect found via a
-   smoke test and profiling pass, both run against real captured data
-   (AIFF, AEMD). `build_state` recomputes the full per-symbol indicator
-   set from the ENTIRE accumulated bar history on every incoming bar,
-   with `relative_volume_time_aware`'s inner-loop rescan making that
-   ONE dominant, quadratic-per-call cost that compounds to O(n^3) total
-   session cost — a real lockup reproduced directly (session stalls
-   after roughly 1,200-1,400 bars of continuous 10s-cadence trading).
-   Full incident, root-cause trace, and the O(n^3) correction: section
-   28 (stage 0, documented 2026-09-21). Stage 1 (audit whether
-   `session_vwap`/`ema_time_aware`/`macd_time_aware`/`evaluate_hold_
-   time_aware` are already genuinely incremental or just cheap enough to
-   look flat at the tested bar counts), stage 2 (incremental redesign,
-   equivalence-proven), and stage 3 (re-run the original lockup replay
-   to prove the wall is actually gone, with real timing evidence) are
-   explicitly OUT of scope for `swing_points_time_aware`/`detect_
-   levels` — proven not currently contributing to the wall, and
-   deserving their own later, separate pass (a bar's status there can
-   depend on later bars, a harder problem). Recorded here as work
-   progresses.
+3.7. **`build_state` incremental architecture (built 2026-09-21).** Not
+   a new feature — a fix for a real production performance defect found
+   via a smoke test and profiling pass, both run against real captured
+   data (AIFF, AEMD). `build_state` recomputed the full per-symbol
+   indicator set from the ENTIRE accumulated bar history on every
+   incoming bar, with `relative_volume_time_aware`'s inner-loop rescan
+   making that ONE dominant, quadratic-per-call cost that compounded to
+   O(n^3) total session cost — a real lockup reproduced directly
+   (session stalls after roughly 1,200-1,400 bars of continuous
+   10s-cadence trading). Full incident, root-cause trace, and the O(n^3)
+   correction: section 28, stage 0. **Stage 1 (audit, documented
+   2026-09-21):** confirmed `session_vwap`/`ema_time_aware`/`macd_time_
+   aware`/`evaluate_hold_time_aware` were ALSO full-recompute-every-call
+   (just linear, not quadratic, per call — cheap enough to look flat at
+   the originally-tested bar counts, not because they were already
+   incremental) — real scope expansion from "certainly `relative_
+   volume_time_aware`" to "confirmed: all five." **Stage 2 (incremental
+   redesign, built 2026-09-21):** `SessionVwapState`/`EmaTimeAwareState`/
+   `MacdTimeAwareState`/`EvaluateHoldTimeAwareState`/`RelativeVolumeState`
+   — each proven bit-identical to its bar-count sibling on real AIFF/
+   AEMD data, wired into `build_state`/`_SymbolSlot` behind an optional
+   `incremental=` parameter (`None` stays the original, byte-identical
+   full-recompute path), proven at the real production `Poller`/
+   `apply_bar_push` level, not just the unit level. **Stage 3 (replay
+   proof, built 2026-09-21):** real per-bar cost at the original
+   diagnosis's own checkpoints, worst case 168.97ms at AIFF n=12,500 —
+   ~59x below the real ~10s failure threshold, three orders of magnitude
+   below where the original defect stopped recovering entirely (around
+   bar_count=1,254-1,426). Full incident writeup, stage 1's audit
+   findings, and all real evidence for stages 2-3: section 28.
+   `swing_points_time_aware`/`detect_levels` were explicitly OUT of
+   scope throughout — confirmed via a targeted real-data check (section
+   28) to share the SAME architectural pattern (full recompute, no
+   cross-call state, genuinely growing — ~n^0.88-0.95, not flat) but to
+   stay far below the actual failure threshold even extrapolated to
+   ~2.5-2.8 million accumulated bars, confirming the original exclusion
+   was evidence-backed, not assumed. A genuinely harder problem (a bar's
+   status there can depend on later bars) deserving its own later,
+   separate pass, not built here.
 5. Anything beyond this point (more autonomy, live execution) requires
    its own explicit design discussion and is not assumed by this roadmap.
 
