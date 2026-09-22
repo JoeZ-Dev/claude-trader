@@ -537,7 +537,7 @@ def test_a_closed_trades_note_snapshot_is_unaffected_by_a_later_note_change(tmp_
 # trail's 8.645 would have been, by design (phase 1 exists to cut a
 # failing pattern early, not ride it down 5%).
 #
-# Sizing (2026-09-21, specs.md section 36, B1 fix): risk_per_share is
+# Sizing (2026-09-21, specs.md section 35, B1 fix): risk_per_share is
 # this SAME real phase-1 distance (entry_price - _EXPECTED_PHASE1_STOP),
 # not entry_price * TRAIL_PCT -- confirmed live and measured on real
 # data that these diverge by 88-94%, systematically. Here, trigger_price

@@ -870,7 +870,7 @@ def test_new_entry_with_no_note_recorded_is_none_not_empty_string():
 
 def test_new_entry_computes_shares_from_current_equity_risk_pct_and_the_real_phase1_stop():
     # risk_per_share is the REAL phase-1 distance (2026-09-21, specs.md
-    # section 36, B1 fix), NOT entry_price * trail_pct -- confirmed live
+    # section 35, B1 fix), NOT entry_price * trail_pct -- confirmed live
     # and measured on real data that these diverge by 88-94%,
     # systematically, since trail_pct only becomes the real governing
     # distance once (if) a position later transitions to the flat
@@ -913,7 +913,7 @@ def test_new_entry_sizing_reads_current_equity_and_risk_pct_at_the_moment_of_ent
 
 def test_new_entry_zero_shares_when_risk_amount_is_smaller_than_one_share():
     # Unaffected by the real-phase1-stop sizing fix above (specs.md
-    # section 36) -- risk_amount=0.01 rounds down to 0 shares whether
+    # section 35) -- risk_amount=0.01 rounds down to 0 shares whether
     # risk_per_share is the old trail_pct-based 0.51 or the real 0.051,
     # so this scenario doesn't distinguish the two formulas -- kept as
     # its own dedicated zero-shares case regardless.
@@ -961,7 +961,7 @@ def test_new_entry_sizing_matches_real_historical_cases_under_the_fix(
 
 
 def test_new_entry_stop_level_and_sizing_share_the_same_real_phase1_distance():
-    # Confirms the fix needed no reordering (specs.md section 36's B1
+    # Confirms the fix needed no reordering (specs.md section 35's B1
     # investigation finding): trigger_price/swing_low_buffer_pct are
     # already in scope at the exact point sizing runs, in the SAME
     # advance_journal call that also sets the position's own initial
@@ -982,7 +982,7 @@ def test_open_positions_ratcheting_does_not_touch_sizing_fields():
     # Sizing is an entry-time-only concern -- apply_bar_to_open_position
     # (via advance_journal's ratchet loop) must never recompute or clear
     # it on a position that's simply continuing. Also confirms this
-    # fix's scope directly (specs.md section 36): a position already
+    # fix's scope directly (specs.md section 35): a position already
     # ratcheting (whether still in swing_low or transitioned to
     # trailing) never touches these fields regardless of which formula
     # priced them at entry -- the fix only ever runs once, here.
@@ -1129,7 +1129,7 @@ def test_advance_journal_reopen_in_the_same_batch_sizes_off_post_close_equity():
     # ... which is NOT the raw 2000.0 that was passed in -- the exact bug.
     assert tick.opened.account_size_used != 2000.0
 
-    # risk_per_share is the REAL phase-1 distance (specs.md section 36,
+    # risk_per_share is the REAL phase-1 distance (specs.md section 35,
     # B1 fix), not entry_price * TRAIL_PCT -- this test predates that
     # fix and is updated here to the corrected formula, not re-derived
     # independently from it.

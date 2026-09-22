@@ -5015,7 +5015,77 @@ directly inside the running container's own Python environment —
 old buggy `9.476`) — confirmed fixed on the actual running system, not
 just inferred from a matching file hash.
 
-### 35. Roadmap / phases
+### 35. Sizing/stop mismatch — B1, investigated then fixed (2026-09-21)
+
+**Investigation (no code changes) — order of operations, traced
+directly.** `trigger_price` and `swing_low_buffer_pct` are both already
+in scope, in the exact same `advance_journal` call, BEFORE the sizing
+math runs (`journal_logic.py:548-639`) — the phase-1 anchor
+(`_phase1_anchor(trigger_price, entry_price)`, clamped to
+`min(trigger_price, entry_price)`) is computed a few lines after
+sizing, from data already available at the sizing point. **No
+reordering was needed for a fix** — the sizing formula simply never
+cross-referenced the real anchor.
+
+**Investigation — measured on the 16 real closed `exit_phase=
+"swing_low"` trades in the database.** Real risk-per-share was
+**88.8%-93.75% tighter** than what `entry_price * trail_pct` sizing
+assumed — **16 of 16 trades, zero counterexamples**, not a small or
+random-per-trade difference. Structurally explainable, not noise: when
+`trigger_price >= entry_price` (the common case, 11 of 16 trades), the
+clamp forces `anchor = entry_price`, so the real stop distance is
+governed entirely by `swing_low_buffer_pct` (0.5%) — completely
+independent of `trail_pct` (8%). In that case the ratio is **exactly**
+`swing_low_buffer_pct / trail_pct` (6.25% at today's live values), for
+any entry price — a clean, deterministic relationship. Practical
+consequence: every one of these 16 real trades' actual dollar risk was
+roughly 6-11% of the stated `risk_pct_per_trade` target, not the
+intended 1% of equity — under-risked, not over-risked, but a large,
+systematic distortion of the strategy's real risk profile, affecting
+100% of trades investigated (every visible closed trade at investigation
+time was `swing_low`-exit).
+
+**Fix.** `risk_per_share = entry_price - phase1_stop`, where
+`phase1_stop = initial_stop_level(_phase1_anchor(trigger_price,
+entry_price), swing_low_buffer_pct)` — the SAME value now computed once
+and reused for both the position's own initial `stop_level` and sizing
+(previously two separate computations from the same inputs that never
+cross-referenced each other). Applies to new entries only — every new
+position starts in `"swing_low"` phase, so this is the only phase
+sizing ever runs for; positions already ratcheting, and the flat-
+trailing phase's own stop computation (`apply_bar_to_open_position`,
+untouched), are unaffected — sizing is an entry-time-only concern that
+never re-runs.
+
+**Historical trades are NOT retroactively corrected** — same append-
+only principle as every other historical record in this project
+(`symbol_switched` exits, equity history, etc.). **Every closed trade
+with `entry_ts` before commit `ec8088c` (2026-09-21) was sized using
+the OLD, flawed `entry_price * trail_pct` assumption** — for a
+`swing_low`-exit trade specifically, that means `risk_amount_used`/
+`shares`/`account_size_used` reflect an assumed risk roughly 6-16x
+LARGER than the real risk actually taken at entry (the exact ratio, for
+the common clamped case, is `trail_pct / swing_low_buffer_pct` — the
+inverse of the 6.25% figure above). Any future analysis of early trades
+(R-multiples, expectancy-per-unit-risk, or anything normalizing by
+`risk_amount_used`) must account for this — those figures do not
+reflect real risk taken for pre-fix trades.
+
+**Tests.** Parametrized against the 4 real historical cases from the
+investigation (GRML/NCPL/SPCX/VEEE — real `entry_price`/`trigger_price`/
+`trail_pct_used`/`account_size_used` values), confirming what shares
+WOULD have been correctly sized under the fix; a dedicated test proving
+`stop_level` and sizing share one computed real number (confirming no
+reordering was needed, not just asserted); 6 pre-existing tests (across
+`test_journal_logic.py` and `test_journal_wiring.py`) had their expected
+share counts/dollar amounts updated — recomputed from the corrected
+formula, not adjusted to make tests pass. Full suite: 472 tests, all
+pass, zero regressions.
+
+**Deployed and verified live** — see the deploy confirmation
+immediately following this section's own commit.
+
+### 36. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,

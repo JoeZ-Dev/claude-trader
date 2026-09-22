@@ -606,7 +606,7 @@ def advance_journal(
             # risk_per_share is the REAL dollar distance from entry to
             # the actual governing stop at this instant -- phase1_stop
             # above, NOT entry_price * trail_pct (2026-09-21, specs.md
-            # section 36, B1: confirmed live and measured on real data
+            # section 35, B1: confirmed live and measured on real data
             # that these can diverge by 88-94%, systematically, since
             # phase 1's real stop is governed by swing_low_buffer_pct
             # once the trigger-price anchor clamps to entry_price -- a
