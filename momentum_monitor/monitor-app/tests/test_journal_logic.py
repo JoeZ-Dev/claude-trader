@@ -868,20 +868,31 @@ def test_new_entry_with_no_note_recorded_is_none_not_empty_string():
 
 # -- position sizing with compounding virtual equity (specs.md section 7) --
 
-def test_new_entry_computes_shares_from_current_equity_risk_pct_and_trail_pct():
-    # risk_amount = 2000 * 0.01 = 20.0; risk_per_share = 10.2 * 0.05 =
-    # 0.51; shares = floor(20.0 / 0.51) = 39; risk_amount_used = 39 *
-    # 0.51 = 19.89 (the REAL amount risked at this rounded share count,
-    # not the theoretical 20.0 target).
+def test_new_entry_computes_shares_from_current_equity_risk_pct_and_the_real_phase1_stop():
+    # risk_per_share is the REAL phase-1 distance (2026-09-21, specs.md
+    # section 36, B1 fix), NOT entry_price * trail_pct -- confirmed live
+    # and measured on real data that these diverge by 88-94%,
+    # systematically, since trail_pct only becomes the real governing
+    # distance once (if) a position later transitions to the flat
+    # trailing phase, which every new entry starts before.
+    #
+    # entry_price=10.2, trigger_price=10.5 (_setup's own default, ABOVE
+    # entry -- the common real case) -> _phase1_anchor clamps to
+    # entry_price itself: anchor=10.2. phase1_stop = 10.2 * (1-0.005) =
+    # 10.149. risk_per_share = 10.2 - 10.149 = 0.051 (NOT 10.2*0.05=0.51,
+    # the OLD trail_pct-based value -- a real, ~10x difference here).
+    # risk_amount = 2000*0.01 = 20.0; shares = floor(20.0/0.051) = 392;
+    # risk_amount_used = 392*0.051 = 19.992 (the REAL amount risked at
+    # this rounded share count, not the theoretical 20.0 target).
     tick = _advance(
         new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
         setups=[_setup("resistance_breakout", confirmed=True)],
         current_equity=2000.0, risk_pct_per_trade=0.01, trail_pct=0.05,
     )
-    assert tick.opened.shares == 39
+    assert tick.opened.shares == 392
     assert tick.opened.account_size_used == 2000.0
     assert tick.opened.risk_pct_used == 0.01
-    assert tick.opened.risk_amount_used == pytest.approx(19.89)
+    assert tick.opened.risk_amount_used == pytest.approx(19.992)
 
 
 def test_new_entry_sizing_reads_current_equity_and_risk_pct_at_the_moment_of_entry():
@@ -895,12 +906,18 @@ def test_new_entry_sizing_reads_current_equity_and_risk_pct_at_the_moment_of_ent
     )
     assert tick.opened.account_size_used == 5000.0
     assert tick.opened.risk_pct_used == 0.02
-    # risk_amount = 100.0; risk_per_share = 10.2*0.05 = 0.51; shares =
-    # floor(100.0/0.51) = 196
-    assert tick.opened.shares == 196
+    # risk_amount = 100.0; risk_per_share = the real phase-1 distance,
+    # 0.051 (see the test above) -- shares = floor(100.0/0.051) = 1960
+    assert tick.opened.shares == 1960
 
 
 def test_new_entry_zero_shares_when_risk_amount_is_smaller_than_one_share():
+    # Unaffected by the real-phase1-stop sizing fix above (specs.md
+    # section 36) -- risk_amount=0.01 rounds down to 0 shares whether
+    # risk_per_share is the old trail_pct-based 0.51 or the real 0.051,
+    # so this scenario doesn't distinguish the two formulas -- kept as
+    # its own dedicated zero-shares case regardless.
+    #
     # A tiny current_equity (or tight risk_pct) relative to the stock's
     # own price/stop distance -- shares rounds DOWN to 0, a real, valid,
     # journaled outcome (specs.md: "the trade still logs ... but visibly
@@ -917,10 +934,58 @@ def test_new_entry_zero_shares_when_risk_amount_is_smaller_than_one_share():
     assert tick.opened.risk_pct_used == 0.01
 
 
+@pytest.mark.parametrize("symbol,entry_price,trigger_price,trail_pct,buffer_pct,equity,risk_pct,new_shares", [
+    # Real closed trades (specs.md section 35's B1 investigation,
+    # journal.db ids 71/73/87/76) -- what shares WOULD have been sized
+    # under the real phase-1 stop, reusing each trade's own real
+    # entry/trigger/trail_pct/buffer/equity, not synthetic round numbers.
+    # The OLD (buggy) formula produced 25/229/1/14 shares for these --
+    # confirmed by recomputing it directly against these same inputs
+    # before writing this test, matching the real recorded values
+    # exactly. The new, real-anchor-based shares are dramatically larger
+    # (the same ~6-16x magnitude the investigation measured).
+    ("GRML", 9.8399, 9.8454, 0.08, 0.005, 2000.0, 0.01, 406),
+    ("NCPL", 1.0892, 1.1000, 0.08, 0.005, 1997.5693895, 0.01, 3667),
+    ("SPCX", 151.85, 152.00, 0.08, 0.005, 1965.755452, 0.01, 25),
+    ("VEEE", 17.208, 17.1694, 0.08, 0.005, 1985.1042395000002, 0.01, 159),
+])
+def test_new_entry_sizing_matches_real_historical_cases_under_the_fix(
+        symbol, entry_price, trigger_price, trail_pct, buffer_pct, equity, risk_pct, new_shares):
+    tick = _advance(
+        new_bars=[_bar(100, high=entry_price + 0.01, low=entry_price - 0.01, close=entry_price)],
+        setups=[_setup("resistance_breakout", confirmed=True, trigger_price=trigger_price)],
+        symbol=symbol, current_equity=equity, risk_pct_per_trade=risk_pct,
+        trail_pct=trail_pct, swing_low_buffer_pct=buffer_pct,
+    )
+    assert tick.opened.shares == new_shares
+
+
+def test_new_entry_stop_level_and_sizing_share_the_same_real_phase1_distance():
+    # Confirms the fix needed no reordering (specs.md section 36's B1
+    # investigation finding): trigger_price/swing_low_buffer_pct are
+    # already in scope at the exact point sizing runs, in the SAME
+    # advance_journal call that also sets the position's own initial
+    # stop_level from that identical value -- one real number, computed
+    # once and reused, not two independently-derived values that happen
+    # to agree by coincidence.
+    tick = _advance(
+        new_bars=[_bar(100, high=10.5, low=9.8, close=10.2)],
+        setups=[_setup("resistance_breakout", confirmed=True)],
+        current_equity=2000.0, risk_pct_per_trade=0.01, trail_pct=0.05,
+    )
+    implied_risk_per_share = tick.opened.entry_price - tick.opened.stop_level
+    assert tick.opened.risk_amount_used == pytest.approx(
+        tick.opened.shares * implied_risk_per_share)
+
+
 def test_open_positions_ratcheting_does_not_touch_sizing_fields():
     # Sizing is an entry-time-only concern -- apply_bar_to_open_position
     # (via advance_journal's ratchet loop) must never recompute or clear
-    # it on a position that's simply continuing.
+    # it on a position that's simply continuing. Also confirms this
+    # fix's scope directly (specs.md section 36): a position already
+    # ratcheting (whether still in swing_low or transitioned to
+    # trailing) never touches these fields regardless of which formula
+    # priced them at entry -- the fix only ever runs once, here.
     pos = OpenPosition(id=1, symbol="AEHL", entry_ts=0, entry_price=10.0,
                        high_water_mark=10.0, stop_level=9.5,
                        shares=39, account_size_used=2000.0,
@@ -1064,8 +1129,14 @@ def test_advance_journal_reopen_in_the_same_batch_sizes_off_post_close_equity():
     # ... which is NOT the raw 2000.0 that was passed in -- the exact bug.
     assert tick.opened.account_size_used != 2000.0
 
+    # risk_per_share is the REAL phase-1 distance (specs.md section 36,
+    # B1 fix), not entry_price * TRAIL_PCT -- this test predates that
+    # fix and is updated here to the corrected formula, not re-derived
+    # independently from it.
     risk_amount = expected_effective_equity * 0.01
-    risk_per_share = tick.opened.entry_price * TRAIL_PCT
+    phase1_stop = initial_stop_level(
+        journal_logic._phase1_anchor(10.5, tick.opened.entry_price), SWING_LOW_BUFFER_PCT)
+    risk_per_share = tick.opened.entry_price - phase1_stop
     assert tick.opened.shares == math.floor(risk_amount / risk_per_share)
     assert tick.opened.risk_amount_used == pytest.approx(tick.opened.shares * risk_per_share)
 

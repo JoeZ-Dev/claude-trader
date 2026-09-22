@@ -589,35 +589,50 @@ def advance_journal(
                 if closed_position.shares is not None:
                     effective_equity += closed_position.shares * (
                         exit_event.exit_price - closed_position.entry_price)
-            # risk_per_share is the dollar distance from entry to the
-            # initial stop (entry_price * trail_pct, algebraically the
-            # same distance initial_stop_level computes below) -- shares
-            # is how many of those risk_per_share units fit inside this
-            # entry's risk budget, rounded DOWN (never up: overshooting
-            # risk_amount on a rounding technicality would defeat the
-            # whole point of a risk-based size). risk_amount_used is the
-            # REAL amount the rounded share count risks, which can differ
-            # slightly from the theoretical risk_amount target above --
-            # the real number is what gets recorded.
+            # Phase 1 (specs.md section 12) starts anchored to the level
+            # actually broken to enter this trade -- no swing low can
+            # possibly be confirmed yet, this instant is entry itself --
+            # buffered the same way a real confirmed low would be, for
+            # the same noise-avoidance reason. Clamped to entry_price
+            # (_phase1_anchor): trigger_price can sit ABOVE the
+            # confirming bar's own close (a real, confirmed case -- see
+            # that function's docstring), and an unclamped anchor there
+            # would price this "protective" stop above the entry itself.
+            # Computed ONCE, reused for both the position's own initial
+            # stop_level AND sizing below -- the same real number, not
+            # two independently-derived values that could drift apart.
+            phase1_stop = initial_stop_level(
+                _phase1_anchor(trigger_price, entry_price), swing_low_buffer_pct)
+            # risk_per_share is the REAL dollar distance from entry to
+            # the actual governing stop at this instant -- phase1_stop
+            # above, NOT entry_price * trail_pct (2026-09-21, specs.md
+            # section 36, B1: confirmed live and measured on real data
+            # that these can diverge by 88-94%, systematically, since
+            # phase 1's real stop is governed by swing_low_buffer_pct
+            # once the trigger-price anchor clamps to entry_price -- a
+            # completely different, usually much tighter, distance than
+            # trail_pct assumes. trail_pct only becomes the REAL
+            # governing distance once a position later transitions to
+            # the flat trailing phase, which sizing has no way to
+            # anticipate at entry and doesn't try to -- this fixes
+            # sizing to match the phase every new position ACTUALLY
+            # starts in, not the phase it might reach later.)
+            # shares is how many of those risk_per_share units fit
+            # inside this entry's risk budget, rounded DOWN (never up:
+            # overshooting risk_amount on a rounding technicality would
+            # defeat the whole point of a risk-based size).
+            # risk_amount_used is the REAL amount the rounded share
+            # count risks, which can differ slightly from the
+            # theoretical risk_amount target above -- the real number is
+            # what gets recorded.
             risk_amount = effective_equity * risk_pct_per_trade
-            risk_per_share = entry_price * trail_pct
+            risk_per_share = entry_price - phase1_stop
             shares = math.floor(risk_amount / risk_per_share) if risk_per_share > 0 else 0
             risk_amount_used = shares * risk_per_share
             opened = OpenPosition(
                 id=None, symbol=symbol, entry_ts=entry_bar["ts"],
                 entry_price=entry_price, high_water_mark=entry_price,
-                # Phase 1 (specs.md section 12) starts anchored to the
-                # level actually broken to enter this trade -- no swing
-                # low can possibly be confirmed yet, this instant is
-                # entry itself -- buffered the same way a real confirmed
-                # low would be, for the same noise-avoidance reason.
-                # Clamped to entry_price (_phase1_anchor): trigger_price
-                # can sit ABOVE the confirming bar's own close (a real,
-                # confirmed case -- see that function's docstring), and
-                # an unclamped anchor there would price this "protective"
-                # stop above the entry itself.
-                stop_level=initial_stop_level(
-                    _phase1_anchor(trigger_price, entry_price), swing_low_buffer_pct),
+                stop_level=phase1_stop,
                 setup_type=candidate["setup_type"],
                 factors={
                     **candidate["factors"],

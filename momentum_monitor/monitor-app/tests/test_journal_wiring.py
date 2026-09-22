@@ -12,6 +12,7 @@ against core/, not assumed) to produce an actual False->True
 hold_confirmed transition through the real detect_levels/select_levels/
 evaluate_hold pipeline -- not a stubbed-out state dict.
 """
+import math
 import os
 import sys
 import time
@@ -534,12 +535,22 @@ def test_a_closed_trades_note_snapshot_is_unaffected_by_a_later_note_change(tmp_
 # initial_stop_level(9.1, app.py's DEFAULT_SWING_LOW_BUFFER_PCT=0.005) =
 # 9.1*0.995 = 9.0545 the whole time -- a much TIGHTER stop than the flat
 # trail's 8.645 would have been, by design (phase 1 exists to cut a
-# failing pattern early, not ride it down 5%). Loss: 43*(9.0545-9.1) =
-# -1.9565.
-_EXPECTED_SHARES = 43
-_EXPECTED_RISK_AMOUNT_USED = 43 * (9.1 * TRAIL_PCT)
+# failing pattern early, not ride it down 5%).
+#
+# Sizing (2026-09-21, specs.md section 36, B1 fix): risk_per_share is
+# this SAME real phase-1 distance (entry_price - _EXPECTED_PHASE1_STOP),
+# not entry_price * TRAIL_PCT -- confirmed live and measured on real
+# data that these diverge by 88-94%, systematically. Here, trigger_price
+# (9.25, round_number_reclaim's own grid point) sits ABOVE entry_price
+# (9.1), so _phase1_anchor clamps to entry_price itself -- the real
+# distance is governed entirely by SWING_LOW_BUFFER_PCT (0.5%), not
+# TRAIL_PCT (5%), a ~11x tighter distance and correspondingly larger
+# share count than the old formula gave.
 _EXPECTED_PHASE1_STOP = initial_stop_level(9.1, SWING_LOW_BUFFER_PCT)
-_EXPECTED_LOSS_DOLLARS = 43 * (_EXPECTED_PHASE1_STOP - 9.1)
+_EXPECTED_RISK_PER_SHARE = 9.1 - _EXPECTED_PHASE1_STOP
+_EXPECTED_SHARES = math.floor(2000.0 * 0.01 / _EXPECTED_RISK_PER_SHARE)
+_EXPECTED_RISK_AMOUNT_USED = _EXPECTED_SHARES * _EXPECTED_RISK_PER_SHARE
+_EXPECTED_LOSS_DOLLARS = _EXPECTED_SHARES * (_EXPECTED_PHASE1_STOP - 9.1)
 
 
 def test_entry_sizing_is_computed_and_persisted_end_to_end(tmp_path):
