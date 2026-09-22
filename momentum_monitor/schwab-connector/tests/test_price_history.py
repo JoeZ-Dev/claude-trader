@@ -74,6 +74,7 @@ class _FakeResponse:
 class _FakePriceHistoryNs:
     class PeriodType:
         DAY = "DAY_MARKER"
+        YEAR = "YEAR_MARKER"
 
     class Period:
         ONE_DAY = "ONE_DAY_MARKER"
@@ -149,10 +150,25 @@ def test_fetch_today_bars_returns_empty_for_empty_candles():
 # section 12) ----------------------------------------------------------
 
 def test_fetch_daily_history_requests_explicit_daily_range_ending_yesterday():
-    # Same "explicit start/end range, not period_type" discipline
-    # fetch_today_bars already established, for the same reason -- and
-    # end_datetime is deliberately today's own NY midnight (EXCLUSIVE of
-    # today), never today's still-forming partial-day volume.
+    # Explicit start/end range, same discipline fetch_today_bars already
+    # established -- end_datetime is deliberately today's own NY midnight
+    # (EXCLUSIVE of today), never today's still-forming partial-day volume.
+    #
+    # period_type=YEAR IS required here, unlike fetch_today_bars -- real
+    # regression, confirmed live against the actual Schwab API (specs.md
+    # section 33): omitting it entirely (which is correct for fetch_
+    # today_bars' MINUTE frequency, since Schwab defaults periodType to
+    # DAY, exactly what a minute-frequency request wants) causes Schwab to
+    # reject a DAILY-frequency request with that same defaulted periodType
+    # DAY -- the real error, verbatim: "Invalid frequencyType DAILY for
+    # periodType DAY". Adding period_type=YEAR fixes it while the
+    # EXPLICIT start_datetime/end_datetime are still honored exactly as
+    # given (confirmed live -- Schwab does not fall back to a period-based
+    # range once period_type is present, only `period`, the separate
+    # COUNT parameter, actually conflicts with explicit dates, per
+    # get_price_history's own docstring: "period: ... Should not be
+    # provided if start_datetime and end_datetime" -- period_type was
+    # never the thing that needed to be avoided).
     resp = _FakeResponse(200, {"candles": [
         {"datetime": (RTH_1030 - 86400) * 1000, "open": 1.0, "high": 1.0,
          "low": 1.0, "close": 1.0, "volume": 500_000},
@@ -166,10 +182,12 @@ def test_fetch_daily_history_requests_explicit_daily_range_ending_yesterday():
     assert len(client.calls) == 1
     symbol, kwargs = client.calls[0]
     assert symbol == "QCLS"
+    assert kwargs["period_type"] == _FakePriceHistoryNs.PeriodType.YEAR
     assert kwargs["frequency_type"] == _FakePriceHistoryNs.FrequencyType.DAILY
     assert kwargs["frequency"] == _FakePriceHistoryNs.Frequency.DAILY
     assert kwargs["need_extended_hours_data"] is False
-    assert "period_type" not in kwargs
+    # `period` (the COUNT) still must be absent -- that's the parameter
+    # that actually conflicts with explicit start/end dates.
     assert "period" not in kwargs
     assert kwargs["end_datetime"] == datetime(2026, 9, 18, 0, 0, 0, tzinfo=_NY)
     assert kwargs["start_datetime"] < kwargs["end_datetime"]

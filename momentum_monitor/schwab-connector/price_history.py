@@ -31,17 +31,36 @@ macd / detect_levels (momentum_monitor/core) take a plain bar list and
 don't assume uniform spacing, so a series that's 1-minute-granularity early
 and 10s-granularity later is a correct input, not a bug.
 
-Date range: an explicit start_datetime/end_datetime pair is used, NOT
-period_type=DAY/period=ONE_DAY. That period-based form was tried first and
-confirmed LIVE (backfilling QCLS on 2026-09-16, against the real Schwab
-API, not a guess) to return the PREVIOUS completed trading day when no
-date range is also given, not the current in-progress session -- matching
-get_price_history's own docstring ("end_datetime: ... Default is previous
-trading day"). That silently reproduced this exact cold-start VWAP bug one
-day later, since the live bar was the only one left matching "today" once
-session_bars_for_vwap (monitor-app/state.py) filtered by calendar date. An
-explicit range (today's NY midnight through now) sidesteps Schwab's
-period-based default entirely and is unambiguous about what "today" means.
+Date range (fetch_today_bars): an explicit start_datetime/end_datetime
+pair is used, NOT period_type=DAY/period=ONE_DAY. That period-based form
+was tried first and confirmed LIVE (backfilling QCLS on 2026-09-16,
+against the real Schwab API, not a guess) to return the PREVIOUS
+completed trading day when no date range is also given, not the current
+in-progress session -- matching get_price_history's own docstring
+("end_datetime: ... Default is previous trading day"). That silently
+reproduced this exact cold-start VWAP bug one day later, since the live
+bar was the only one left matching "today" once session_bars_for_vwap
+(monitor-app/state.py) filtered by calendar date. An explicit range
+(today's NY midnight through now) sidesteps Schwab's period-based
+default entirely and is unambiguous about what "today" means.
+
+Correction (specs.md section 33): the above is specific to
+`fetch_today_bars`' MINUTE frequency, NOT a blanket "never pass
+period_type" rule -- `fetch_daily_history` below genuinely NEEDS
+`period_type=YEAR` alongside its own explicit dates, a real regression
+found live (avg_daily_volume/continuation/market_backdrop all silently
+degraded to "unknown" for weeks): Schwab's real API defaults
+`periodType` to DAY whenever it's omitted, and DAY only accepts
+`frequencyType=minute` -- which is why omitting `period_type` happened
+to work for `fetch_today_bars` (MINUTE) but returns a genuine 400 for
+`fetch_daily_history` (DAILY: "Invalid frequencyType DAILY for
+periodType DAY"). Confirmed live, separately, that Schwab still honors
+explicit start_datetime/end_datetime with `period_type` present -- only
+`period` (the separate COUNT parameter) actually conflicts with
+explicit dates, per get_price_history's own docstring. The original
+"period_type/period must both be absent" conclusion conflated two
+independent parameters that only happened to both be irrelevant for the
+MINUTE case tested at the time.
 """
 from __future__ import annotations
 
@@ -141,12 +160,30 @@ async def fetch_daily_history(client, symbol: str, *, lookback_days: int = 30,
     False preserves every existing caller's behavior byte-for-byte.
 
     Raises on any non-2xx response or network failure, same as
-    fetch_today_bars -- callers decide whether that's fatal."""
+    fetch_today_bars -- callers decide whether that's fatal.
+
+    `period_type=YEAR` is REQUIRED here (specs.md section 33) -- a real
+    regression found live: Schwab's real API defaults `periodType` to
+    DAY whenever it's omitted (confirmed directly, verbatim response:
+    "Invalid frequencyType DAILY for periodType DAY"), and DAY only
+    accepts `frequencyType=minute` -- exactly what `fetch_today_bars`
+    above wants, which is WHY omitting `period_type` happened to work
+    there, not because `period_type` itself is unsafe to pass alongside
+    explicit dates. Confirmed live, separately, that Schwab still honors
+    the EXPLICIT `start_datetime`/`end_datetime` given below with
+    `period_type` present -- it does not fall back to some period-based
+    range. `period` (the separate COUNT parameter) is the one that
+    actually conflicts with explicit dates, per get_price_history's own
+    docstring, and stays omitted. YEAR (not MONTH) is used regardless of
+    `lookback_days`, since the explicit date range below already governs
+    exactly what's fetched -- `period_type` here only has to be VALID
+    for `frequencyType=DAILY`, not match the lookback precisely."""
     now = datetime.fromtimestamp(now_fn(), _NY)
     end = now if include_today else now.replace(hour=0, minute=0, second=0, microsecond=0)
     start = end - timedelta(days=lookback_days * 2 + 10)
     resp = await client.get_price_history(
         symbol,
+        period_type=client.PriceHistory.PeriodType.YEAR,
         frequency_type=client.PriceHistory.FrequencyType.DAILY,
         frequency=client.PriceHistory.Frequency.DAILY,
         start_datetime=start,
