@@ -144,6 +144,7 @@ from state import build_state, IncrementalState
 from analysis import (breakdown_by_review_label, breakdown_by_setup_type,
                       losses_section, overall_stats)
 import narration
+import pattern_flags
 
 # Same sys.path setup as state.py's own CORE_PATH -- app.py reaches into
 # core/levels.py directly for confirmed_swing_lows (specs.md section 12's
@@ -254,6 +255,12 @@ DEFAULT_NARRATION_REARM_MINUTES = 60.0
 # nothing structurally, and both safety gates already reset to their
 # safe defaults on every restart regardless).
 NARRATION_LOG_MAX_ENTRIES = 50
+# Pattern-flags forward-price sweep (specs.md section 37) -- how often
+# run_pattern_flag_forward_price_loop checks for due checkpoints. 10s
+# keeps the tightest checkpoint (30s) filled promptly without adding a
+# second high-frequency loop competing with bar processing; the sweep
+# itself is cheap (one query + in-memory bar reads, no network).
+DEFAULT_PATTERN_FLAG_FORWARD_PRICE_SWEEP_SECONDS = 10.0
 MAX_SYMBOLS = 4
 
 # Real ticker symbols are short and plain (letters/digits, occasionally a
@@ -355,6 +362,8 @@ class Poller:
                  narration_max_calls_per_window=DEFAULT_NARRATION_MAX_CALLS_PER_WINDOW,
                  narration_window_minutes=DEFAULT_NARRATION_WINDOW_MINUTES,
                  narration_rearm_minutes=DEFAULT_NARRATION_REARM_MINUTES,
+                 flag_count_threshold=pattern_flags.DEFAULT_FLAG_COUNT_THRESHOLD,
+                 pattern_flag_forward_price_sweep_seconds=DEFAULT_PATTERN_FLAG_FORWARD_PRICE_SWEEP_SECONDS,
                  now_fn=time.time, max_symbols=MAX_SYMBOLS):
         self._fetch_bars = fetch_bars
         self._fetch_daily_bars = fetch_daily_bars
@@ -388,6 +397,14 @@ class Poller:
         self._narration_breaker_tripped: bool = False
         self._narration_log: list[dict] = []
         self._narration_tasks: set[asyncio.Task] = set()
+        # Pattern flags (specs.md section 37) -- purely observational,
+        # shares the narration state above (gates, rate-limit budget,
+        # task-tracking set) rather than building a second copy of any of
+        # it. flag_count_threshold's own seed/fallback default; live-tuned
+        # via strategy_params from then on, same split as every other
+        # threshold here.
+        self._flag_count_threshold = flag_count_threshold
+        self._pattern_flag_forward_price_sweep_seconds = pattern_flag_forward_price_sweep_seconds
         self._initial_symbol = watch_symbol.upper() if watch_symbol else None
         self._announce_watch = announce_watch
         self._announce_unwatch = announce_unwatch
@@ -664,19 +681,13 @@ class Poller:
                 symbol, position, exit_event, pnl_pct, pnl_dollars)))
         return events
 
-    async def _fire_narration_call(self, symbol: str, kind: str, prompt: str) -> None:
-        """Records the attempt against the rate-limit window FIRST (an
-        attempt counts even if the call itself then fails -- a runaway
-        bug producing rapid failing attempts must still trip the breaker,
-        specs.md section 27), then makes the real call. Any failure --
-        non-zero exit, timeout, malformed output, a network error
-        reaching claude-connector, anything -- is caught here and
-        recorded in the narration log as a visible failure entry, never
-        swallowed. Given the stage-0 investigation's OAuth-refresh path
-        was never exercised, a failure here gets NO special "probably
-        transient" treatment -- it's surfaced exactly the same as any
-        other failure, by design."""
-        now = self._now_fn()
+    def _consume_narration_budget(self, now: float) -> None:
+        """Records one real claude -p call against the SHARED rate-limit
+        window and trips the SHARED circuit breaker if it's now exceeded
+        -- every caller that makes a real narration call (event-triggered
+        narration's own three triggers, AND pattern-flags' narration,
+        specs.md section 37) goes through this ONE place, never a second,
+        independently-tracked budget."""
         window_minutes = self._narration_param(
             "narration_window_minutes", self._narration_window_minutes)
         max_calls = self._narration_param(
@@ -690,6 +701,21 @@ class Poller:
                 "(max %d) -- narration blocked until manually reset",
                 len(self._narration_call_timestamps), window_minutes, max_calls,
             )
+
+    async def _fire_narration_call(self, symbol: str, kind: str, prompt: str) -> None:
+        """Records the attempt against the rate-limit window FIRST (an
+        attempt counts even if the call itself then fails -- a runaway
+        bug producing rapid failing attempts must still trip the breaker,
+        specs.md section 27), then makes the real call. Any failure --
+        non-zero exit, timeout, malformed output, a network error
+        reaching claude-connector, anything -- is caught here and
+        recorded in the narration log as a visible failure entry, never
+        swallowed. Given the stage-0 investigation's OAuth-refresh path
+        was never exercised, a failure here gets NO special "probably
+        transient" treatment -- it's surfaced exactly the same as any
+        other failure, by design."""
+        now = self._now_fn()
+        self._consume_narration_budget(now)
         entry: dict = {"ts": now, "symbol": symbol, "kind": kind, "prompt": prompt}
         try:
             text = await self._fetch_narration(prompt)
@@ -723,6 +749,133 @@ class Poller:
                 await self._fire_narration_call(symbol, kind, prompt)
         except Exception:
             logger.exception("unexpected error in narration task for %s", symbol)
+
+    # -- pattern flags: bullish confirmations undermined by external
+    # factors (specs.md section 37) -- purely observational: reads slot.
+    # state/journal_store, NEVER writes slot.journal_position/journal_
+    # confirmed_types or anything else should_enter/advance_journal read
+    # -- the same structural separation already proven for breakdown
+    # types and B2's fix, confirmed by grepping should_enter/
+    # advance_journal's own signatures and bodies for any of these names.
+
+    def _pattern_flag_setups_for_tick(self, was_confirmed_types: frozenset[str],
+                                      tick, setups: list[dict]) -> list[dict]:
+        """The real setup dicts for whatever bullish types newly confirmed
+        THIS tick -- reuses narration's own trigger-1 detection (narration.
+        newly_confirmed_types over tick.confirmed_types_after/was_
+        confirmed_types, the SAME "real transition, not every tick" diff
+        already proven for narration), not a second detector. `setups`
+        only ever holds the four bullish types (state.py keeps breakdown_
+        setups in a completely separate key -- see journal_logic.py's own
+        _ENTRY_ELIGIBLE_SETUP_TYPES comment), so this is bullish-only by
+        construction, with no extra filtering needed here."""
+        out = []
+        for setup_type in narration.newly_confirmed_types(
+                tick.confirmed_types_after, was_confirmed_types):
+            setup = next((s for s in setups if s["setup_type"] == setup_type), None)
+            if setup is not None:
+                out.append(setup)
+        return out
+
+    async def _fire_pattern_flag_narration_call(self, row_id: int, symbol: str,
+                                                 prompt: str) -> None:
+        """Real claude -p call for a flagged pattern (specs.md section
+        37) -- consumes the SAME shared rate-limit budget event-triggered
+        narration's own calls do (_consume_narration_budget, never a
+        second independent budget), but persists its result onto the
+        pattern_flags row itself (JournalStore.set_pattern_flag_
+        narrative), not the in-memory narration_log -- this is a
+        different, durably queryable record, not ephemeral commentary. A
+        failed call still writes a visible, distinguishable "[narration
+        failed: ...]" string, same "never silently swallowed" discipline
+        as _fire_narration_call's own failure handling."""
+        now = self._now_fn()
+        self._consume_narration_budget(now)
+        try:
+            text = await self._fetch_narration(prompt)
+        except Exception as exc:
+            text = f"[narration failed: {exc}]"
+            logger.warning(
+                "pattern-flag narration call failed for %s (row %s): %s",
+                symbol, row_id, exc,
+            )
+        self._journal_store.set_pattern_flag_narrative(row_id, text)
+        self._broadcast_state()
+
+    async def _maybe_flag_pattern(self, symbol: str, was_confirmed_types: frozenset[str],
+                                  tick, setups: list[dict], flag_context: dict) -> None:
+        """Runs as a detached background task (see _update_journal), same
+        "never delay bar processing" discipline as _maybe_narrate. Records
+        a pattern_flags row only when the setup genuinely confirms AND at
+        least flag_count_threshold of the six factors disagree with it
+        (pattern_flags.meets_flag_threshold) -- then, if narration is
+        configured and both its shared gates (rate limit, arming) are
+        clear, fires ONE real claude -p call per recorded row."""
+        if self._journal_store is None:
+            return
+        try:
+            threshold = self._journal_store.get_param(
+                "flag_count_threshold", self._flag_count_threshold)
+            for setup in self._pattern_flag_setups_for_tick(was_confirmed_types, tick, setups):
+                flags = pattern_flags.compute_flags(
+                    price=flag_context["price"], macd=flag_context["macd"],
+                    vwap=flag_context["vwap"], day_open=flag_context["day_open"],
+                    ema9=flag_context["ema9"], ema20=flag_context["ema20"],
+                    watch_note=flag_context["watch_note"],
+                    relative_volume=flag_context["relative_volume"],
+                    volume_confirm_threshold=flag_context["volume_confirm_threshold"],
+                    session_cumulative_volume=flag_context["session_cumulative_volume"],
+                    avg_daily_volume=flag_context["avg_daily_volume"],
+                    session_volume_multiple=flag_context["session_volume_multiple"],
+                )
+                if not pattern_flags.meets_flag_threshold(flags["flag_count"], threshold=threshold):
+                    continue
+                row_id = self._journal_store.record_pattern_flag(
+                    ts=int(self._now_fn()), symbol=symbol, setup_type=setup["setup_type"],
+                    trigger_price=setup["trigger_price"], distance=setup["distance"],
+                    factors=setup.get("factors"), flags=flags,
+                )
+                if self._fetch_narration is not None and self._narration_gates_clear():
+                    prompt = pattern_flags.pattern_flag_prompt(
+                        symbol, setup["setup_type"], setup["trigger_price"],
+                        setup["distance"], flags)
+                    await self._fire_pattern_flag_narration_call(row_id, symbol, prompt)
+        except Exception:
+            logger.exception("unexpected error in pattern-flag task for %s", symbol)
+
+    # -- forward-price sweep (specs.md section 37) --
+
+    def _fill_pattern_flag_forward_prices(self) -> None:
+        """One sweep pass: every pattern_flags row with a due-but-unfilled
+        checkpoint gets it filled from the real bar history already being
+        captured for that symbol (slot.bars' own latest close) -- never a
+        second fetch, mirroring run_market_backdrop_loop's own "reuse
+        what's already flowing in" shape. A row whose symbol has since
+        been unwatched (no slot, or an empty one) is simply left null for
+        this pass -- a real, documented limitation, not silently
+        pretended away -- and picked up by a later sweep if the symbol is
+        watched again before its checkpoint would otherwise go stale."""
+        if self._journal_store is None:
+            return
+        now = self._now_fn()
+        for pending in self._journal_store.pending_forward_price_checkpoints(now_ts=now):
+            slot = self._slots.get(pending["symbol"])
+            if slot is None or not slot.bars:
+                continue
+            price = slot.bars[-1]["close"]
+            for checkpoint in pending["due_checkpoints"]:
+                self._journal_store.set_forward_price(pending["id"], checkpoint, price)
+
+    async def run_pattern_flag_forward_price_loop(self) -> None:
+        """Independent periodic sweep (specs.md section 37), same shape as
+        run_market_backdrop_loop -- checks immediately on start, then
+        every pattern_flag_forward_price_sweep_seconds. No-ops forever if
+        journaling is disabled (nothing to sweep)."""
+        if self._journal_store is None:
+            return
+        while True:
+            self._fill_pattern_flag_forward_prices()
+            await asyncio.sleep(self._pattern_flag_forward_price_sweep_seconds)
 
     def reverse_splits_for(self, symbol: str) -> list[dict]:
         """Every recorded reverse split for `symbol`, most recent first --
@@ -1457,6 +1610,37 @@ class Poller:
                 self._maybe_narrate(symbol, was_confirmed_types_before, tick, setups))
             self._narration_tasks.add(task)
             task.add_done_callback(self._narration_tasks.discard)
+        # Pattern flags (specs.md section 37) -- purely observational,
+        # scheduled the SAME "detached, never awaited inline" way as
+        # narration above (and tracked in the SAME _narration_tasks set,
+        # since both need identical shutdown-cancellation treatment).
+        # Runs whenever journaling itself is enabled, independent of
+        # whether narration is configured -- recording a flag never
+        # requires a real claude -p call, only narrating one does (gated
+        # inside _maybe_flag_pattern itself). Reuses this tick's own
+        # already-computed setups/session data rather than re-reading
+        # slot.state a second time.
+        if self._journal_store is not None:
+            session = slot.state.get("session", {})
+            flag_context = {
+                "price": slot.state.get("last_price"),
+                "macd": session.get("macd", {}).get("macd", 0.0),
+                "vwap": session.get("vwap"),
+                "day_open": session.get("day_open"),
+                "ema9": session.get("ema9"),
+                "ema20": session.get("ema20"),
+                "watch_note": watch_note,
+                "relative_volume": relative_volume,
+                "volume_confirm_threshold": volume_confirm_threshold,
+                "session_cumulative_volume": session_cumulative_volume,
+                "avg_daily_volume": avg_daily_volume,
+                "session_volume_multiple": session_volume_multiple,
+            }
+            flag_task = asyncio.create_task(
+                self._maybe_flag_pattern(symbol, was_confirmed_types_before, tick, setups,
+                                         flag_context))
+            self._narration_tasks.add(flag_task)
+            flag_task.add_done_callback(self._narration_tasks.discard)
 
 
 # -- rendering helpers shared in spirit (deliberately, minimally
@@ -3253,6 +3437,8 @@ def create_app(*, fetch_bars, watch_symbol=None,
                narration_max_calls_per_window=DEFAULT_NARRATION_MAX_CALLS_PER_WINDOW,
                narration_window_minutes=DEFAULT_NARRATION_WINDOW_MINUTES,
                narration_rearm_minutes=DEFAULT_NARRATION_REARM_MINUTES,
+               flag_count_threshold=pattern_flags.DEFAULT_FLAG_COUNT_THRESHOLD,
+               pattern_flag_forward_price_sweep_seconds=DEFAULT_PATTERN_FLAG_FORWARD_PRICE_SWEEP_SECONDS,
                now_fn=time.time, max_symbols=MAX_SYMBOLS) -> FastAPI:
     poller = Poller(fetch_bars=fetch_bars, watch_symbol=watch_symbol,
                     announce_watch=announce_watch,
@@ -3278,6 +3464,9 @@ def create_app(*, fetch_bars, watch_symbol=None,
                     narration_max_calls_per_window=narration_max_calls_per_window,
                     narration_window_minutes=narration_window_minutes,
                     narration_rearm_minutes=narration_rearm_minutes,
+                    flag_count_threshold=flag_count_threshold,
+                    pattern_flag_forward_price_sweep_seconds=
+                    pattern_flag_forward_price_sweep_seconds,
                     now_fn=now_fn, max_symbols=max_symbols)
 
     @asynccontextmanager
@@ -3297,11 +3486,17 @@ def create_app(*, fetch_bars, watch_symbol=None,
         # updates above; no-ops forever if fetch_market_backdrop was never
         # configured, so this task is harmless to always start.
         backdrop_task = asyncio.create_task(poller.run_market_backdrop_loop())
+        # Pattern-flags forward-price sweep (specs.md section 37) -- its
+        # own independent periodic task, same shape as backdrop_task
+        # above; no-ops forever if journaling is disabled, so harmless to
+        # always start.
+        forward_price_task = asyncio.create_task(poller.run_pattern_flag_forward_price_loop())
         yield
         run_task.cancel()
         if stream_task is not None:
             stream_task.cancel()
         backdrop_task.cancel()
+        forward_price_task.cancel()
         # Narration calls run as detached background tasks (specs.md
         # section 27) -- cancel any still in flight at shutdown rather
         # than leaving a subprocess call dangling past the app's own

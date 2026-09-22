@@ -96,6 +96,17 @@ Environment:
                         explicit POST /api/narration/arm, before going
                         dormant again -- independent of the circuit
                         breaker; same seed-only treatment  (default 60)
+  FLAG_COUNT_THRESHOLD  pattern-flags (specs.md section 37): how many of
+                        the six external-disagreement factors must be
+                        true, on a genuine bullish confirmation, before
+                        it's recorded + narrated -- same seed-only
+                        treatment as TRAIL_PCT above       (default 2)
+  PATTERN_FLAG_FORWARD_PRICE_SWEEP_SECONDS  how often the forward-price
+                        sweep (specs.md section 37) checks for due,
+                        unfilled 30s/1m/5m checkpoints -- a plain runtime
+                        setting, not a live-tunable strategy threshold,
+                        same treatment as MARKET_BACKDROP_REFRESH_SECONDS
+                                                              (default 10)
 
 Run:  uvicorn main:app --host 0.0.0.0 --port 8012
 """
@@ -134,6 +145,9 @@ CLAUDE_CONNECTOR_URL = os.environ.get("CLAUDE_CONNECTOR_URL", "http://claude-con
 NARRATION_MAX_CALLS_PER_WINDOW = float(os.environ.get("NARRATION_MAX_CALLS_PER_WINDOW", "10"))
 NARRATION_WINDOW_MINUTES = float(os.environ.get("NARRATION_WINDOW_MINUTES", "15"))
 NARRATION_REARM_MINUTES = float(os.environ.get("NARRATION_REARM_MINUTES", "60"))
+FLAG_COUNT_THRESHOLD = float(os.environ.get("FLAG_COUNT_THRESHOLD", "2"))
+PATTERN_FLAG_FORWARD_PRICE_SWEEP_SECONDS = float(
+    os.environ.get("PATTERN_FLAG_FORWARD_PRICE_SWEEP_SECONDS", "10"))
 # claude-connector's own claude_cli timeout defaults to 30s -- this HTTP
 # call's timeout must be comfortably LONGER than that, so claude-
 # connector's own clean {"ok": false, "error": "...timed out..."} JSON
@@ -157,6 +171,7 @@ _journal_store = JournalStore(JOURNAL_DB_PATH, default_params={
     "narration_max_calls_per_window": NARRATION_MAX_CALLS_PER_WINDOW,
     "narration_window_minutes": NARRATION_WINDOW_MINUTES,
     "narration_rearm_minutes": NARRATION_REARM_MINUTES,
+    "flag_count_threshold": FLAG_COUNT_THRESHOLD,
 })
 
 
@@ -280,4 +295,7 @@ app = create_app(fetch_bars=fetch_bars, watch_symbol=WATCH_SYMBOL,
                  fetch_narration=fetch_narration,
                  narration_max_calls_per_window=NARRATION_MAX_CALLS_PER_WINDOW,
                  narration_window_minutes=NARRATION_WINDOW_MINUTES,
-                 narration_rearm_minutes=NARRATION_REARM_MINUTES)
+                 narration_rearm_minutes=NARRATION_REARM_MINUTES,
+                 flag_count_threshold=FLAG_COUNT_THRESHOLD,
+                 pattern_flag_forward_price_sweep_seconds=
+                 PATTERN_FLAG_FORWARD_PRICE_SWEEP_SECONDS)

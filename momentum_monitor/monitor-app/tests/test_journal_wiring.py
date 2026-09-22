@@ -115,7 +115,9 @@ def _client(fetch, *, journal_store, symbol="AEHL", trail_pct=TRAIL_PCT,
            announce=None, unwatch=None, now_fn=lambda: 0.0,
            volume_confirm_threshold=0.0, fetch_daily_bars=None,
            fetch_narration=None, narration_max_calls_per_window=10.0,
-           narration_window_minutes=15.0, narration_rearm_minutes=60.0):
+           narration_window_minutes=15.0, narration_rearm_minutes=60.0,
+           flag_count_threshold=2.0,
+           pattern_flag_forward_price_sweep_seconds=3600.0):
     # Threshold defaults to 0.0 (always clears) -- this file proves the
     # Poller<->journal_logic<->journal_store WIRING against real bar-
     # driven hold_confirmed transitions, not the volume gate itself
@@ -145,6 +147,9 @@ def _client(fetch, *, journal_store, symbol="AEHL", trail_pct=TRAIL_PCT,
                      narration_max_calls_per_window=narration_max_calls_per_window,
                      narration_window_minutes=narration_window_minutes,
                      narration_rearm_minutes=narration_rearm_minutes,
+                     flag_count_threshold=flag_count_threshold,
+                     pattern_flag_forward_price_sweep_seconds=
+                     pattern_flag_forward_price_sweep_seconds,
                      now_fn=now_fn)
     return TestClient(app)
 
@@ -878,13 +883,23 @@ def test_narration_fires_on_a_real_confirmation_and_a_real_entry_when_armed(tmp_
         assert _wait_until(lambda: store.open_position_for("AEHL") is not None)
         # Both the confirmation (round_number_reclaim) AND the entry it
         # produced are separately narration-worthy (specs.md section 27)
-        # -- two real calls from this one real tick.
-        assert _wait_until(lambda: len(narrator.calls) == 2)
+        # -- two real calls from this one real tick, PLUS one more from
+        # pattern-flags (specs.md section 37): this same confirmation's
+        # real factors (below_vwap, no_news) meet the default flag_count_
+        # threshold of 2, and pattern-flags narration shares this SAME
+        # rate-limit budget/fetch_narration, not a second one -- three
+        # real calls total from this one real tick.
+        assert _wait_until(lambda: len(narrator.calls) == 3)
 
     kinds_in_log = {entry["kind"] for entry in _narration_log(c)}
     assert kinds_in_log == {"confirmation", "entry"}
     assert any("round number reclaim" in p.lower() for p in narrator.calls)
     assert any("AEHL" in p and "9.1" in p for p in narrator.calls)  # the real entry price
+    assert any("external factor" in p for p in narrator.calls)  # the pattern-flag call
+    (row,) = store.recent_pattern_flags()
+    assert row["symbol"] == "AEHL"
+    assert row["flag_count"] == 2
+    assert row["narrative"] is not None
 
 
 def test_narration_does_not_fire_when_disarmed(tmp_path):
@@ -909,12 +924,14 @@ def test_narration_fires_on_a_real_exit_with_correct_pnl(tmp_path):
 
     with _client(fetch, journal_store=store, fetch_narration=narrator) as c:
         c.post("/api/narration/arm")
-        _resync(c)  # entry_bars -- confirmation + entry
-        assert _wait_until(lambda: len(narrator.calls) == 2)
+        _resync(c)  # entry_bars -- confirmation + entry (+ 1 pattern-flag call,
+                    # specs.md section 37 -- same real factors/threshold as the
+                    # confirmation-and-entry test above)
+        assert _wait_until(lambda: len(narrator.calls) == 3)
         _resync(c)  # ratchet
         _resync(c)  # sharp breach -- trailing stop trips, a real exit
         assert _wait_until(lambda: store.open_position_for("AEHL") is None)
-        assert _wait_until(lambda: len(narrator.calls) == 3)
+        assert _wait_until(lambda: len(narrator.calls) == 4)
 
     exit_prompt = narrator.calls[-1]
     assert "AEHL" in exit_prompt
@@ -1106,3 +1123,152 @@ def test_narration_failure_is_caught_logged_and_surfaced_not_swallowed(tmp_path)
     log = _narration_log(c)
     assert all(entry["ok"] is False for entry in log)
     assert all("authentication failed" in entry["error"] for entry in log)
+
+
+# -- pattern flags: bullish confirmations undermined by external factors
+# (specs.md section 37) -- reuses the SAME _entry_bars() fixture already
+# proven above to produce a genuine round_number_reclaim confirmation
+# whose real factors at that moment (below_vwap, no_news) sum to
+# flag_count=2, exactly the default flag_count_threshold.
+
+def test_pattern_flag_fires_at_the_threshold_and_records_the_real_factors(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": [[], _entry_bars()]})
+    narrator = _recording_narration_fetcher()
+
+    with _client(fetch, journal_store=store, fetch_narration=narrator,
+                flag_count_threshold=2.0) as c:
+        c.post("/api/narration/arm")
+        _resync(c)
+        assert _wait_until(lambda: store.open_position_for("AEHL") is not None)
+        assert _wait_until(lambda: len(store.recent_pattern_flags()) == 1)
+
+    (row,) = store.recent_pattern_flags()
+    assert row["symbol"] == "AEHL"
+    assert row["setup_type"] == "round_number_reclaim"
+    assert row["below_vwap"] is True
+    assert row["no_news"] is True
+    assert row["volume_not_confirmed"] is False
+    assert row["macd_negative"] is False
+    assert row["ema_misaligned"] is False
+    assert row["flag_count"] == 2
+    assert row["narrative"] is not None
+    assert row["narrative"].startswith("narration #")
+
+
+def test_pattern_flag_stays_silent_below_the_threshold(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": [[], _entry_bars()]})
+    narrator = _recording_narration_fetcher()
+
+    # AEHL's real flag_count here is 2 -- raising the bar to 3 must
+    # silence it entirely, proving this isn't just "usually fires."
+    with _client(fetch, journal_store=store, fetch_narration=narrator,
+                flag_count_threshold=3.0) as c:
+        c.post("/api/narration/arm")
+        _resync(c)
+        assert _wait_until(lambda: store.open_position_for("AEHL") is not None)
+        time.sleep(0.2)  # give any (wrongly) fired background task a chance to land
+
+    assert store.recent_pattern_flags() == []
+    # Only the two real narration triggers (confirmation, entry) fired --
+    # no third, pattern-flag call.
+    assert len(narrator.calls) == 2
+
+
+def test_pattern_flag_is_recorded_even_when_narration_is_disarmed(tmp_path):
+    # Purely observational (specs.md section 37): the RECORD itself is
+    # never gated by narration's own arm/circuit-breaker state -- only
+    # the follow-up real claude -p call is.
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": [_entry_bars()]})
+    narrator = _recording_narration_fetcher()
+
+    with _client(fetch, journal_store=store, fetch_narration=narrator) as c:
+        # Deliberately never armed.
+        assert _wait_until(lambda: store.open_position_for("AEHL") is not None)
+        time.sleep(0.2)
+
+    assert narrator.calls == []  # narration gate blocked the real call...
+    (row,) = store.recent_pattern_flags()  # ...but the flag itself was still recorded
+    assert row["flag_count"] == 2
+    assert row["narrative"] is None  # never generated -- gate never cleared
+
+
+def test_pattern_flag_narration_shares_the_narration_circuit_breaker_not_a_second_one(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": [[], _entry_bars()]})
+    narrator = _recording_narration_fetcher()
+
+    with _client(fetch, journal_store=store, fetch_narration=narrator,
+                narration_max_calls_per_window=1.0) as c:
+        c.post("/api/narration/arm")
+        # This one tick produces THREE real trigger events sharing the
+        # SAME budget: the confirmation, the entry it causes, and the
+        # pattern-flag it also qualifies for (specs.md section 37) --
+        # more than max_calls_per_window=1 real calls within the window
+        # trips the ONE shared breaker, whichever of the three fires
+        # first, not a second independent budget for pattern-flags.
+        _resync(c)
+        assert _wait_until(lambda: _narration_status(c)["breaker_tripped"] is True)
+        assert _wait_until(lambda: len(narrator.calls) >= 1)
+
+    # The pattern_flags ROW is recorded regardless -- observational,
+    # independent of whether its own narration call got through the
+    # breaker or was blocked by it.
+    (row,) = store.recent_pattern_flags()
+    assert row["flag_count"] == 2
+
+
+# -- forward-price sweep (specs.md section 37) ----------------------------
+
+def test_pattern_flag_forward_price_sweep_fills_due_checkpoints_only(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": [[], _entry_bars()]})
+    clock = _Clock(0.0)
+
+    with _client(fetch, journal_store=store, now_fn=clock) as c:
+        _resync(c)
+        assert _wait_until(lambda: store.open_position_for("AEHL") is not None)
+        (row,) = store.recent_pattern_flags()
+        assert row["forward_price_30s"] is None
+        assert row["forward_price_1m"] is None
+        assert row["forward_price_5m"] is None
+
+        poller = c.app.state.poller
+        last_close = poller._slots["AEHL"].bars[-1]["close"]
+
+        clock.t = row["ts"] + 40.0  # 30s checkpoint due; 1m/5m not yet
+        poller._fill_pattern_flag_forward_prices()
+        (row,) = store.recent_pattern_flags()
+        assert row["forward_price_30s"] == last_close
+        assert row["forward_price_1m"] is None
+        assert row["forward_price_5m"] is None
+
+        clock.t = row["ts"] + 400.0  # all three now due
+        poller._fill_pattern_flag_forward_prices()
+        (row,) = store.recent_pattern_flags()
+        assert row["forward_price_30s"] == last_close
+        assert row["forward_price_1m"] == last_close
+        assert row["forward_price_5m"] == last_close
+
+
+def test_pattern_flag_forward_price_loop_runs_periodically(tmp_path):
+    # Proves the real background loop (not just the pure helper above)
+    # is actually wired up -- same "short interval + a little real sleep"
+    # convention as test_market_backdrop_unknown_when_fetch_returns_
+    # fewer_than_two_bars in test_app.py.
+    store = JournalStore(tmp_path / "journal.db")
+    fetch = FakeFetch({"AEHL": [[], _entry_bars()]})
+    clock = _Clock(0.0)
+
+    with _client(fetch, journal_store=store, now_fn=clock,
+                pattern_flag_forward_price_sweep_seconds=0.05) as c:
+        _resync(c)
+        assert _wait_until(lambda: store.open_position_for("AEHL") is not None)
+        (row,) = store.recent_pattern_flags()
+        clock.t = row["ts"] + 40.0  # 30s checkpoint due
+        time.sleep(0.2)  # give the real periodic loop a couple cycles
+
+    (row,) = store.recent_pattern_flags()
+    assert row["forward_price_30s"] is not None

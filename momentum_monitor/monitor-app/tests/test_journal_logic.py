@@ -730,6 +730,28 @@ def test_breakdown_type_allowlist_break_then_fix(monkeypatch):
     assert fixed.opened is None  # correctly blocked once restored
 
 
+# -- pattern-flags structural safety proof (specs.md section 37) -----------
+# Purely observational: MUST be provably incapable of affecting
+# should_enter/advance_journal or any entry/exit decision, the same
+# structural (not conventional) standard already proven for the
+# breakdown-type allowlist above and for market_backdrop (test_app.py's
+# test_market_backdrop_never_influences_should_enter_or_advance_journal).
+# Checked at the source level, not just by behavior: neither function's
+# signature NOR body references anything from pattern_flags.py at all.
+
+def test_pattern_flags_never_appears_in_entry_gating_functions():
+    import inspect
+    source = inspect.getsource(journal_logic)
+    assert "pattern_flag" not in source
+    assert "flag_count" not in source
+    for name in ("should_enter", "apply_bar_to_open_position", "advance_journal"):
+        func = getattr(journal_logic, name)
+        assert "pattern_flag" not in inspect.getsource(func)
+        assert "flag_count" not in inspect.getsource(func)
+        assert "pattern_flag" not in inspect.signature(func).parameters
+        assert "flag_count" not in inspect.signature(func).parameters
+
+
 # -- Part B: volume confirmation gates entries only, never exits -----------
 
 def test_advance_journal_blocks_entry_when_relative_volume_below_threshold():
