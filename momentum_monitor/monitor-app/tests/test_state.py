@@ -90,6 +90,20 @@ def test_build_state_warming_up_on_empty():
     assert build_state([], symbol="AEHL")["status"] == "warming_up"
 
 
+def test_build_state_exposes_session_day_open():
+    # Today's actual opening price (specs.md section 37, pattern-flags
+    # feature) -- the FIRST bar of the latest bar's own session slice
+    # (session_bars_for_vwap), reusing that same session boundary, not a
+    # separately-invented "day start" concept. A tiny, cheap addition:
+    # this data was already being filtered out every call, just never
+    # exposed.
+    backfill = _flat_backfill_bars(100.0)
+    live = _flat_live_bars(10.0, backfill[-1]["ts"] + 300)
+    bars = backfill + live
+    st = build_state(bars, symbol="X")
+    assert st["session"]["day_open"] == backfill[0]["open"]
+
+
 def test_build_state_on_demo_session_is_sane():
     bars = _load_demo_session()
     st = build_state(bars, symbol="AEHL")

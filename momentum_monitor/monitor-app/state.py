@@ -89,6 +89,13 @@ class IncrementalState:
     processed_count: int = 0
     vwap: SessionVwapState | None = None
     vwap_session_date: date | None = None
+    # Today's real opening price (specs.md section 37, pattern-flags
+    # feature) -- captured ONCE, alongside vwap's own one-time rebuild
+    # at a real session rollover (same session_bars_for_vwap(bars) call,
+    # not a second filter), then read cheaply on every other call. Reset
+    # naturally whenever vwap itself resets, since both track the SAME
+    # session boundary.
+    session_day_open: float | None = None
     ema9: EmaTimeAwareState | None = None
     ema20: EmaTimeAwareState | None = None
     macd: MacdTimeAwareState | None = None
@@ -217,6 +224,7 @@ def build_state(bars: list[dict], symbol: str | None = None,
     if incremental is None:
         session = session_bars_for_vwap(bars)
         vwap = session_vwap(session)[-1] if session else None
+        day_open = session[0]["open"] if session else None
         # today's cumulative session volume (specs.md section 12's
         # session-level volume gate) -- the SAME session slice VWAP
         # already uses above, not a separately-invented one.
@@ -229,13 +237,17 @@ def build_state(bars: list[dict], symbol: str | None = None,
             # here (out of scope -- this is a ONE-TIME cost per real
             # session rollover, not per bar), then SessionVwapState folds
             # in exactly that slice, same as the full-recompute path
-            # would compute over it.
-            incremental.vwap = SessionVwapState.from_bars(session_bars_for_vwap(bars))
+            # would compute over it. day_open captured from this SAME
+            # slice/call, not a second filter.
+            today_session = session_bars_for_vwap(bars)
+            incremental.vwap = SessionVwapState.from_bars(today_session)
             incremental.vwap_session_date = latest_date
+            incremental.session_day_open = today_session[0]["open"] if today_session else None
         else:
             for b in new_bars:
                 incremental.vwap.update(b)
         vwap = incremental.vwap.last_value
+        day_open = incremental.session_day_open
         # SessionVwapState.cum_vol IS exactly sum(b["volume"] for b in
         # session) -- both accumulate the SAME today-only bars' volume,
         # so reusing it here avoids a second full-history date filter.
@@ -318,6 +330,11 @@ def build_state(bars: list[dict], symbol: str | None = None,
         "last_bar_ts": bars[-1]["ts"],
         "last_bar_is_extended": bars[-1]["is_extended"],
         "session": {
+            # Today's real opening price (specs.md section 37, pattern-
+            # flags feature) -- the first bar of the SAME session slice
+            # VWAP already uses, not a separately-invented "day start"
+            # concept; a cheap addition, not a new capture pipeline.
+            "day_open": day_open,
             "vwap": round(vwap, 4) if vwap is not None else None,
             "ema9": round(ema9_val, 4),
             "ema20": round(ema20_val, 4),
