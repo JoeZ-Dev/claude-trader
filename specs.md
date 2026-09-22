@@ -5325,3 +5325,192 @@ a matching file hash.
 
 Do not build ahead of the current phase without an explicit instruction
 to move to the next one.
+
+### 37. B4 (narrowed scope) — flagging confirmed patterns undermined by
+external factors, built 2026-09-22
+
+Not the original broad "record every setup" idea. Specifically: when a
+bullish setup genuinely confirms (the same "real transition, not every
+tick" detection narration's trigger 1 already uses), check factors
+OUTSIDE the pattern itself for disagreement, and record + narrate only
+when enough of them disagree. Purely observational, by design and by
+structural proof (below) — this can never affect `should_enter`/
+`advance_journal` or any entry/exit decision. Bullish setup types only
+(`resistance_breakout`, `micro_breakout`, `vwap_reclaim`,
+`round_number_reclaim`) — breakdown types never reach `pattern_flags.py`
+at all, for the same reason they never reach `advance_journal`: `setups`
+(what `_update_journal` passes through) only ever holds the four bullish
+types, `breakdown_setups` stays a completely separate key (section 22).
+
+**The six factors (`monitor-app/pattern_flags.py`).** Five of the six
+are named for the DISAGREEING condition itself — `macd_negative`,
+`below_vwap`, `below_day_open`, `ema_misaligned`, `no_news` all mean
+TRUE = a bearish/disagreeing signal:
+- `volume_not_confirmed` — reuses `journal_logic.volume_gate_clears`
+  (newly extracted from `should_enter`, specs.md's existing "reuse, not
+  reimplement" discipline), the SAME bar-level `relative_volume` check
+  and session-level `avg_daily_volume`-based gate entries are gated by.
+  A real naming decision worth recording: the original design
+  discussion's shorthand for this factor was "volume_confirmed" (did
+  real volume back this breakout) — but stored literally under that
+  name, TRUE would mean AGREEMENT, the opposite polarity of the other
+  five, silently corrupting `flag_count` (summing a mix of "this
+  disagrees" and "this agrees" as if they meant the same thing). Named
+  `volume_not_confirmed` instead: the same real check, the same
+  "TRUE = disagreement" polarity as every other flag.
+- `macd_negative` — MACD's current sign (`macd < 0`; exactly zero is not
+  negative).
+- `below_vwap` — price below session VWAP. `vwap` can genuinely be
+  `None` (state.py, no session data yet) — never crashes, never treated
+  as a disagreement.
+- `below_day_open` — price below today's real opening price. Confirmed
+  via grep that nothing in this project tracked "today's opening price"
+  anywhere before this — the smallest possible addition: `state.py`'s
+  `IncrementalState` gained one new field, `session_day_open`, captured
+  ONCE at the SAME real session rollover `SessionVwapState.from_bars`
+  already rebuilds from (reusing that same `session_bars_for_vwap(bars)`
+  call, not a second O(n) filter), read cheaply on every other call, and
+  exposed as `build_state`'s `session.day_open`. Same `None`-safe
+  treatment as `below_vwap`.
+- `ema_misaligned` — `ema9 < ema20`. Concrete, reasoned definition: a
+  short EMA below a longer one is the standard "downward momentum
+  pressure" reading, and both are already computed on every tick
+  (`state.py`'s `session.ema9`/`session.ema20`) — no new indicator
+  needed.
+- `no_news` — best-effort only, `not watch_note`. An empty/missing
+  watch note means NOTHING WAS TYPED, never a confirmed absence of a
+  real catalyst — a real one could easily exist and simply never have
+  been written down. Explicitly the WEAKEST of the six, labeled as such
+  everywhere it's surfaced: `FLAG_LABELS["no_news"]`'s own text carries
+  this caveat inline, so it can never be shown without it, and
+  `pattern_flag_prompt` (below) only ever renders `FLAG_LABELS`
+  verbatim, never a re-worded summary that could drop the caveat.
+
+**Trigger condition.** Record only when the setup genuinely confirms
+(reuses `narration.newly_confirmed_types(tick.confirmed_types_after,
+was_confirmed_types)` — the exact same diff narration's own trigger 1
+already computes, no second detector) AND `flag_count >=
+flag_count_threshold`. New live-tunable `strategy_param`
+(`journal_store.py`'s `_PARAM_BOUNDS`), default **2.0**, bounds `[0.0,
+6.0]`: matches the design discussion's own reasoning — a single
+disagreeing factor is common and often noise (a genuinely strong
+breakout can still show `macd_negative` if momentum is just turning),
+but a combination of two or more independent factors all pointing the
+same (bearish) direction is a real, worth-narrating tension — "a
+combination is usually the tell," not any one signal alone. Live-tunable
+specifically so it can be dialed up against real observed noise without
+a redeploy, per the explicit plan to watch real volume and retune.
+
+**Storage (`monitor-app/journal_store.py`, table `pattern_flags`):**
+`id`, `ts`, `symbol`, `setup_type`, `trigger_price`, `distance`,
+`factors` (JSON, the setup's own type-specific detail dict), the six
+flags as their own INTEGER columns (never folded into prose — each
+stays independently queryable, so a later flag-count-vs-outcome
+analysis can slice by any single factor, not just the total),
+`flag_count`, `narrative` (TEXT, NULL until filled in), and
+`forward_price_30s`/`forward_price_1m`/`forward_price_5m` (REAL, NULL
+until filled in). Five new `JournalStore` methods: `record_pattern_flag`,
+`set_pattern_flag_narrative`, `recent_pattern_flags`,
+`pending_forward_price_checkpoints`, `set_forward_price`.
+
+**Automatic narrative generation.** When the trigger condition is met,
+`Poller._maybe_flag_pattern` immediately builds a prompt
+(`pattern_flags.pattern_flag_prompt` — real numbers, real context, no
+fabrication, same discipline as `narration.py`'s three prompt
+functions) and fires it through `_fire_pattern_flag_narration_call`.
+This SHARES narration's existing rate-limit circuit breaker and mandatory
+re-arm — not a second, independent budget or arming mechanism: the
+call-recording/breaker-trip logic that used to live inline in
+`_fire_narration_call` was extracted into `_consume_narration_budget`,
+and both `_fire_narration_call` (event narration) and
+`_fire_pattern_flag_narration_call` (pattern-flags) call this one place.
+A pattern-flags ROW is always recorded once the threshold is met
+(purely observational, independent of narration's own gates); the
+NARRATIVE only gets generated if `_narration_gates_clear()` (armed,
+breaker not tripped) — same "record the mechanical fact regardless,
+gate only the real LLM call" split already used for `should_enter`
+independent of narration. A failed call writes a distinct
+`"[narration failed: ...]"` string onto the row, same "never silently
+swallowed" discipline as `_fire_narration_call`'s own failure handling.
+
+**Forward-price sweep — a new pattern for this project.** Nothing here
+had done "check back later and fill in a value" before. Kept
+deliberately simple, for exactly three fixed checkpoints (30s/1m/5m
+after `ts`) — not a general-purpose scheduler.
+`pending_forward_price_checkpoints(now_ts)` finds every row with at
+least one checkpoint whose target time has passed but is still NULL;
+`Poller.run_pattern_flag_forward_price_loop` (mirroring
+`run_market_backdrop_loop`'s own shape — checks immediately, then every
+`pattern_flag_forward_price_sweep_seconds`, default 10s) fills each due
+checkpoint from that symbol's own real, already-captured in-memory bar
+history (`slot.bars[-1]["close"]`) — never a second fetch. A checkpoint
+for a symbol that's been unwatched since it was recorded is simply left
+NULL for that sweep (a real, documented limitation, not silently
+pretended away) and picked up by a later sweep only if the symbol is
+watched again before then.
+
+**Structural safety proof.** Same standard already proven twice this
+session (the breakdown-type allowlist, section 22; `market_backdrop`,
+section 23): `should_enter`, `apply_bar_to_open_position`, and
+`advance_journal` have zero references to `pattern_flag`/`flag_count`,
+checked at the SOURCE level (both `inspect.signature(...).parameters`
+AND `inspect.getsource(...)`, not just behaviorally) —
+`test_journal_logic.py::test_pattern_flags_never_appears_in_entry_gating_functions`.
+
+**Real-data verification (2026-09-22).** Replayed RETO's full real
+captured session (1,575 real bars, a genuine reverse-split-driven crash
+from ~$13.49 to ~$0.197) through the REAL `Poller`/`journal_logic`/
+`journal_store` pipeline, bar-by-bar via `apply_bar_push` — the exact
+production entry point — with `fetch_narration` pointed at the real,
+running `claude-connector` container (not stubbed). Results: 12 genuine
+bullish confirmations fired for real over the session (the same 12 also
+producing narration's own "confirmation" log entries); ALL 12 met the
+default `flag_count_threshold=2` and were recorded, with real,
+non-fabricated flag distributions (one at `flag_count=4`, two at `5`,
+nine at `6`) — a real, honest reflection of this particular capture's
+story: a collapsing stock whose mechanically-confirmed bullish setups
+were, in fact, almost always undermined by real bearish context
+(`below_vwap`/`below_day_open`/`macd_negative`/`ema_misaligned` true on
+nearly every row), exactly the tension this feature exists to surface.
+Zero real entries fired during the same replay (the bar-level volume
+gate never cleared) — direct proof this feature operated entirely in
+parallel with, and had zero effect on, real entry/exit decisions, not
+just an assertion. The forward-price sweep, run against this same real
+data with `now_fn` advanced past all three checkpoints, filled every
+row's `forward_price_30s`/`1m`/`5m` from RETO's own real final captured
+price.
+
+The one piece NOT verified with real generated narrative TEXT: every one
+of the 12 real `claude -p` calls (both pattern-flags' own and regular
+narration's) failed identically with `claude -p exited 1: <empty
+stderr>` via `claude-connector`. Traced to root cause by running `claude
+-p` directly inside the `claude-connector` container: `Failed to
+authenticate. API Error: 401 OAuth access token has been revoked.` —
+a real, current, PRE-EXISTING infrastructure fact (the exact "access-
+token refresh under this mount was never exercised" risk flagged and
+explicitly accepted in section 25), affecting ALL narration right now,
+not something this feature introduced or something narrower to
+pattern-flags specifically (confirmed by regular event narration failing
+identically in the same replay). This is exactly the "never silently
+swallowed" failure path working as designed under a real failure: every
+failed call produced a distinct, visible `"[narration failed: ...]"`
+narrative/log entry rather than a false success. Re-authenticating
+`claude-connector`'s mounted OAuth credential is a separate, standalone
+action outside this feature's scope.
+
+**Confirmed:** shares (does not duplicate) narration's rate-limit/arming
+state — proven both structurally (`_consume_narration_budget` is the
+one place either caller records a call) and via
+`test_pattern_flag_narration_shares_the_narration_circuit_breaker_not_a_second_one`
+(a `narration_max_calls_per_window=1.0` breaker trips from whichever of
+the tick's three real trigger events — confirmation, entry, or
+pattern-flag — fires first, and the pattern_flags row is still recorded
+regardless of whether its own narration call got through). Full test
+coverage: `tests/test_pattern_flags.py` (16 tests, all six flags +
+threshold + prompt construction against real data shapes),
+`tests/test_journal_store.py` (storage layer + `flag_count_threshold`
+param bounds), `tests/test_journal_wiring.py` (fires at/above threshold,
+stays silent below it, records independent of arming, shares the
+circuit breaker, forward-price sweep fills due checkpoints only — both
+the pure helper and the real periodic loop), `tests/test_journal_logic.py`
+(the structural safety proof).
