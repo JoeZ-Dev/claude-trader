@@ -542,6 +542,28 @@ def test_narration_params_reject_absurdly_large_values():
         store.set_param("narration_rearm_minutes", 100_000.0)
 
 
+# -- pattern-flags trigger threshold (specs.md section 37) -- same
+# generic _PARAM_BOUNDS machinery, one new key.
+
+def test_flag_count_threshold_accepts_the_documented_default():
+    store = JournalStore(":memory:", default_params={"flag_count_threshold": 2.0})
+    assert store.all_params()["flag_count_threshold"]["value"] == 2.0
+
+
+def test_flag_count_threshold_is_live_tunable():
+    store = JournalStore(":memory:")
+    store.set_param("flag_count_threshold", 3.0)
+    assert store.all_params()["flag_count_threshold"]["value"] == 3.0
+
+
+def test_flag_count_threshold_rejects_a_value_over_its_ceiling():
+    import pytest
+    from journal_store import InvalidParamError
+    store = JournalStore(":memory:")
+    with pytest.raises(InvalidParamError):
+        store.set_param("flag_count_threshold", 7.0)
+
+
 def test_a_rejected_set_param_does_not_change_the_live_value_or_history(tmp_path):
     import pytest
     from journal_store import InvalidParamError

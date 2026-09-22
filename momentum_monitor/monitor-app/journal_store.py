@@ -373,6 +373,20 @@ _PARAM_BOUNDS = {
     # pathologically short arm window is still a real, valid choice for
     # someone who wants to watch every single call land).
     "narration_rearm_minutes": (1.0, 1440.0),
+    # Pattern-flags trigger condition (specs.md section 37) -- how many
+    # of the six external-disagreement factors (pattern_flags.py) must
+    # be TRUE, on a genuine bullish confirmation, before it gets
+    # recorded + narrated. 2.0 matches pattern_flags.DEFAULT_FLAG_COUNT_
+    # THRESHOLD's own reasoning (a single disagreeing factor is common
+    # and often noise; a combination of two or more independent factors
+    # is the real, worth-narrating tension) -- kept live-tunable
+    # specifically so it can be dialed up against real observed noise
+    # without a redeploy, per the feature's own explicit plan. 0.0 would
+    # record every single genuine confirmation (defeats the point: not a
+    # useful floor, but not unsafe either, so left open rather than
+    # arbitrarily disallowed); 6.0 (all six) is the real ceiling -- nothing
+    # above "every flag fired" is meaningful.
+    "flag_count_threshold": (0.0, 6.0),
 }
 
 # current_equity's own seed/reset fallback (specs.md section 7) -- "2000
