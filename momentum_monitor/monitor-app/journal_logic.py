@@ -298,6 +298,27 @@ def _first_newly_confirmed(setups: list[dict], was_confirmed_types: frozenset[st
     return None
 
 
+def volume_gate_clears(relative_volume: float, volume_confirm_threshold: float,
+                       session_cumulative_volume: float = 0.0,
+                       avg_daily_volume: float | None = None,
+                       session_volume_multiple: float = 3.0) -> bool:
+    """The real volume-confirmation rule `should_enter` gates entries
+    with -- extracted into its own function (2026-09-22, specs.md
+    section 37) so the pattern-flags feature's `volume_not_confirmed`
+    flag can reuse this SAME logic, not a second, independently-
+    maintained copy of it. Bar-level `relative_volume` must clear
+    `volume_confirm_threshold`, AND (specs.md section 12's session-level
+    volume gate, separate from and stacking with the bar-level check)
+    today's cumulative session volume must clear `avg_daily_volume *
+    session_volume_multiple` -- `avg_daily_volume=None` (the default,
+    and the real value whenever a symbol's historical daily volume
+    couldn't be fetched) SKIPS the session-level gate entirely, the
+    bar-level check still applies regardless."""
+    session_volume_ok = (avg_daily_volume is None or
+                         session_cumulative_volume >= avg_daily_volume * session_volume_multiple)
+    return relative_volume >= volume_confirm_threshold and session_volume_ok
+
+
 def should_enter(*, newly_confirmed_type: str | None, relative_volume: float,
                  volume_confirm_threshold: float, position_open: bool,
                  session_cumulative_volume: float = 0.0,
@@ -322,11 +343,10 @@ def should_enter(*, newly_confirmed_type: str | None, relative_volume: float,
     choice) -- the bar-level relative_volume gate above still applies
     regardless. Existing callers that don't pass these three kwargs at
     all get this exact same skip-the-gate behavior automatically."""
-    session_volume_ok = (avg_daily_volume is None or
-                         session_cumulative_volume >= avg_daily_volume * session_volume_multiple)
     return (newly_confirmed_type is not None and not position_open
-            and relative_volume >= volume_confirm_threshold
-            and session_volume_ok)
+            and volume_gate_clears(relative_volume, volume_confirm_threshold,
+                                   session_cumulative_volume, avg_daily_volume,
+                                   session_volume_multiple))
 
 
 def apply_bar_to_open_position(

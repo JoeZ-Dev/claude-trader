@@ -16,6 +16,7 @@ from journal_logic import (
     apply_bar_to_open_position,
     initial_stop_level,
     should_enter,
+    volume_gate_clears,
 )
 
 TRAIL_PCT = 0.05
@@ -64,6 +65,35 @@ def _setup(setup_type, *, confirmed, distance=1.0, trigger_price=10.5,
 
 def test_initial_stop_level_is_trail_pct_below_entry():
     assert initial_stop_level(100.0, 0.05) == 95.0
+
+
+# -- volume_gate_clears (extracted from should_enter, specs.md section 37
+# -- the pattern-flags feature needs this SAME real logic, not a second
+# copy of it) -----------------------------------------------------------
+
+def test_volume_gate_clears_bar_level_only_by_default():
+    assert volume_gate_clears(HIGH_VOLUME, VOLUME_CONFIRM_THRESHOLD) is True
+    assert volume_gate_clears(LOW_VOLUME, VOLUME_CONFIRM_THRESHOLD) is False
+
+
+def test_volume_gate_clears_session_level_gate_stacks():
+    assert volume_gate_clears(
+        HIGH_VOLUME, VOLUME_CONFIRM_THRESHOLD,
+        session_cumulative_volume=100_000.0, avg_daily_volume=50_000.0,
+        session_volume_multiple=3.0,
+    ) is False  # needs >= 150_000
+    assert volume_gate_clears(
+        HIGH_VOLUME, VOLUME_CONFIRM_THRESHOLD,
+        session_cumulative_volume=150_000.0, avg_daily_volume=50_000.0,
+        session_volume_multiple=3.0,
+    ) is True
+
+
+def test_volume_gate_clears_skips_session_gate_when_avg_daily_volume_none():
+    assert volume_gate_clears(
+        HIGH_VOLUME, VOLUME_CONFIRM_THRESHOLD,
+        session_cumulative_volume=1.0, avg_daily_volume=None,
+    ) is True
 
 
 # -- should_enter ------------------------------------------------------------
