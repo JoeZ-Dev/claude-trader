@@ -5082,8 +5082,20 @@ share counts/dollar amounts updated — recomputed from the corrected
 formula, not adjusted to make tests pass. Full suite: 472 tests, all
 pass, zero regressions.
 
-**Deployed and verified live** — see the deploy confirmation
-immediately following this section's own commit.
+**Deployed and verified live**, same standard as every deploy tonight.
+Zero open positions confirmed immediately before deploying (twice —
+once before writing this section, once again immediately before the
+actual `docker compose` commands). `docker compose down monitor-app` /
+`up -d --build --no-deps monitor-app`. Verified by hashing the running
+container's `journal_logic.py` against `git show aef5de1:...` (the
+final pushed commit, after the section-number correction) — exact
+match. Beyond the hash check: ran the real fix directly inside the
+running container's own Python environment with the exact real
+`round_number_reclaim` scenario (`entry_price=9.1`, `trigger_price=
+9.25`, `trail_pct=0.08`, `swing_low_buffer_pct=0.005`) — real
+`risk_per_share=0.0455`, vs. what the old formula would have given
+(`0.728`) — confirmed the fix is genuinely live, not just inferred from
+a matching file hash.
 
 ### 36. Roadmap / phases
 
