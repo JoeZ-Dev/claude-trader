@@ -4935,7 +4935,87 @@ passed. Full suite: 428 monitor-app + schwab-connector's own 112 (test
 count unchanged, one test's assertions updated), all pass, zero
 regressions.
 
-### 34. Roadmap / phases
+### 34. Phase-transition breakeven floor — a real, live bug (B2)
+
+**Confirmed live, independently, twice before any fix was written.**
+The two-phase exit design (section 12): phase 1 ("swing_low") anchors
+the stop to the lowest confirmed swing low since entry (or the entry-
+trigger level as an interim fallback); once `high_water_mark` clears
+`entry_price * (1 + pattern_progress_threshold_pct)`, it transitions
+one-way to phase 2 ("trailing"), a flat `high_water_mark * (1 -
+trail_pct)` ratchet. Against the currently-deployed live
+`strategy_params` (`trail_pct=0.08`, `pattern_progress_threshold_pct=
+0.03`), the raw formula at the EARLIEST possible transition point
+computes `entry_price * 1.03 * 0.92 = entry_price * 0.9476` — a stop
+BELOW entry, on a position that just earned a phase upgrade for
+genuine +3% progress. Re-derived directly from `journal_logic.py:
+214-215, 394-413` and cross-checked against real recorded trade rows;
+confirmed zero open positions existed in production at the moment this
+was found, so nothing was actually harmed, but the bug was live and
+active.
+
+**Fixed as a structural invariant, not a threshold retuned to today's
+numbers.** `trail_pct` and `pattern_progress_threshold_pct` are both
+live-tunable and have already been retuned once this session
+(`trail_pct` 0.05 → 0.08) — a fix that only happens to be safe for
+today's specific values would silently break again on the next retune.
+Instead: `new_stop = max(computed_stop, entry_price)`, applied for as
+long as `phase_transitioned_ts is not None` (a real swing_low →
+trailing transition has actually occurred) — critically, on EVERY bar
+that condition holds, not just the one bar the transition happened on:
+`new_hwm` can stay flat for many bars afterward, and the raw formula is
+recomputed fresh from `new_hwm` each time (not carried forward from the
+previous stop), so a one-time correction at the transition bar alone
+would be silently undone on the very next bar if `new_hwm` hadn't yet
+risen far enough for the unfloored value to clear `entry_price` on its
+own — verified this precisely by hand-deriving the math before writing
+the fix, not assumed.
+
+**Deliberately scoped to exclude plain trailing-stop positions.** A
+position that started life directly in `"trailing"` phase (the
+original, pre-two-phase mechanism — `phase_transitioned_ts` stays
+`None` forever for these) is NOT affected: a plain trailing stop
+sitting below entry before real progress has been made is normal,
+accepted behavior for that mechanism, never promised swing-low
+protection in the first place. Getting this scoping wrong (applying the
+floor unconditionally to every `"trailing"`-phase computation) would
+have broken existing, correct behavior — caught directly by hand-
+tracing `test_no_exit_when_low_stays_above_stop` before writing the
+fix, then locked in with its own dedicated test.
+
+**Real evidence the invariant is structural, not tuned to one known
+case.** RED confirmed the parameterized sweep — `trail_pct` in
+`{0.03,0.05,0.08,0.15,0.30,0.50}` × `pattern_progress_threshold_pct` in
+`{0.005,0.01,0.03,0.05,0.10,0.20}`, 36 combinations, the transition-bar
+stop checked against `entry_price` for each — found **31 of 36 (86%)
+already broken before the fix**, including at the ORIGINAL default
+`trail_pct=0.05` (not just the current live-tuned 0.08): this bug has
+been present since the two-phase feature was first built, not
+introduced by the later retune. All 36 pass post-fix. A healthy-
+transition case (computed stop already comfortably above entry)
+confirmed completely unaffected — the floor resolves to the unchanged
+computed value. Two existing tests that had asserted the buggy sub-
+entry value as "expected" were corrected, with the reasoning recorded
+inline.
+
+Full suite: 467 monitor-app tests (+39: the fix's own coverage), all
+pass, zero regressions.
+
+**Deployed and verified live, same standard as every deploy tonight.**
+Zero open positions in production at deploy time (confirmed fresh
+immediately before), so no waiting/precondition gate needed — `docker
+compose down monitor-app` / `up -d --build --no-deps monitor-app`
+(`--no-deps` again, to leave `claude-connector` undisturbed). Verified
+by hashing the running container's `journal_logic.py` against
+`git show 1ca8363:...` — exact match. Then, beyond the hash check: ran
+the EXACT live-broken scenario (`entry_price=10.0`, `trail_pct=0.08`,
+`pattern_progress_threshold_pct=0.03`, transitioning at `high=10.3`)
+directly inside the running container's own Python environment —
+`exit_phase: trailing`, `stop_level: 10.0` (== `entry_price`, not the
+old buggy `9.476`) — confirmed fixed on the actual running system, not
+just inferred from a matching file hash.
+
+### 35. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,
