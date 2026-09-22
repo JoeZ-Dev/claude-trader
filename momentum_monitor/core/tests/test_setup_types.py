@@ -1,4 +1,4 @@
-import sys, os
+import sys, os, json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from setup_types import evaluate_setups, evaluate_breakdown_setups
@@ -7,6 +7,25 @@ from levels import nearest_round_number_above, nearest_round_number_below
 
 def bar(ts, o, h, l, c, v):
     return {"ts": ts, "open": o, "high": h, "low": l, "close": c, "volume": v}
+
+
+_FIXTURE_BARS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "schwab-connector", "data", "bars",
+)
+
+
+def _load_real_bars(symbol: str, limit: int | None = None) -> list[dict]:
+    """Same real fixture files/purpose as core/tests/test_core.py's own
+    `_load_real_bars` (specs.md section 31/32)."""
+    path = os.path.join(_FIXTURE_BARS_DIR, f"{symbol}.jsonl")
+    bars = []
+    with open(path) as f:
+        for i, line in enumerate(f):
+            if limit is not None and i >= limit:
+                break
+            bars.append(json.loads(line))
+    return bars
 
 
 def _double_top_bars(peak=8.69):
@@ -387,16 +406,33 @@ def _stale_touch_bars(trough=6.90):
     return _monotonic_drift_bars(trough)
 
 
-def _fresh_retouch_bars(trough=6.90):
-    """Same base as `_stale_touch_bars`, plus a SECOND, recent touch of
-    the exact same level (bracketed the same way as the first), then a
-    couple more bars -- real elapsed gap to `bars[-1]` is 300s either
-    way this fixture is used, well under BREAKDOWN_RECENT_TOUCH_SECONDS."""
+def _recent_touch_still_nearby_bars(trough=6.90):
+    """A SECOND, recent touch of the same level, then price drifts only
+    MODESTLY afterward (not a decisive move away) -- current distance to
+    the level ends up just OVER BREAKDOWN_NEAR_DISTANCE_PCT (so "near"
+    alone would say no), but price hasn't traveled far from the touch
+    itself (well under BREAKDOWN_MOVED_AWAY_PCT) -- genuinely still
+    active, the real value the recency+direction check adds beyond
+    distance alone."""
     bars = _monotonic_drift_bars(trough)
     ts = bars[-1]["ts"] + 60
-    for p in [7.4, 7.0, trough, 7.5, 8.1, 8.6]:
+    for p in [7.4, 7.0, trough, 7.1, 7.2, 7.3]:
         bars.append(bar(ts, p, p + 0.05, p - 0.05, p, 50_000)); ts += 60
-    for p in [9.0, 9.2]:
+    return bars
+
+
+def _blowthrough_touch_bars(trough=6.90):
+    """Real-shape mirror of the TOPS finding: the touch bar's own LOW is
+    the level, but that SAME bar closes far higher -- price rocketing
+    straight through on its way up, not hovering near or retesting.
+    Bracketed the same way as every other fixture here so detect_levels
+    still registers a genuine swing low, not a fluke."""
+    bars = _monotonic_drift_bars(trough)
+    ts = bars[-1]["ts"] + 60
+    for p in [7.4, 7.0]:
+        bars.append(bar(ts, p, p + 0.05, p - 0.05, p, 50_000)); ts += 60
+    bars.append(bar(ts, trough, 9.5, trough, 9.3, 500_000)); ts += 60  # the explosive bar
+    for p in [9.4, 9.5, 9.6]:
         bars.append(bar(ts, p, p + 0.05, p - 0.05, p, 40_000)); ts += 60
     return bars
 
@@ -415,14 +451,31 @@ def test_support_breakdown_not_relevant_when_far_and_stale():
     assert support.trigger_price == 6.85
 
 
-def test_support_breakdown_relevant_when_recently_retouched_even_if_far():
-    bars = _fresh_retouch_bars()
-    current_price = 9.2  # same far distance as the stale case above
+def test_support_breakdown_relevant_when_recently_touched_and_still_nearby():
+    bars = _recent_touch_still_nearby_bars()
+    current_price = bars[-1]["close"]
     candidates = evaluate_breakdown_setups(bars, current_price, vwap=None)
     support = next(c for c in candidates if c.setup_type == "support_breakdown")
+    # Sanity: this really is a case "near" alone would miss -- confirms
+    # the test is exercising the recency+direction path, not just
+    # happening to also pass the plain distance check.
+    assert support.factors["distance_pct"] > 5.0
+    assert support.factors["moved_away_pct_since_touch"] < 15.0
     assert support.factors["is_relevant"] is True
     assert support.factors["touch_count"] == 2
-    assert support.factors["seconds_since_last_touch"] == 300
+
+
+def test_support_breakdown_not_relevant_when_price_blows_through_the_touch():
+    # The real directional gap found live against TOPS (specs.md section
+    # 32): a level "touched" only because price rocketed straight
+    # through it isn't genuinely still in play, no matter how recent.
+    bars = _blowthrough_touch_bars()
+    current_price = bars[-1]["close"]
+    candidates = evaluate_breakdown_setups(bars, current_price, vwap=None)
+    support = next(c for c in candidates if c.setup_type == "support_breakdown")
+    assert support.factors["seconds_since_last_touch"] <= 300  # sanity: genuinely "recent"
+    assert support.factors["moved_away_pct_since_touch"] > 15.0
+    assert support.factors["is_relevant"] is False
 
 
 def test_support_breakdown_relevant_when_near_even_if_stale():
@@ -465,6 +518,28 @@ def test_vwap_breakdown_is_always_relevant_when_present():
     candidates = evaluate_breakdown_setups(live_bars, current_price=9.97, vwap=vwap)
     breakdown = next(c for c in candidates if c.setup_type == "vwap_breakdown")
     assert breakdown.factors["is_relevant"] is True
+
+
+def test_breakdown_relevance_on_the_real_reported_tops_rocketing_breakout():
+    # The actual live-reported case (specs.md section 32): TOPS rallied
+    # from ~$0.70 to $1.18 -- real captured data, not a synthetic
+    # reproduction. Both support_breakdown and micro_breakdown were
+    # showing is_relevant=True under the pre-fix logic purely because
+    # their touch (the launching point of the rocket itself) fell within
+    # BREAKDOWN_RECENT_TOUCH_SECONDS, even though price is now 30%+ away
+    # and still climbing -- confirmed NOT genuinely in play once the
+    # directional check is applied.
+    bars = _load_real_bars("TOPS")
+    current_price = bars[-1]["close"]
+    candidates = evaluate_breakdown_setups(bars, current_price, vwap=None)
+    for setup_type in ("support_breakdown", "micro_breakdown"):
+        c = next((x for x in candidates if x.setup_type == setup_type), None)
+        if c is None:
+            continue  # not present at all is also a valid, non-alarming outcome
+        assert c.factors["is_relevant"] is False, (
+            f"{setup_type} still relevant: distance_pct={c.factors['distance_pct']}, "
+            f"moved_away_pct_since_touch={c.factors['moved_away_pct_since_touch']}"
+        )
 
 
 if __name__ == "__main__":

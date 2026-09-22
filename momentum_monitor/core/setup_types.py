@@ -102,6 +102,25 @@ BREAKDOWN_NEAR_DISTANCE_PCT = 0.05
 # (requires_prior_touches=False), so distance is its only signal.
 BREAKDOWN_RECENT_TOUCH_SECONDS = 1800.0
 
+# BREAKDOWN_MOVED_AWAY_PCT: the directional gap "recently touched" alone
+# missed (found live against a real TOPS breakout, ~$0.70 -> $1.18): a
+# level "touched" 740s ago only because price ROCKETED straight through
+# it on the way up is not "genuinely still in play" the way a level
+# price is hovering near or retesting is -- confirmed on the real TOPS
+# data, whose touch bar itself moved from a low of 0.718 to a close of
+# 1.03 (43% within that ONE bar), with price 50% above the touch by the
+# time it's evaluated. "Recently touched" only counts toward relevance
+# when price hasn't ALSO moved more than this fraction away from the
+# actual touch price (the touch bar's own low, for a support-kind level)
+# since -- a SIGNED comparison, so price moving back TOWARD the level
+# since the touch never fails this check, only moving further away does.
+# 15% is deliberately looser than BREAKDOWN_NEAR_DISTANCE_PCT (5%) -- a
+# level touched minutes ago with price still roughly in the same
+# neighborhood should still read as active, not just literally
+# unchanged; it's the DIRECTION and MAGNITUDE of a decisive move away,
+# not any drift at all, that disqualifies a recent touch.
+BREAKDOWN_MOVED_AWAY_PCT = 0.15
+
 
 @dataclass
 class SetupCandidate:
@@ -306,8 +325,19 @@ def _breakdown_candidate(setup_type: str, bars: list[dict],
     distance = round(current_price - level.price, 4)
     distance_pct = abs(distance) / current_price if current_price > 0 else 0.0
     seconds_since_touch = bars[-1]["ts"] - level.last_touch_ts
-    is_relevant = (distance_pct <= BREAKDOWN_NEAR_DISTANCE_PCT
-                  or seconds_since_touch <= BREAKDOWN_RECENT_TOUCH_SECONDS)
+    # The touch bar's own LOW is the actual value that registered as a
+    # support-kind touch (detect_levels clusters on bars[i]["low"] for
+    # kind="support") -- comparing CURRENT price to THAT, not to
+    # level.price itself, measures whether price has moved away since
+    # the touch actually happened, not just how far the level is now.
+    touch_bar = next((b for b in bars if b["ts"] == level.last_touch_ts), None)
+    touch_price = touch_bar["low"] if touch_bar is not None else level.price
+    moved_away_pct = (current_price - touch_price) / touch_price if touch_price > 0 else 0.0
+    recently_tested_and_still_in_play = (
+        seconds_since_touch <= BREAKDOWN_RECENT_TOUCH_SECONDS
+        and moved_away_pct <= BREAKDOWN_MOVED_AWAY_PCT
+    )
+    is_relevant = distance_pct <= BREAKDOWN_NEAR_DISTANCE_PCT or recently_tested_and_still_in_play
     return SetupCandidate(
         setup_type=setup_type,
         trigger_price=round(level.price, 4),
@@ -320,6 +350,7 @@ def _breakdown_candidate(setup_type: str, bars: list[dict],
             "round_number_bonus": round(level.round_number_bonus, 4),
             "distance_pct": round(distance_pct * 100.0, 2),
             "seconds_since_last_touch": seconds_since_touch,
+            "moved_away_pct_since_touch": round(moved_away_pct * 100.0, 2),
             "is_relevant": is_relevant,
         },
     )
