@@ -4797,7 +4797,80 @@ tests (+3 for the display de-emphasis), all pass, zero regressions.
 Not deployed as part of this work — production still runs the pre-fix
 display; deploying it is a separate step if/when requested.
 
-### 32. Roadmap / phases
+### 32. Bearish-signals follow-up: a stale deployment AND a real directional gap
+
+Reported live: `TOPS` (a real breakout, ~$0.70 to $1.18) still showed
+the OLD "Bearish signals" header — evidence something was wrong. Turned
+out to be **both** of the two possibilities raised, not just one.
+
+**Problem 1 — confirmed real: the section 31 fix was never actually
+deployed.** Hashed the running `monitor-app` container's files against
+git blobs (the same method every prior deploy in this project has used)
+and found an exact match to commit `7888b35` — the deploy from BEFORE
+the bearish-signals work (`055d825`/`8a1b0e8`/`b28558c`), not current
+HEAD. The fix was built, tested, committed, and pushed, but the
+container was never rebuilt afterward. Redeployed properly (`docker
+compose down` then `up -d --build --no-deps` for `schwab-connector`/
+`monitor-app` — `--no-deps` used this time specifically to avoid
+section 30's `claude-connector` `depends_on` incident recurring),
+confirmed by re-hashing: both containers now match `HEAD` exactly.
+
+**Problem 2 — a real, distinct logic gap, found independently of the
+deployment issue.** `TOPS`'s own real data showed exactly why: its
+`support_breakdown` touch bar (`ts` matching `Level.last_touch_ts`) has
+`low=0.718, close=1.03` — a 43% move WITHIN that single bar. The
+"recently touched" relevance path had no notion of direction: a level
+"touched" only because price rocketed straight through it on the way up
+counted the same as a genuine hover/retest. By the time evaluated,
+price was 50.4% above that touch and still climbing — the touch was the
+rocket's launching point, not a sign the level was back in play.
+
+**Fix:** a recent touch only counts toward relevance if price hasn't
+ALSO moved more than `BREAKDOWN_MOVED_AWAY_PCT` (15%) away from the
+ACTUAL touch price (the touch bar's own low, not `level.price`) since —
+a signed comparison, so price moving back TOWARD the level since the
+touch never fails this check, only a decisive move further away does.
+15% is deliberately looser than `BREAKDOWN_NEAR_DISTANCE_PCT` (5%): a
+level touched minutes ago with price still roughly in the neighborhood
+should still read as active — it's a decisive move away, not any drift
+at all, that disqualifies a recent touch.
+
+**Verified against both real cases, not reasoned in the abstract:**
+- `TOPS` (real captured data, loaded directly in a committed test):
+  `support_breakdown` (50.4% moved away since touch) and
+  `micro_breakdown` (53.1%) both now correctly `is_relevant: False`.
+- `DDC` (the original case, section 31): re-checked with the new
+  directional field added — unaffected, still `is_relevant: False` for
+  all three chips (already excluded via distance/staleness alone; the
+  new `moved_away_pct_since_touch` shows 44-51% there too, consistent).
+- A synthetic case (`test_support_breakdown_relevant_when_recently_
+  touched_and_still_nearby`) proves the fix is a genuine directional
+  discriminator, not a blanket "always False now" — a level touched
+  recently with price still roughly nearby (just outside the strict 5%
+  "near" cutoff, but only ~6.6% moved from the actual touch, well under
+  the 15% threshold) still correctly reads as relevant.
+
+**Structural entry-safety guarantee reconfirmed** — grepped
+`journal_logic.py` directly: neither `is_relevant` nor the new
+`moved_away_pct_since_touch` appears anywhere in it. Re-ran the
+existing break-then-fix structural proof
+(`test_breakdown_type_allowlist_break_then_fix`) and the full
+parametrized non-entry test across all four breakdown types; both pass
+unchanged.
+
+**Live system re-verified after the second redeploy, not just "on
+GitHub":** re-hashed both containers against the final commit
+(`74983b8`) after rebuilding — exact match. `curl`'d the live
+`/api/state` for a real currently-watched symbol and confirmed the
+rendered page shows "Downside levels to be aware of," not "Bearish
+signals," and that a real breakdown chip (whichever is present at
+verification time) carries the `is_relevant` factor with the new
+`moved_away_pct_since_touch` alongside it.
+
+Full suite: 96 core (+2 net from section 31's baseline) and 428
+monitor-app tests, all pass, zero regressions, at both commits.
+
+### 33. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,
