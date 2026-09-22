@@ -205,6 +205,26 @@ CREATE TABLE IF NOT EXISTS equity_history (
     new_value REAL NOT NULL,
     reason TEXT NOT NULL,
     changed_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pattern_flags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    symbol TEXT NOT NULL,
+    setup_type TEXT NOT NULL,
+    trigger_price REAL NOT NULL,
+    distance REAL NOT NULL,
+    factors TEXT,
+    volume_not_confirmed INTEGER NOT NULL,
+    macd_negative INTEGER NOT NULL,
+    below_vwap INTEGER NOT NULL,
+    below_day_open INTEGER NOT NULL,
+    ema_misaligned INTEGER NOT NULL,
+    no_news INTEGER NOT NULL,
+    flag_count INTEGER NOT NULL,
+    narrative TEXT,
+    forward_price_30s REAL,
+    forward_price_1m REAL,
+    forward_price_5m REAL
 )
 """
 
@@ -882,6 +902,102 @@ class JournalStore:
         )
         self._conn.commit()
         return cur.rowcount
+
+    # -- pattern flags (specs.md section 37) --------------------------------
+
+    def record_pattern_flag(self, *, ts: int, symbol: str, setup_type: str,
+                            trigger_price: float, distance: float,
+                            factors: dict | None, flags: dict) -> int:
+        """Records a genuine bullish confirmation flagged for enough
+        external disagreement -- the six flags stored as their own
+        columns (never folded into one opaque score), narrative/
+        forward_price_* all start NULL (filled in later, by
+        set_pattern_flag_narrative/set_forward_price). Returns the new
+        row's id."""
+        cur = self._conn.execute(
+            "INSERT INTO pattern_flags (ts, symbol, setup_type, trigger_price, "
+            "distance, factors, volume_not_confirmed, macd_negative, below_vwap, "
+            "below_day_open, ema_misaligned, no_news, flag_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts, symbol, setup_type, trigger_price, distance,
+             json.dumps(factors) if factors is not None else None,
+             int(flags["volume_not_confirmed"]), int(flags["macd_negative"]),
+             int(flags["below_vwap"]), int(flags["below_day_open"]),
+             int(flags["ema_misaligned"]), int(flags["no_news"]),
+             flags["flag_count"]),
+        )
+        self._conn.commit()
+        return cur.lastrowid
+
+    def set_pattern_flag_narrative(self, row_id: int, narrative: str) -> None:
+        """Fills in the real generated narrative (or, on a real
+        generation failure -- specs.md section 37 -- a distinct
+        "[narration failed: ...]" string, never silently left
+        indistinguishable from "not yet attempted")."""
+        self._conn.execute(
+            "UPDATE pattern_flags SET narrative = ? WHERE id = ?",
+            (narrative, row_id),
+        )
+        self._conn.commit()
+
+    def recent_pattern_flags(self, limit: int = 20) -> list[dict]:
+        """Most recent first. `factors` deserialized back to a dict (None
+        stays None); the six flag columns come back as real Python bools,
+        not raw 0/1 ints, matching how every other boolean field in this
+        store already reads back (e.g. OpenPosition's own fields)."""
+        rows = self._conn.execute(
+            "SELECT * FROM pattern_flags ORDER BY id DESC LIMIT ?", (limit,),
+        ).fetchall()
+        out = []
+        for row in rows:
+            d = dict(row)
+            d["factors"] = json.loads(d["factors"]) if d["factors"] is not None else None
+            for key in ("volume_not_confirmed", "macd_negative", "below_vwap",
+                       "below_day_open", "ema_misaligned", "no_news"):
+                d[key] = bool(d[key])
+            out.append(d)
+        return out
+
+    def pending_forward_price_checkpoints(self, now_ts: float) -> list[dict]:
+        """Rows with at least one forward_price_* checkpoint whose target
+        time (row's own ts + the checkpoint's seconds -- _FORWARD_PRICE_
+        CHECKPOINTS below) has passed but isn't filled in yet. Each
+        returned dict carries `due_checkpoints`: the list of checkpoint
+        keys ("30s"/"1m"/"5m", in that fixed order) actually ready to be
+        filled RIGHT NOW for that row -- a checkpoint already filled
+        (forward_price_* IS NOT NULL) is never listed again, even if its
+        target time is long past."""
+        rows = self._conn.execute(
+            "SELECT id, ts, symbol, forward_price_30s, forward_price_1m, "
+            "forward_price_5m FROM pattern_flags WHERE "
+            "forward_price_30s IS NULL OR forward_price_1m IS NULL OR "
+            "forward_price_5m IS NULL",
+        ).fetchall()
+        out = []
+        for row in rows:
+            due = [key for key, seconds in _FORWARD_PRICE_CHECKPOINTS.items()
+                  if row[f"forward_price_{key}"] is None and now_ts >= row["ts"] + seconds]
+            if due:
+                out.append({"id": row["id"], "symbol": row["symbol"], "ts": row["ts"],
+                           "due_checkpoints": due})
+        return out
+
+    def set_forward_price(self, row_id: int, checkpoint: str, price: float) -> None:
+        """Fills in exactly ONE named checkpoint ("30s"/"1m"/"5m") --
+        never touches the other two."""
+        column = f"forward_price_{checkpoint}"
+        self._conn.execute(
+            f"UPDATE pattern_flags SET {column} = ? WHERE id = ?",
+            (price, row_id),
+        )
+        self._conn.commit()
+
+
+# The forward-price checkpoints tracked for every pattern-flag record
+# (specs.md section 37) -- a fixed, small set (not a general-purpose
+# scheduler for arbitrary future checkpoints, deliberately, per the
+# feature's own explicit scope), in the order they become due.
+_FORWARD_PRICE_CHECKPOINTS = {"30s": 30, "1m": 60, "5m": 300}
 
 
 # The dataclass's own default, not a re-typed literal -- a pre-migration

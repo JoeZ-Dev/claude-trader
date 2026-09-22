@@ -1291,3 +1291,117 @@ def test_continuation_threshold_pct_rejects_a_value_over_its_ceiling(tmp_path):
     store = JournalStore(tmp_path / "journal.db")
     with pytest.raises(InvalidParamError):
         store.set_param("continuation_threshold_pct", 6.0)
+
+
+# -- pattern flags (specs.md section 37) -----------------------------------
+
+_FLAGS = {
+    "volume_not_confirmed": True, "macd_negative": True, "below_vwap": False,
+    "below_day_open": False, "ema_misaligned": False, "no_news": True,
+    "flag_count": 3,
+}
+
+
+def test_record_pattern_flag_persists_all_six_flags_individually(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    row_id = store.record_pattern_flag(
+        ts=100, symbol="AEHL", setup_type="resistance_breakout",
+        trigger_price=10.5, distance=0.5, factors={"strength_score": 5.0},
+        flags=_FLAGS,
+    )
+    (row,) = store.recent_pattern_flags()
+    assert row["id"] == row_id
+    assert row["symbol"] == "AEHL"
+    assert row["setup_type"] == "resistance_breakout"
+    assert row["trigger_price"] == 10.5
+    assert row["distance"] == 0.5
+    assert row["factors"] == {"strength_score": 5.0}
+    # Each flag independently queryable -- never folded into one opaque
+    # score (specs.md section 3's scoring-visibility principle).
+    assert row["volume_not_confirmed"] is True
+    assert row["macd_negative"] is True
+    assert row["below_vwap"] is False
+    assert row["below_day_open"] is False
+    assert row["ema_misaligned"] is False
+    assert row["no_news"] is True
+    assert row["flag_count"] == 3
+    assert row["narrative"] is None  # not yet generated
+    assert row["forward_price_30s"] is None
+    assert row["forward_price_1m"] is None
+    assert row["forward_price_5m"] is None
+
+
+def test_set_pattern_flag_narrative_fills_it_in(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    row_id = store.record_pattern_flag(
+        ts=100, symbol="AEHL", setup_type="resistance_breakout",
+        trigger_price=10.5, distance=0.5, factors=None, flags=_FLAGS,
+    )
+    store.set_pattern_flag_narrative(row_id, "A real generated narrative.")
+    (row,) = store.recent_pattern_flags()
+    assert row["narrative"] == "A real generated narrative."
+
+
+def test_recent_pattern_flags_most_recent_first(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    id1 = store.record_pattern_flag(
+        ts=100, symbol="AEHL", setup_type="resistance_breakout",
+        trigger_price=10.5, distance=0.5, factors=None, flags=_FLAGS)
+    id2 = store.record_pattern_flag(
+        ts=200, symbol="MSFT", setup_type="vwap_reclaim",
+        trigger_price=20.0, distance=0.2, factors=None, flags=_FLAGS)
+    rows = store.recent_pattern_flags()
+    assert [r["id"] for r in rows] == [id2, id1]
+
+
+def test_pending_forward_price_checkpoints_none_due_before_their_time(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    store.record_pattern_flag(
+        ts=1000, symbol="AEHL", setup_type="resistance_breakout",
+        trigger_price=10.5, distance=0.5, factors=None, flags=_FLAGS)
+    # now_ts is only 10s past ts -- none of 30s/1m/5m are due yet.
+    assert store.pending_forward_price_checkpoints(now_ts=1010) == []
+
+
+def test_pending_forward_price_checkpoints_returns_due_ones_only(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    row_id = store.record_pattern_flag(
+        ts=1000, symbol="AEHL", setup_type="resistance_breakout",
+        trigger_price=10.5, distance=0.5, factors=None, flags=_FLAGS)
+    # 40s past ts -- only the 30s checkpoint is due; 1m/5m are not yet.
+    pending = store.pending_forward_price_checkpoints(now_ts=1040)
+    assert len(pending) == 1
+    assert pending[0]["id"] == row_id
+    assert pending[0]["symbol"] == "AEHL"
+    assert pending[0]["due_checkpoints"] == ["30s"]
+
+
+def test_pending_forward_price_checkpoints_excludes_already_filled_ones(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    row_id = store.record_pattern_flag(
+        ts=1000, symbol="AEHL", setup_type="resistance_breakout",
+        trigger_price=10.5, distance=0.5, factors=None, flags=_FLAGS)
+    store.set_forward_price(row_id, "30s", 10.6)
+    # 40s past ts -- 30s is due but already filled, so nothing pending.
+    assert store.pending_forward_price_checkpoints(now_ts=1040) == []
+
+
+def test_pending_forward_price_checkpoints_all_three_due_at_once(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    row_id = store.record_pattern_flag(
+        ts=1000, symbol="AEHL", setup_type="resistance_breakout",
+        trigger_price=10.5, distance=0.5, factors=None, flags=_FLAGS)
+    pending = store.pending_forward_price_checkpoints(now_ts=1000 + 400)
+    assert pending[0]["due_checkpoints"] == ["30s", "1m", "5m"]
+
+
+def test_set_forward_price_fills_the_named_checkpoint_only(tmp_path):
+    store = JournalStore(tmp_path / "journal.db")
+    row_id = store.record_pattern_flag(
+        ts=1000, symbol="AEHL", setup_type="resistance_breakout",
+        trigger_price=10.5, distance=0.5, factors=None, flags=_FLAGS)
+    store.set_forward_price(row_id, "1m", 10.7)
+    (row,) = store.recent_pattern_flags()
+    assert row["forward_price_30s"] is None
+    assert row["forward_price_1m"] == 10.7
+    assert row["forward_price_5m"] is None
