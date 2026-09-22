@@ -4870,7 +4870,72 @@ verification time) carries the `is_relevant` factor with the new
 Full suite: 96 core (+2 net from section 31's baseline) and 428
 monitor-app tests, all pass, zero regressions, at both commits.
 
-### 33. Roadmap / phases
+### 33. `avg_daily_volume`/`continuation`/`market_backdrop` all silently degraded — a genuine, ONE-cause bug
+
+Reported live: `SPCX` showing `avg_daily_volume: null`, `continuation.
+status: "unknown"`, and `market_backdrop` (SPY) entirely null. Nothing
+crashed — the session-level volume gate correctly skipped rather than
+blocking — but real underlying data was missing.
+
+**Confirmed, not assumed, whether this is one shared cause or two
+coincidentally-aligned ones.** `avg_daily_volume`/`continuation` (a
+one-time fetch for the watched symbol, SPCX) and `market_backdrop` (an
+independent loop, SPY, on its own 180s cadence) are structurally
+separate code paths — investigated both directly. Both, independently,
+were logging (confirmed: failures here were ALREADY visible, same
+standard as token refresh/narration — `daily-volume-history fetch
+failed for SPCX...`/`market-backdrop fetch failed for SPY...`, nothing
+silent to fix there) the exact same underlying error: `502 Bad Gateway`
+from `schwab-connector`'s `GET /daily_bars/{symbol}` — both symbols,
+both callers, the SAME route. Hit that route directly (`GET
+/daily_bars/SPCX` inside the running container) to see the real body
+Schwab actually returned: `Client error '400 Bad Request' for url
+'https://api.schwabapi.com/marketdata/v1/pricehistory?symbol=SPCX&
+frequencyType=daily&frequency=1&startDate=...&endDate=...'`. **One
+shared root cause, confirmed — not two.**
+
+**Root cause, verified against the real Schwab API before writing any
+fix** (a live, isolated `get_price_history` call, read-only, using the
+same client-construction path `main.py` already uses): the REAL error
+Schwab returns is `"Invalid frequencyType DAILY for periodType DAY"`.
+`fetch_daily_history` (`schwab-connector/price_history.py`) never
+passes `period_type`, and Schwab defaults it to `DAY` whenever it's
+omitted — but `DAY` only accepts `frequencyType=minute`. This
+"period_type/period must both be absent" discipline was established
+correctly for `fetch_today_bars` (section 4's original finding, live-
+verified against QCLS on 2026-09-16) — but that verification was for
+the MINUTE-frequency function specifically; the SAME discipline was then
+applied by analogy to `fetch_daily_history`'s DAILY frequency without
+being separately verified, and doesn't hold there. `fetch_today_bars`
+"happened to work" without `period_type` only because MINUTE is exactly
+what Schwab's own DAY default wants anyway.
+
+**Fix, verified live before committing:** added
+`period_type=client.PriceHistory.PeriodType.YEAR`. Confirmed directly
+against the real API: `200 OK`, genuine SPCX daily candles returned.
+Separately confirmed Schwab still honors the EXPLICIT `start_datetime`/
+`end_datetime` given alongside `period_type` — it does not fall back to
+some period-based range; only `period` (the separate COUNT parameter)
+actually conflicts with explicit dates, per `get_price_history`'s own
+docstring — `period_type` was never the parameter that needed avoiding.
+
+**Verified fixed on the live running system, not just in tests:**
+redeployed `schwab-connector` only (the sole component this fix
+touches), confirmed via the same file-hash method as every prior
+deploy. Re-hit `GET /daily_bars/SPCX` directly: `200 OK`, real data.
+Re-watched SPCX (a fresh watch-time fetch): `avg_daily_volume:
+97238093.57`, `continuation.status: "fresh"` — both real, both
+populated. Waited out `market_backdrop`'s own natural 180s refresh
+cycle (not a restart): `status: "ok", current_price: 773.5,
+prior_close: 761.69, pct_change: +1.55%` — real SPY data.
+
+Regression test (`test_fetch_daily_history_requests_explicit_daily_
+range_ending_yesterday`) updated to assert `period_type=YEAR` is now
+passed. Full suite: 428 monitor-app + schwab-connector's own 112 (test
+count unchanged, one test's assertions updated), all pass, zero
+regressions.
+
+### 34. Roadmap / phases
 
 1. **(built)** One symbol, live Schwab data through the tested core,
    a basic web page showing correct numbers. No trades, no multi-symbol,
