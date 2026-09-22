@@ -329,13 +329,22 @@ def test_swing_low_phase_exit_still_fires_immediately_on_breach():
 
 def test_phase_transitions_to_trailing_once_progress_threshold_cleared():
     # entry_price=10.0, progress_pct=0.03 -> clears at hwm >= 10.30
+    #
+    # Breakeven floor (specs.md section 34 -- confirmed live, B2): raw
+    # flat-trail math (10.35 * 0.95 = 9.8325) sits BELOW entry_price
+    # (10.0) even at TRAIL_PCT's own long-standing default of 0.05, not
+    # just the currently-live-tuned 0.08 -- this test previously asserted
+    # that buggy sub-entry value as "expected." A position up 3.5% must
+    # never transition into a stop representing a loss.
     pos = _swing_low_position(entry_price=10.0, trigger_price=9.5, progress_pct=0.03)
     updated, _ = apply_bar_to_open_position(
         pos, _bar(10, high=10.35, low=10.2, close=10.3), swing_low_anchor=None)
     assert updated.exit_phase == "trailing"
     assert updated.phase_transitioned_ts == 10
-    # from the moment of transition, the stop is flat-trail-from-hwm
-    assert updated.stop_level == 10.35 * (1 - TRAIL_PCT)
+    # Floored to entry_price -- the raw flat-trail value (9.8325) would
+    # otherwise be a real loss on a position that just earned a phase
+    # upgrade for genuine progress.
+    assert updated.stop_level == 10.0
 
 
 def test_phase_stays_swing_low_when_progress_threshold_not_yet_cleared():
@@ -359,7 +368,12 @@ def test_phase_transition_is_one_way_a_later_pullback_does_not_revert_it():
     assert updated.exit_phase == "trailing"
     assert updated.phase_transitioned_ts == 5  # unchanged, not re-stamped
     # still flat-trail math, completely ignoring the (lower) swing_low_anchor
-    assert updated.stop_level == 10.5 * (1 - TRAIL_PCT)
+    # -- but still floored to entry_price (specs.md section 34, B2): raw
+    # value 10.5 * 0.95 = 9.975 is still below entry_price (10.0), so the
+    # floor must keep applying on every bar after a real transition, not
+    # just the one bar it happened on (this position was ALREADY in
+    # "trailing" going into this bar, not transitioning on it).
+    assert updated.stop_level == 10.0
 
 
 def test_swing_low_phase_falls_back_to_entry_price_when_factors_missing():
@@ -402,6 +416,102 @@ def test_swing_low_phase_confirmed_anchor_above_entry_price_is_also_clamped():
     updated, _ = apply_bar_to_open_position(
         pos, _bar(10, high=10.1, low=9.99, close=10.05), swing_low_anchor=10.5)
     assert updated.stop_level == initial_stop_level(10.0, SWING_LOW_BUFFER_PCT)
+
+
+# -- breakeven floor at swing_low -> trailing transition (specs.md
+# section 34, B2 -- confirmed live: with the currently-deployed
+# trail_pct=0.08 and pattern_progress_threshold_pct=0.03, the earliest
+# possible transition point produces entry_price * 1.03 * 0.92 =
+# entry_price * 0.9476 -- BELOW entry, a real loss on a position that
+# just earned a phase upgrade for genuine +3% progress. Zero open
+# positions existed in production when this was found. Fixed as a
+# STRUCTURAL invariant (max(computed_stop, entry_price), applied for as
+# long as a real transition has occurred), not a threshold tuned to
+# today's specific trail_pct/pattern_progress_threshold_pct values --
+# those are live-tunable and have already been retuned once this
+# session (trail_pct: 0.05 -> 0.08), so a fix that only happens to work
+# for today's numbers would silently break again on the next retune. ---
+
+def test_phase_transition_breakeven_floor_fixes_the_exact_live_broken_case():
+    # The precise combination confirmed live in production right now:
+    # trail_pct=0.08, pattern_progress_threshold_pct=0.03. Raw flat-trail
+    # math at the earliest transition point is entry * 1.03 * 0.92 =
+    # entry * 0.9476 -- below entry. The fix must floor this to exactly
+    # entry_price, not merely "closer to" it.
+    entry = 10.0
+    pos = _swing_low_position(entry_price=entry, trigger_price=9.5,
+                              trail_pct=0.08, progress_pct=0.03)
+    updated, _ = apply_bar_to_open_position(
+        pos, _bar(10, high=entry * 1.03, low=entry * 1.02, close=entry * 1.03),
+        swing_low_anchor=None)
+    assert updated.exit_phase == "trailing"
+    raw_unfloored = entry * 1.03 * (1 - 0.08)
+    assert raw_unfloored < entry  # sanity: this really is the broken case
+    assert updated.stop_level == entry  # floored, not the raw 9.476
+
+
+@pytest.mark.parametrize("trail_pct", [0.03, 0.05, 0.08, 0.15, 0.30, 0.50])
+@pytest.mark.parametrize("progress_pct", [0.005, 0.01, 0.03, 0.05, 0.10, 0.20])
+def test_phase_transition_never_produces_a_stop_below_entry_across_param_sweep(
+        trail_pct, progress_pct):
+    # THE test that proves this is a structural invariant, not a fix
+    # tuned to one known-bad combination: sweeps a real range of both
+    # live-tunable parameters (including values well beyond anything
+    # currently configured, since these ARE live-tunable and will be
+    # retuned again as real data accumulates) and confirms the
+    # transition-bar stop is never below entry_price for ANY of them.
+    entry = 10.0
+    pos = _swing_low_position(entry_price=entry, trigger_price=entry * 0.95,
+                              trail_pct=trail_pct, progress_pct=progress_pct)
+    # The earliest possible transition point: hwm just clears the
+    # progress threshold.
+    hwm = entry * (1 + progress_pct)
+    updated, _ = apply_bar_to_open_position(
+        pos, _bar(10, high=hwm, low=hwm * 0.999, close=hwm), swing_low_anchor=None)
+    assert updated.exit_phase == "trailing", (
+        f"did not transition for trail_pct={trail_pct}, progress_pct={progress_pct}")
+    assert updated.stop_level >= entry, (
+        f"stop {updated.stop_level} < entry {entry} for "
+        f"trail_pct={trail_pct}, progress_pct={progress_pct}")
+
+
+def test_phase_transition_floor_has_zero_effect_on_a_healthy_transition():
+    # When the computed stop is ALREADY comfortably above entry (a large
+    # enough progress_pct relative to trail_pct -- the normal, expected
+    # case for most real parameter combinations), the floor must resolve
+    # to the computed value UNCHANGED, not silently alter healthy
+    # transitions.
+    entry = 10.0
+    trail_pct, progress_pct = 0.05, 0.10  # hwm=11.0 -> raw stop = 11.0*0.95 = 10.45, well above entry
+    pos = _swing_low_position(entry_price=entry, trigger_price=9.5,
+                              trail_pct=trail_pct, progress_pct=progress_pct)
+    hwm = entry * (1 + progress_pct)
+    raw_computed = hwm * (1 - trail_pct)
+    assert raw_computed > entry  # sanity: this really is the healthy case
+    updated, _ = apply_bar_to_open_position(
+        pos, _bar(10, high=hwm, low=hwm * 0.99, close=hwm), swing_low_anchor=None)
+    assert updated.stop_level == raw_computed  # untouched by the floor
+
+
+def test_plain_trailing_position_with_no_real_transition_is_unaffected_by_the_floor():
+    # The floor must apply ONLY to a position that actually went through
+    # a real swing_low -> trailing transition (phase_transitioned_ts is
+    # not None) -- a position that started life directly in "trailing"
+    # (the ORIGINAL, pre-two-phase-feature mechanism, phase_transitioned_ts
+    # stays None forever) must ratchet exactly as it always has, even
+    # when hwm hasn't yet risen far enough for the plain trailing stop to
+    # clear entry on its own -- that's normal, accepted trailing-stop
+    # behavior for a position that was NEVER promised swing-low
+    # protection, not the bug this floor exists to close.
+    pos = OpenPosition(id=None, symbol="X", entry_ts=0, entry_price=100.0,
+                       high_water_mark=100.0, stop_level=95.0, trail_pct=0.05)
+    assert pos.phase_transitioned_ts is None
+    updated, exit_event = apply_bar_to_open_position(
+        pos, _bar(10, high=101.0, low=96.5, close=100.5))
+    raw_computed = 101.0 * (1 - 0.05)
+    assert raw_computed < 100.0  # sanity: below entry, same shape as the bug
+    assert updated.stop_level == raw_computed  # NOT floored -- unaffected
+    assert exit_event is None
 
 
 # -- advance_journal: the per-poll orchestration function -------------------

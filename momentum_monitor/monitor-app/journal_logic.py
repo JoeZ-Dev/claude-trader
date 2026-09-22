@@ -404,6 +404,36 @@ def apply_bar_to_open_position(
 
     if phase == "trailing":
         new_stop = initial_stop_level(new_hwm, position.trail_pct)
+        # Breakeven floor (2026-09-21, specs.md section 34) -- ONLY for a
+        # position that actually went through a real swing_low ->
+        # trailing transition (phase_transitioned_ts is not None, set
+        # just above the moment that happens, or already set on a
+        # position that transitioned on an earlier bar): the raw
+        # flat-trail formula can produce a stop BELOW entry_price at the
+        # earliest possible transition point -- confirmed live with the
+        # currently-deployed trail_pct=0.08/pattern_progress_threshold_
+        # pct=0.03 (entry*1.03*0.92 = entry*0.9476), and confirmed
+        # structurally true across a wide sweep of both live-tunable
+        # parameters, not just today's specific values. A position that
+        # just earned a phase upgrade for genuine progress must never
+        # transition into a stop that represents a loss. Applied on
+        # EVERY bar for as long as `phase` is "trailing" via a real
+        # transition (not just the one bar it happened on): new_hwm can
+        # stay flat for many bars after transitioning, and the raw
+        # formula is recomputed fresh from new_hwm each time, so a
+        # one-time correction would be silently undone on the very next
+        # bar if new_hwm hasn't risen far enough yet for the unfloored
+        # value to clear entry_price on its own.
+        #
+        # Deliberately NOT applied when phase_transitioned_ts is None
+        # (a position that started life directly in "trailing," the
+        # ORIGINAL single-phase mechanism, and never went through the
+        # swing-low phase at all) -- a plain trailing stop sitting below
+        # entry before real progress has been made is normal, accepted
+        # behavior for that mechanism, not the bug this floor exists to
+        # close.
+        if phase_transitioned_ts is not None:
+            new_stop = max(new_stop, position.entry_price)
     else:
         trigger_price = ((position.factors or {}).get("trigger_price")
                          or position.entry_price)
